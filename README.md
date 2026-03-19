@@ -18,10 +18,6 @@ AI-powered documentation generator that turns any code repository into a browsab
 - **Self-hosted** — runs entirely on your infrastructure with a single `docker compose up`
 - **Authentication** — built-in username/password, GitHub OAuth, Google OAuth
 
-<p align="center">
-  <img src="docs/images/deep-research-tools.png" alt="Deep Research with tool calls" width="800" />
-</p>
-
 ## Quick Start
 
 One command to install and run:

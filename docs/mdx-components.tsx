@@ -8,15 +8,18 @@ import type { ReactNode, ComponentProps, ImgHTMLAttributes } from 'react';
 
 // Render both light and dark images; CSS hides the inactive one.
 // Dark variant is automatically derived: /images/foo.png → /images/foo-dark.png
+const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? '';
+
 function ThemedImage({ src, alt, style, ...rest }: ImgHTMLAttributes<HTMLImageElement>) {
   if (!src || typeof src !== 'string' || !src.startsWith('/images/')) {
     return <img src={src} alt={alt} style={style} {...rest} />;
   }
-  const darkSrc = src.replace(/(\.[^.]+)$/, '-dark$1');
+  const lightSrc = `${basePath}${src}`;
+  const darkSrc = `${basePath}${src.replace(/(\.[^.]+)$/, '-dark$1')}`;
   const baseStyle = { borderRadius: '0.5rem', border: '1px solid var(--color-fd-border)', maxWidth: '100%', ...style };
   return (
     <>
-      <img src={src} alt={alt} style={baseStyle} className="wikis-img-light" {...rest} />
+      <img src={lightSrc} alt={alt} style={baseStyle} className="wikis-img-light" {...rest} />
       <img src={darkSrc} alt={alt} style={baseStyle} className="wikis-img-dark" {...rest} />
     </>
   );
