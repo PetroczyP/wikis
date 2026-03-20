@@ -198,7 +198,7 @@ class Invocation(BaseModel):
             # ----- Live events -----
             while True:
                 try:
-                    event = await asyncio.wait_for(q.get(), timeout=300)
+                    event = await asyncio.wait_for(q.get(), timeout=1800)
                 except TimeoutError:
                     yield (cursor, _events.task_status(
                         self.id, "failed", "Stream timeout", error="Stream timeout",
