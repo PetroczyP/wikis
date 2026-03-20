@@ -189,7 +189,13 @@ case "${provider_choice:-7}" in
     else
       info "Using default AWS credential chain (IAM role, env vars, ~/.aws/credentials)."
     fi
-    prompt_models "us.anthropic.claude-sonnet-4-6-20250514-v1:0" "us.anthropic.claude-haiku-4-5-20251001-v1:0" "amazon.titan-embed-text-v2:0"
+    # Use region-appropriate model prefix (us/eu/ap)
+    BEDROCK_PREFIX="us"
+    case "$AWS_REGION" in
+      eu-*) BEDROCK_PREFIX="eu" ;;
+      ap-*) BEDROCK_PREFIX="ap" ;;
+    esac
+    prompt_models "${BEDROCK_PREFIX}.anthropic.claude-sonnet-4-6-20250514-v1:0" "${BEDROCK_PREFIX}.anthropic.claude-haiku-4-5-20251001-v1:0" "amazon.titan-embed-text-v2:0"
     ;;
   5)
     LLM_PROVIDER="custom"
