@@ -42,7 +42,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             from app.services.llm_factory import create_embeddings
 
             embeddings = create_embeddings(settings)
-            qa_cache = QACacheManager(settings.cache_dir, embeddings)
+            qa_cache = QACacheManager(settings.cache_dir, embeddings, max_wikis=settings.qa_cache_max_wikis)
             logger.info("QA cache initialized")
         except Exception as e:
             logger.error("QA cache disabled — embedding init failed: %s", e)
@@ -59,7 +59,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("Services initialized: wiki, ask, research, wiki_management, qa")
 
     # Wire MCP tools to services (direct calls, no HTTP)
-    from mcp_server.server import mcp as mcp_server, set_services
+    from mcp_server.server import mcp as mcp_server
+    from mcp_server.server import set_services
 
     set_services(
         wiki_management=wiki_management,

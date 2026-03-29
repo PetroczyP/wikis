@@ -4,9 +4,7 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass
-from unittest.mock import MagicMock
 
-import faiss
 import numpy as np
 import pytest
 
@@ -42,7 +40,7 @@ def embeddings():
 
 @pytest.fixture
 def manager(cache_dir, embeddings):
-    return QACacheManager(cache_dir, embeddings)
+    return QACacheManager(cache_dir, embeddings, max_wikis=50)
 
 
 @pytest.mark.asyncio
@@ -88,17 +86,19 @@ async def test_k5_returns_multiple_candidates(manager):
 
 @pytest.mark.asyncio
 async def test_delete_index(manager, cache_dir):
-    """delete_index removes files and clears in-memory state."""
+    """delete_index removes files (including ready marker) and clears in-memory state."""
     vec = np.random.randn(8).astype(np.float32)
     await manager.add("wiki-1", "qa-1", vec)
     # Files should exist
     assert os.path.exists(os.path.join(cache_dir, "wiki-1.qa.faiss"))
     assert os.path.exists(os.path.join(cache_dir, "wiki-1.qa.ids.json"))
+    assert os.path.exists(os.path.join(cache_dir, "wiki-1.qa.ready"))
     # Delete
     result = manager.delete_index("wiki-1")
     assert result is True
     assert not os.path.exists(os.path.join(cache_dir, "wiki-1.qa.faiss"))
     assert not os.path.exists(os.path.join(cache_dir, "wiki-1.qa.ids.json"))
+    assert not os.path.exists(os.path.join(cache_dir, "wiki-1.qa.ready"))
     # Second delete returns False
     assert manager.delete_index("wiki-1") is False
 
@@ -151,12 +151,13 @@ async def test_corruption_detection(manager, cache_dir):
 
 @pytest.mark.asyncio
 async def test_atomic_write(manager, cache_dir):
-    """After add, no .tmp files remain."""
+    """After add, no .tmp files remain and ready marker exists."""
     vec = np.random.randn(8).astype(np.float32)
     await manager.add("wiki-1", "qa-1", vec)
     files = os.listdir(cache_dir)
     tmp_files = [f for f in files if f.endswith(".tmp")]
     assert tmp_files == []
+    assert "wiki-1.qa.ready" in files
 
 
 @pytest.mark.asyncio
@@ -211,10 +212,50 @@ async def test_check_needs_rebuild_clean_cold_start(manager, cache_dir):
     # Simulate cold restart: clear in-memory state, files remain on disk
     manager._indexes.pop("wiki-1", None)
     manager._qa_ids.pop("wiki-1", None)
-    # Files are clean — should load successfully, not demand a rebuild
+    # Files are clean (including ready marker) — should load successfully
     assert manager.check_needs_rebuild("wiki-1") is False
     # Verify it was loaded into memory by the check
     assert "wiki-1" in manager._indexes
+
+
+@pytest.mark.asyncio
+async def test_missing_ready_marker_triggers_rebuild(manager, cache_dir):
+    """Missing ready marker (simulating interrupted save) triggers rebuild."""
+    vec = np.random.randn(8).astype(np.float32)
+    await manager.add("wiki-1", "qa-1", vec)
+    # Remove ready marker to simulate interrupted save
+    os.remove(os.path.join(cache_dir, "wiki-1.qa.ready"))
+    # Clear in-memory state
+    manager._indexes.pop("wiki-1", None)
+    manager._qa_ids.pop("wiki-1", None)
+    # Should need rebuild (files exist but ready marker is missing)
+    assert manager.check_needs_rebuild("wiki-1") is True
+    # Search returns empty (index not loadable)
+    qa_ids, _ = await manager.search("wiki-1", "test", threshold=0.0)
+    assert qa_ids == []
+
+
+@pytest.mark.asyncio
+async def test_lru_eviction(cache_dir, embeddings):
+    """In-memory indexes are evicted when exceeding max_wikis."""
+    manager = QACacheManager(cache_dir, embeddings, max_wikis=3)
+    for i in range(5):
+        vec = np.random.randn(8).astype(np.float32)
+        await manager.add(f"wiki-{i}", f"qa-{i}", vec)
+    # Only the 3 most recently used wikis should be in memory
+    assert len(manager._indexes) == 3
+    # The last 3 added (wiki-2, wiki-3, wiki-4) should be in memory
+    assert "wiki-2" in manager._indexes
+    assert "wiki-3" in manager._indexes
+    assert "wiki-4" in manager._indexes
+    # Evicted wikis (wiki-0, wiki-1) still have files on disk
+    assert os.path.exists(os.path.join(cache_dir, "wiki-0.qa.faiss"))
+    assert os.path.exists(os.path.join(cache_dir, "wiki-1.qa.faiss"))
+    # Searching an evicted wiki reloads it from disk
+    qa_ids, _ = await manager.search("wiki-0", "test", threshold=0.0)
+    assert "wiki-0" in manager._indexes
+    # Reloading evicts the new LRU
+    assert len(manager._indexes) == 3
 
 
 @pytest.mark.asyncio
