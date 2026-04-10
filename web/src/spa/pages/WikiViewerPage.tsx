@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Box, Typography, CircularProgress, Dialog, DialogTitle,
-  DialogContent, DialogActions, Button, TextField, Chip,
+  DialogContent, DialogActions, Button, TextField, Chip, Divider,
 } from '@mui/material';
 import ClearIcon from '@mui/icons-material/Clear';
 import { useParams, useSearchParams } from 'react-router-dom';
@@ -35,6 +35,7 @@ interface AskState {
   toolCalls: ToolCallRecord[];
   todos: TodoItem[];
   loading: boolean;
+  error: boolean;
   mode: 'fast' | 'deep';
 }
 
@@ -66,19 +67,45 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const threadEndRef = useRef<HTMLDivElement>(null);
   const { setRepo, clearRepo } = useRepoContext();
-  const [askState, setAskState] = useState<AskState | null>(null);
+  const [chatTurns, setChatTurns] = useState<AskState[]>([]);
   const [searchParams, setSearchParams] = useSearchParams();
   const [genEvents, setGenEvents] = useState<SSEEventData[]>([]);
   const cancelResearchRef = useRef<(() => void) | null>(null);
   const [tokenDialogOpen, setTokenDialogOpen] = useState(false);
   const [tokenInput, setTokenInput] = useState('');
-  const [convHistory, setConvHistory] = useState<ChatMessage[]>([]);
 
-  // Reset conversation history when switching wikis
+  // Derive LLM context from successfully completed turns (no errors)
+  const convHistory = useMemo<ChatMessage[]>(() =>
+    chatTurns
+      .filter((t) => !t.loading && !t.error && t.answer !== null)
+      .flatMap((t) => [
+        { role: 'user' as const, content: t.question },
+        { role: 'assistant' as const, content: t.answer! },
+      ]),
+    [chatTurns],
+  );
+
+  // Helper: update the last turn in chatTurns
+  const updateLastTurn = useCallback((updater: (prev: AskState) => AskState) => {
+    setChatTurns((prev) => {
+      if (!prev.length) return prev;
+      return [...prev.slice(0, -1), updater(prev[prev.length - 1])];
+    });
+  }, []);
+
+  // Reset conversation when switching wikis
   useEffect(() => {
-    setConvHistory([]);
+    setChatTurns([]);
   }, [wikiId]);
+
+  // Auto-scroll to the bottom of the thread when new content arrives
+  useEffect(() => {
+    if (chatTurns.length > 0) {
+      threadEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    }
+  }, [chatTurns]);
   const urlGenerating = searchParams.get('generating') === 'true';
   const urlInvocationId = searchParams.get('invocation');
   const [activeInvocationId, setActiveInvocationId] = useState<string | null>(urlInvocationId);
@@ -201,7 +228,7 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
   const handleSelectPage = useCallback(
     (pageId: string) => {
       setActivePageId(pageId);
-      setAskState(null);
+      setChatTurns([]);
       setSearchParams(
         (prev) => {
           const next = new URLSearchParams(prev);
@@ -222,15 +249,11 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
       cancelResearchRef.current?.();
       cancelResearchRef.current = null;
 
-      setAskState({
-        question,
-        answer: null,
-        sources: [],
-        toolCalls: [],
-        todos: [],
-        loading: true,
-        mode: useDeepResearch ? 'deep' : 'fast',
-      });
+      // Append a new turn to the thread
+      setChatTurns((prev) => [
+        ...prev,
+        { question, answer: null, sources: [], toolCalls: [], todos: [], loading: true, error: false, mode: useDeepResearch ? 'deep' : 'fast' },
+      ]);
 
       if (useDeepResearch) {
         const cancel = subscribeResearchSSE(
@@ -239,10 +262,8 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           (event) => {
             if (event.type === 'thinking_step') {
               const e = event;
-              // Accept both legacy step_type and new MCP stepType
               const stepKind = e.step_type ?? e.stepType;
-              setAskState((prev) => {
-                if (!prev) return prev;
+              updateLastTurn((prev) => {
                 if (stepKind === 'tool_call') {
                   const record: ToolCallRecord = {
                     tool_name: e.tool,
@@ -255,7 +276,6 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                   return { ...prev, toolCalls: [...prev.toolCalls, record] };
                 }
                 if (stepKind === 'tool_result') {
-                  // Update the last unfinished call for this tool
                   let updated = false;
                   const toolCalls = [...prev.toolCalls]
                     .reverse()
@@ -277,47 +297,29 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                 return prev;
               });
             } else if (event.type === 'answer_chunk') {
-              setAskState((prev) =>
-                prev ? { ...prev, answer: (prev.answer ?? '') + event.chunk } : null,
-              );
+              updateLastTurn((prev) => ({ ...prev, answer: (prev.answer ?? '') + event.chunk }));
             } else if (event.type === 'research_complete') {
               const answer = event.report ?? '';
-              setAskState((prev) =>
-                prev ? { ...prev, answer, loading: false } : null,
-              );
-              setConvHistory((prev) => [
-                ...prev,
-                { role: 'user', content: question },
-                { role: 'assistant', content: answer },
-              ]);
+              updateLastTurn((prev) => ({ ...prev, answer, loading: false, error: false }));
             } else if (event.type === 'research_error') {
-              setAskState((prev) =>
-                prev ? { ...prev, answer: `Error: ${event.error}`, loading: false } : null,
-              );
+              updateLastTurn((prev) => ({ ...prev, answer: `Error: ${event.error}`, loading: false, error: true }));
             } else if (event.type === 'task_failed') {
-              // New MCP terminal failure event for research stream
-              setAskState((prev) =>
-                prev ? { ...prev, answer: `Error: ${event.error}`, loading: false } : null,
-              );
+              updateLastTurn((prev) => ({ ...prev, answer: `Error: ${event.error}`, loading: false, error: true }));
             } else if (event.type === 'todo_update') {
               const todos = (event.todos as TodoItem[]) ?? [];
-              setAskState((prev) => (prev ? { ...prev, todos } : null));
+              updateLastTurn((prev) => ({ ...prev, todos }));
             }
           },
           () => {
-            // Stream ended without research_complete — mark done
-            setAskState((prev) => (prev?.loading ? { ...prev, loading: false } : prev));
+            updateLastTurn((prev) => (prev.loading ? { ...prev, loading: false } : prev));
           },
           () => {
-            setAskState((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    answer: 'Sorry, something went wrong. Please try again.',
-                    loading: false,
-                  }
-                : null,
-            );
+            updateLastTurn((prev) => ({
+              ...prev,
+              answer: 'Sorry, something went wrong. Please try again.',
+              loading: false,
+              error: true,
+            }));
           },
         );
         cancelResearchRef.current = cancel;
@@ -328,10 +330,8 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           (event) => {
             if (event.type === 'thinking_step') {
               const e = event;
-              // Accept both legacy step_type and new MCP stepType
               const stepKind = e.step_type ?? e.stepType;
-              setAskState((prev) => {
-                if (!prev) return prev;
+              updateLastTurn((prev) => {
                 if (stepKind === 'tool_call') {
                   const record: ToolCallRecord = {
                     tool_name: e.tool,
@@ -365,75 +365,37 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                 return prev;
               });
             } else if (event.type === 'answer_chunk') {
-              setAskState((prev) =>
-                prev ? { ...prev, answer: (prev.answer ?? '') + event.chunk } : null,
-              );
+              updateLastTurn((prev) => ({ ...prev, answer: (prev.answer ?? '') + event.chunk }));
             } else if (event.type === 'ask_complete') {
               const answer = event.answer ?? '';
-              const sources = event.sources ?? [];
-              setAskState((prev) =>
-                prev
-                  ? {
-                      ...prev,
-                      answer,
-                      sources: sources as typeof prev.sources,
-                      loading: false,
-                    }
-                  : null,
-              );
-              setConvHistory((prev) => [
-                ...prev,
-                { role: 'user', content: question },
-                { role: 'assistant', content: answer },
-              ]);
+              const sources = (event.sources ?? []) as AskState['sources'];
+              updateLastTurn((prev) => ({ ...prev, answer, sources, loading: false, error: false }));
             } else if (event.type === 'task_complete' && event.answer) {
               const answer = event.answer;
-              const sources = event.sources ?? [];
-              setAskState((prev) =>
-                prev
-                  ? {
-                      ...prev,
-                      answer,
-                      sources: sources as typeof prev.sources,
-                      loading: false,
-                    }
-                  : null,
-              );
-              setConvHistory((prev) => [
-                ...prev,
-                { role: 'user', content: question },
-                { role: 'assistant', content: answer },
-              ]);
+              const sources = (event.sources ?? []) as AskState['sources'];
+              updateLastTurn((prev) => ({ ...prev, answer, sources, loading: false, error: false }));
             } else if (event.type === 'ask_error') {
-              setAskState((prev) =>
-                prev ? { ...prev, answer: `Error: ${event.error}`, loading: false } : null,
-              );
+              updateLastTurn((prev) => ({ ...prev, answer: `Error: ${event.error}`, loading: false, error: true }));
             } else if (event.type === 'task_failed') {
-              // New MCP terminal failure event for ask stream
-              setAskState((prev) =>
-                prev ? { ...prev, answer: `Error: ${event.error}`, loading: false } : null,
-              );
+              updateLastTurn((prev) => ({ ...prev, answer: `Error: ${event.error}`, loading: false, error: true }));
             }
           },
           () => {
-            setAskState((prev) => (prev?.loading ? { ...prev, loading: false } : prev));
+            updateLastTurn((prev) => (prev.loading ? { ...prev, loading: false } : prev));
           },
           () => {
-            setAskState((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    answer: 'Sorry, something went wrong. Please try again.',
-                    loading: false,
-                  }
-                : null,
-            );
+            updateLastTurn((prev) => ({
+              ...prev,
+              answer: 'Sorry, something went wrong. Please try again.',
+              loading: false,
+              error: true,
+            }));
           },
         );
         cancelResearchRef.current = cancel;
       }
     },
-    [wikiId, convHistory],
+    [wikiId, convHistory, updateLastTurn],
   );
 
 
@@ -514,7 +476,7 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           width: '100%',
         }}
       >
-        {!askState && !isGenerating && (
+        {!chatTurns.length && !isGenerating && (
           <WikiSidebar
             pages={sidebarPages}
             activePageId={activePageId}
@@ -541,20 +503,22 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                 }}
               />
             </Box>
-          ) : askState ? (
+          ) : chatTurns.length > 0 ? (
             <Box sx={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
+              {/* Header shows first question + back/clear actions */}
               <AnswerHeader
-                question={askState.question}
-                mode={askState.mode}
-                answer={askState.answer}
+                question={chatTurns[0].question}
+                mode={chatTurns[chatTurns.length - 1].mode}
+                answer={chatTurns[chatTurns.length - 1].answer}
+                turnCount={chatTurns.length}
                 onBack={() => {
                   cancelResearchRef.current?.();
                   cancelResearchRef.current = null;
-                  setAskState(null);
+                  setChatTurns([]);
                 }}
               />
               <Box sx={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-                {/* Left: Answer */}
+                {/* Left: Scrollable conversation thread */}
                 <Box
                   sx={{
                     flex: 1,
@@ -564,14 +528,20 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                     borderColor: 'divider',
                   }}
                 >
-                  <AnswerView
-                    question={askState.question}
-                    answer={askState.answer}
-                    loading={askState.loading}
-                    mode={mode}
-                  />
+                  {chatTurns.map((turn, i) => (
+                    <Box key={i}>
+                      {i > 0 && <Divider sx={{ my: 2 }} />}
+                      <AnswerView
+                        question={turn.question}
+                        answer={turn.answer}
+                        loading={turn.loading}
+                        mode={mode}
+                      />
+                    </Box>
+                  ))}
+                  <div ref={threadEndRef} />
                 </Box>
-                {/* Right: Tool Calls (both fast and deep) */}
+                {/* Right: Tool Calls for the latest turn */}
                 <Box
                   sx={{
                     width: { xs: 0, md: '40%' },
@@ -581,7 +551,10 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                     display: { xs: 'none', md: 'block' },
                   }}
                 >
-                  <ToolCallPanel toolCalls={askState.toolCalls} todos={askState.todos} />
+                  <ToolCallPanel
+                    toolCalls={chatTurns[chatTurns.length - 1].toolCalls}
+                    todos={chatTurns[chatTurns.length - 1].todos}
+                  />
                 </Box>
               </Box>
             </Box>
@@ -594,19 +567,19 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           )}
         </Box>
 
-        {!askState && !isGenerating && <OnThisPage contentRef={contentRef} />}
+        {!chatTurns.length && !isGenerating && <OnThisPage contentRef={contentRef} />}
       </Box>
 
       {!isGenerating && (
         <>
-          {convHistory.length > 0 && (
+          {chatTurns.length > 0 && (
             <Box sx={{ display: 'flex', justifyContent: 'center', mb: 0.5 }}>
               <Chip
                 size="small"
                 icon={<ClearIcon fontSize="small" />}
-                label={`Context active (${convHistory.length / 2} turn${convHistory.length / 2 !== 1 ? 's' : ''})`}
-                onClick={() => setConvHistory([])}
-                onDelete={() => setConvHistory([])}
+                label={`Context active (${chatTurns.filter(t => !t.loading && !t.error).length} turn${chatTurns.filter(t => !t.loading && !t.error).length !== 1 ? 's' : ''})`}
+                onClick={() => setChatTurns([])}
+                onDelete={() => setChatTurns([])}
                 color="primary"
                 variant="outlined"
                 sx={{ fontSize: '0.72rem', cursor: 'pointer' }}
@@ -615,7 +588,8 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           )}
           <AskBar
             onSubmit={handleAsk}
-            disabled={askState?.loading}
+            disabled={chatTurns[chatTurns.length - 1]?.loading}
+            placeholder={chatTurns.length > 0 ? 'Ask a follow-up question…' : undefined}
             repoLabel={
               wiki?.repo_url
                 ? (() => {

@@ -16,11 +16,12 @@ interface AskBarProps {
   onSubmit: (question: string, deepResearch: boolean) => void;
   disabled?: boolean;
   repoLabel?: string;
+  placeholder?: string;
 }
 
 type Mode = 'fast' | 'deep';
 
-export function AskBar({ onSubmit, disabled = false, repoLabel }: AskBarProps) {
+export function AskBar({ onSubmit, disabled = false, repoLabel, placeholder: placeholderProp }: AskBarProps) {
   const [input, setInput] = useState('');
   const [mode, setMode] = useState<Mode>('fast');
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
@@ -42,7 +43,7 @@ export function AskBar({ onSubmit, disabled = false, repoLabel }: AskBarProps) {
     [handleSubmit],
   );
 
-  const placeholder = repoLabel ? `Ask about ${repoLabel}...` : 'Ask about this repository...';
+  const placeholder = placeholderProp ?? (repoLabel ? `Ask about ${repoLabel}...` : 'Ask about this repository...');
 
   return (
     <Box

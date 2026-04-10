@@ -7,9 +7,11 @@ interface AnswerHeaderProps {
   mode: 'fast' | 'deep';
   onBack: () => void;
   answer?: string | null;
+  turnCount?: number;
 }
 
-export function AnswerHeader({ question, mode, onBack, answer }: AnswerHeaderProps) {
+export function AnswerHeader({ question, mode, onBack, answer, turnCount }: AnswerHeaderProps) {
+  const title = (turnCount ?? 1) > 1 ? `Conversation (${turnCount} turns)` : question;
   return (
     <Box
       sx={{
@@ -35,7 +37,7 @@ export function AnswerHeader({ question, mode, onBack, answer }: AnswerHeaderPro
           whiteSpace: 'nowrap',
         }}
       >
-        {question}
+        {title}
       </Typography>
       <Chip
         label={mode === 'deep' ? 'Deep Research' : 'Fast'}
