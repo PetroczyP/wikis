@@ -43,6 +43,9 @@ export const auth = betterAuth({
       keyExpiration: {
         defaultExpiresIn: 90 * 24 * 60 * 60 * 1000, // 90 days
       },
+      rateLimit: {
+        enabled: false,
+      },
     }),
   ],
   session: {
