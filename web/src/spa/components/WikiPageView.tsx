@@ -424,6 +424,7 @@ export function WikiPageView({ content, mode = 'dark', onNavigate, pages = [] }:
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeHighlight]}
         components={components}
+        urlTransform={(url) => (url.startsWith('javascript:') ? '' : url)}
       >
         {processedBody}
       </ReactMarkdown>
