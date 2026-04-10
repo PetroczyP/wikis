@@ -644,6 +644,9 @@ class ArtifactExporter:
         )
         if not siblings:
             return content
+        # Don't append if the LLM already included a Related Pages section
+        if "## Related Pages" in content or "## related pages" in content.lower():
+            return content
         footer = "\n\n---\n\n## Related Pages\n\n"
         for title in siblings:
             footer += f"- [[{title}]]\n"

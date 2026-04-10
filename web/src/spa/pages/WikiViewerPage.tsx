@@ -553,7 +553,7 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
               <Typography color="text.secondary">No wiki pages found.</Typography>
             </Box>
           ) : (
-            <WikiPageView content={content} mode={mode} onNavigate={handleSelectPage} />
+            <WikiPageView content={content} mode={mode} onNavigate={handleSelectPage} pages={pages.map(p => ({ id: p.id, title: p.title }))} />
           )}
         </Box>
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json as _json
+import re
 from dataclasses import asdict
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
@@ -281,6 +282,30 @@ async def list_wikis(
     return result
 
 
+def _extract_frontmatter_title_section(content: str) -> tuple[str, str]:
+    """Parse YAML frontmatter and return (title, section) from it, or ('', '') if absent."""
+    if not content.startswith("---"):
+        return "", ""
+    end = content.find("\n---", 3)
+    if end == -1:
+        return "", ""
+    yaml_block = content[4:end]
+    title = ""
+    section = ""
+    for line in yaml_block.splitlines():
+        if not title:
+            m = re.match(r'^title\s*:\s*["\']?(.+?)["\']?\s*$', line)
+            if m:
+                title = m.group(1).strip()
+        if not section:
+            m = re.match(r'^section\s*:\s*["\']?(.+?)["\']?\s*$', line)
+            if m:
+                section = m.group(1).strip()
+        if title and section:
+            break
+    return title, section
+
+
 @router.get("/wikis/{wiki_id}")
 async def get_wiki(
     wiki_id: str,
@@ -401,11 +426,16 @@ async def get_wiki(
         except Exception:
             content_str = ""
 
+        # Prefer frontmatter title/section over filename-derived values
+        fm_title, fm_section = _extract_frontmatter_title_section(content_str)
+        display_title = fm_title or page_name.replace("-", " ").replace("_", " ").title().strip()
+        display_section = fm_section or section_name.replace("-", " ").replace("_", " ").title().strip()
+
         pages.append(
             {
                 "id": page_id,
-                "title": page_name.replace("-", " ").replace("_", " ").title(),
-                "section": section_name.replace("-", " ").replace("_", " ").title(),
+                "title": display_title,
+                "section": display_section,
                 "order": i,
                 "content": content_str,
             }

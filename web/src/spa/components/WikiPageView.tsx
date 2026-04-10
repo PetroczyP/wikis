@@ -1,4 +1,4 @@
-import { Box } from '@mui/material';
+import { Box, Chip, Collapse, IconButton, Tooltip, Typography } from '@mui/material';
 import ReactMarkdown from 'react-markdown';
 import { ShareButton } from './ShareButton';
 import remarkGfm from 'remark-gfm';
@@ -6,11 +6,13 @@ import rehypeHighlight from 'rehype-highlight';
 import { MermaidDiagram } from './MermaidDiagram';
 import { CodeBlock } from './CodeBlock';
 import type { Components } from 'react-markdown';
+import React, { useState } from 'react';
 
 interface WikiPageViewProps {
   content: string;
   mode?: 'light' | 'dark';
   onNavigate?: (pageId: string) => void;
+  pages?: { id: string; title: string }[];
 }
 
 /**
@@ -28,14 +30,149 @@ function extractText(node: React.ReactNode): string {
   return '';
 }
 
-function stripFrontmatter(raw: string): string {
-  if (!raw.startsWith('---')) return raw;
-  const end = raw.indexOf('\n---', 3);
-  if (end === -1) return raw;
-  return raw.slice(end + 4).replace(/^\r?\n/, '');
+interface FrontmatterMeta {
+  title?: string;
+  description?: string;
+  type?: string;
+  section?: string;
+  wiki?: string;
+  repository?: string;
+  branch?: string;
+  created?: string;
+  tags?: string[];
+  aliases?: string[];
+  key_files?: string[];
+  symbols?: string[];
+  source_files?: string[];
+  [key: string]: unknown;
 }
 
-export function WikiPageView({ content, mode = 'dark', onNavigate }: WikiPageViewProps) {
+function parseFrontmatter(raw: string): { meta: FrontmatterMeta; content: string } {
+  if (!raw.startsWith('---')) return { meta: {}, content: raw };
+  const end = raw.indexOf('\n---', 3);
+  if (end === -1) return { meta: {}, content: raw };
+  const yamlStr = raw.slice(4, end);
+  const content = raw.slice(end + 4).replace(/^\r?\n/, '');
+
+  const meta: FrontmatterMeta = {};
+  const lines = yamlStr.split('\n');
+  let currentKey: string | null = null;
+  let currentList: string[] | null = null;
+
+  for (const line of lines) {
+    const listItem = line.match(/^[ \t]+-[ \t]+(.+)/);
+    if (listItem && currentKey) {
+      if (!currentList) {
+        currentList = [];
+        (meta as Record<string, unknown>)[currentKey] = currentList;
+      }
+      currentList.push(listItem[1].trim().replace(/^["']|["']$/g, ''));
+      continue;
+    }
+    const kv = line.match(/^([a-zA-Z_][a-zA-Z0-9_-]*)\s*:\s*(.*)$/);
+    if (kv) {
+      currentList = null;
+      currentKey = kv[1];
+      const val = kv[2].trim().replace(/^["']|["']$/g, '');
+      if (val === '') {
+        currentList = [];
+        (meta as Record<string, unknown>)[currentKey] = currentList;
+      } else {
+        (meta as Record<string, unknown>)[currentKey] = val;
+      }
+    }
+  }
+  return { meta, content };
+}
+
+/** Convert [[Target|Label]] and [[Target]] wikilinks to [Label](wiki:Target) markdown links. */
+function processWikilinks(content: string): string {
+  return content.replace(/\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|([^\]]+))?\]\]/g, (_, target, label) => {
+    const display = (label ?? target).trim();
+    return `[${display}](wiki:${encodeURIComponent(target.trim())})`;
+  });
+}
+
+function WikiProperties({ meta, mode }: { meta: FrontmatterMeta; mode: 'light' | 'dark' }) {
+  const [open, setOpen] = useState(false);
+
+  const hasMeta = meta.description || meta.section || meta.repository || (meta.tags && meta.tags.length > 0) || (meta.key_files && meta.key_files.length > 0);
+  if (!hasMeta) return null;
+
+  // Filter tags to surface-friendly ones (skip long wiki/ prefixed tags)
+  const displayTags = (meta.tags ?? []).filter(
+    (t) => !t.startsWith('wiki/') && !t.startsWith('section/')
+  );
+
+  const dim = mode === 'dark' ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)';
+  const border = mode === 'dark' ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)';
+
+  return (
+    <Box sx={{ mb: 3, border: `1px solid ${border}`, borderRadius: 2, overflow: 'hidden', fontSize: '0.85rem' }}>
+      <Box
+        onClick={() => setOpen((o) => !o)}
+        sx={{
+          display: 'flex', alignItems: 'center', gap: 1, px: 2, py: 1,
+          bgcolor: dim, cursor: 'pointer', userSelect: 'none',
+          '&:hover': { bgcolor: mode === 'dark' ? 'rgba(255,255,255,0.09)' : 'rgba(0,0,0,0.07)' },
+        }}
+      >
+        <span style={{ fontSize: '0.75rem', opacity: 0.6 }}>{open ? '▾' : '▸'}</span>
+        <Typography variant="caption" sx={{ fontWeight: 600, opacity: 0.7, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+          Properties
+        </Typography>
+        {meta.type && (
+          <Chip label={meta.type} size="small" sx={{ height: 18, fontSize: '0.7rem', ml: 'auto', opacity: 0.7 }} />
+        )}
+      </Box>
+      <Collapse in={open}>
+        <Box sx={{ px: 2, py: 1.5, display: 'flex', flexDirection: 'column', gap: 1 }}>
+          {meta.description && (
+            <Box>
+              <Typography variant="caption" sx={{ opacity: 0.5, display: 'block', mb: 0.25 }}>description</Typography>
+              <Typography variant="body2" sx={{ lineHeight: 1.5 }}>{meta.description}</Typography>
+            </Box>
+          )}
+          {meta.section && (
+            <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+              <Typography variant="caption" sx={{ opacity: 0.5, minWidth: 80 }}>section</Typography>
+              <Typography variant="body2">{meta.section}</Typography>
+            </Box>
+          )}
+          {meta.repository && (
+            <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+              <Typography variant="caption" sx={{ opacity: 0.5, minWidth: 80 }}>repository</Typography>
+              <Typography variant="body2" sx={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>
+                {meta.repository}{meta.branch ? `@${meta.branch}` : ''}
+              </Typography>
+            </Box>
+          )}
+          {displayTags.length > 0 && (
+            <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap', alignItems: 'center' }}>
+              <Typography variant="caption" sx={{ opacity: 0.5, minWidth: 80 }}>tags</Typography>
+              {displayTags.map((t) => (
+                <Chip key={t} label={t.replace(/^type\/|^lang\//, '')} size="small"
+                  sx={{ height: 18, fontSize: '0.7rem', bgcolor: dim }} />
+              ))}
+            </Box>
+          )}
+          {meta.key_files && meta.key_files.length > 0 && (
+            <Box>
+              <Typography variant="caption" sx={{ opacity: 0.5, display: 'block', mb: 0.25 }}>key files</Typography>
+              <Box component="ul" sx={{ m: 0, pl: 2, '& li': { fontFamily: 'monospace', fontSize: '0.75rem', opacity: 0.8 } }}>
+                {meta.key_files.map((f) => <li key={f}>{f}</li>)}
+              </Box>
+            </Box>
+          )}
+        </Box>
+      </Collapse>
+    </Box>
+  );
+}
+
+export function WikiPageView({ content, mode = 'dark', onNavigate, pages = [] }: WikiPageViewProps) {
+  const { meta, content: body } = parseFrontmatter(content);
+  const processedBody = processWikilinks(body);
   // Callout type → color palette
   const calloutColors: Record<string, { border: string; bg: string; label: string }> = {
     abstract: { border: '#a78bfa', bg: 'rgba(167,139,250,0.08)', label: '📋' },
@@ -107,6 +244,31 @@ export function WikiPageView({ content, mode = 'dark', onNavigate }: WikiPageVie
       );
     },
     a({ href, children, ...props }) {
+      // Wikilinks resolved to wiki: protocol
+      if (href && href.startsWith('wiki:') && onNavigate) {
+        const title = decodeURIComponent(href.slice(5));
+        const page = pages.find(
+          (p) => p.title === title || p.title.toLowerCase() === title.toLowerCase()
+        );
+        if (page) {
+          return (
+            <a
+              href={`#${page.id}`}
+              onClick={(e) => { e.preventDefault(); onNavigate(page.id); }}
+              style={{ cursor: 'pointer' }}
+              {...props}
+            >
+              {children}
+            </a>
+          );
+        }
+        // Unresolved wikilink — show as dimmed non-link
+        return (
+          <span style={{ opacity: 0.5, textDecoration: 'underline dotted', cursor: 'not-allowed' }}>
+            {children}
+          </span>
+        );
+      }
       // Intercept internal .md links
       if (href && href.endsWith('.md') && !href.startsWith('http') && onNavigate) {
         const pageId = href.replace(/^\.\//, '').replace(/\.md$/, '');
@@ -257,12 +419,13 @@ export function WikiPageView({ content, mode = 'dark', onNavigate }: WikiPageVie
       <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 1 }}>
         <ShareButton />
       </Box>
+      <WikiProperties meta={meta} mode={mode} />
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeHighlight]}
         components={components}
       >
-        {stripFrontmatter(content)}
+        {processedBody}
       </ReactMarkdown>
     </Box>
   );

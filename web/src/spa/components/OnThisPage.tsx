@@ -24,6 +24,7 @@ export function OnThisPage({ contentRef }: OnThisPageProps) {
     const extract = () => {
       const nodes = el.querySelectorAll('h2, h3');
       const result: Heading[] = [];
+      const seenIds = new Set<string>();
       nodes.forEach((node) => {
         const text = node.textContent?.trim() ?? '';
         if (!text) return;
@@ -35,6 +36,8 @@ export function OnThisPage({ contentRef }: OnThisPageProps) {
             .replace(/^-|-$/g, '');
           node.id = id;
         }
+        if (seenIds.has(id)) return;
+        seenIds.add(id);
         result.push({ id, text, level: node.tagName === 'H2' ? 2 : 3 });
       });
       setHeadings(result);
