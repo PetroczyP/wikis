@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -115,12 +116,61 @@ class ResearchRequest(BaseModel):
     chat_history: list[ChatMessage] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Code Map — hierarchical call-tree view (like DeepWiki's code-map panel)
+# ---------------------------------------------------------------------------
+
+
+class CodeMapSymbol(BaseModel):
+    """A single symbol (function / class / variable) shown as a leaf in the tree."""
+
+    id: str
+    name: str
+    symbol_type: str = ""   # function, class, method, variable, …
+    file_path: str = ""     # relative path
+    line_start: int | None = None
+    description: str = ""   # LLM-generated 1-sentence explanation of this symbol's role
+    relationships: list[str] = Field(default_factory=list)  # e.g. ["calls: validate_token"]
+
+
+class CodeMapSection(BaseModel):
+    """A top-level section in the call-tree (usually one source file)."""
+
+    id: str
+    title: str          # short label, e.g. file basename
+    file_path: str = "" # relative path
+    description: str = ""
+    symbols: list[CodeMapSymbol] = Field(default_factory=list)
+
+
+class CallStackStep(BaseModel):
+    """One step in a call stack chain."""
+
+    symbol: str        # e.g. "MCPAuthMiddleware.__call__"
+    file_path: str = ""
+    description: str = ""  # what happens at this step
+
+class CallStack(BaseModel):
+    """A named call-flow chain, e.g. 'Frontend Auth' or 'MCP Auth'."""
+
+    title: str         # e.g. "Frontend Session Auth"
+    steps: list[CallStackStep] = Field(default_factory=list)
+
+class CodeMapData(BaseModel):
+    """Hierarchical call-tree for the code-map right panel."""
+
+    summary: str = ""   # LLM-generated 1-2 sentence overview
+    call_stacks: list[CallStack] = Field(default_factory=list)  # rendered call chains
+    sections: list[CodeMapSection] = Field(default_factory=list)
+
+
 class ResearchResponse(BaseModel):
     """Response from deep research."""
 
     answer: str
     sources: list[SourceReference] = Field(default_factory=list)
     research_steps: list[str] = Field(default_factory=list)
+    code_map: CodeMapData | None = None
 
 
 # ---------------------------------------------------------------------------

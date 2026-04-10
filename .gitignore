@@ -42,7 +42,7 @@ data/
 .claude/paste-cache
 .claude/plans
 .claude/image-cache
-
+.claude/tasks
 # Playwright
 .playwright-mcp/
 

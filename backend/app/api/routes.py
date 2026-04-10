@@ -172,6 +172,14 @@ async def research(
     accept: str = "application/json",
 ) -> ResearchResponse | StreamingResponse:
     try:
+        if request.research_type == "codemap":
+            if "text/event-stream" in accept:
+                async def codemap_sse():
+                    async for event in service.codemap_stream(request):
+                        event_type = event.get("event_type", "message")
+                        yield f"event: {event_type}\ndata: {_json.dumps(event.get('data', {}))}\n\n"
+                return StreamingResponse(codemap_sse(), media_type="text/event-stream")
+            return await service.codemap_sync(request)
         if "text/event-stream" in accept:
 
             async def stream():

@@ -133,11 +133,12 @@ export type ResearchSSEEvent =
   | ({ type: 'research_start' } & { session_id: string; question: string; timestamp: string })
   | ({ type: 'thinking_step' } & ThinkingStepEvent)
   | ({ type: 'answer_chunk' } & { chunk: string; timestamp: string })
-  | ({ type: 'research_complete' } & { session_id: string; report: string; timestamp: string })
+  | ({ type: 'research_complete' } & { session_id: string; report: string; timestamp: string; code_map?: unknown })
   | ({ type: 'research_error' } & { session_id: string; error: string; timestamp: string })
   | ({ type: 'task_complete' } & { taskId?: string; status: string; wikiId?: string; wiki_id?: string })
   | ({ type: 'task_failed' } & { taskId?: string; status: string; error: string; recoverable?: boolean })
-  | ({ type: 'todo_update' } & { todos: unknown[]; timestamp: string });
+  | ({ type: 'todo_update' } & { todos: unknown[]; timestamp: string })
+  | ({ type: 'code_map_ready' } & { code_map: unknown });
 
 export type AskSSEEvent =
   | ({ type: 'ask_start' } & { session_id: string; question: string; timestamp: string })

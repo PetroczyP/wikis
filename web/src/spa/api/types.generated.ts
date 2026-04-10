@@ -310,11 +310,6 @@ export interface components {
              * @default null
              */
             embedding_model: string | null;
-            /**
-             * Visibility
-             * @default personal
-             */
-            visibility?: 'personal' | 'shared';
         };
         /**
          * GenerateWikiResponse
@@ -414,10 +409,10 @@ export interface components {
              */
             research_type: string;
             /**
-             * Chat History
-             * @default []
+             * Enable Subagents
+             * @default true
              */
-            chat_history?: components["schemas"]["ChatMessage"][];
+            enable_subagents: boolean;
         };
         /**
          * ResearchResponse
@@ -430,6 +425,8 @@ export interface components {
             sources?: components["schemas"]["SourceReference"][];
             /** Research Steps */
             research_steps?: string[];
+            /** Code Map */
+            code_map?: components["schemas"]["CodeMapData"] | null;
         };
         /**
          * SourceReference
@@ -515,21 +512,6 @@ export interface components {
              * @default null
              */
             error: string | null;
-            /**
-             * Owner Id
-             * @default null
-             */
-            owner_id?: string | null;
-            /**
-             * Visibility
-             * @default personal
-             */
-            visibility?: 'personal' | 'shared';
-            /**
-             * Is Owner
-             * @default true
-             */
-            is_owner?: boolean;
         };
         /**
          * SSEEvent
@@ -614,6 +596,100 @@ export interface components {
              * @default false
              */
             recoverable: boolean;
+        };
+        /** CodeMapSymbol */
+        CodeMapSymbol: {
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /**
+             * Symbol Type
+             * @default
+             */
+            symbol_type: string;
+            /**
+             * File Path
+             * @default
+             */
+            file_path: string;
+            /** Line Start */
+            line_start?: number | null;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /**
+             * Relationships
+             * @default []
+             */
+            relationships: string[];
+        };
+        /** CodeMapSection */
+        CodeMapSection: {
+            /** Id */
+            id: string;
+            /** Title */
+            title: string;
+            /**
+             * File Path
+             * @default
+             */
+            file_path: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /**
+             * Symbols
+             * @default []
+             */
+            symbols: components["schemas"]["CodeMapSymbol"][];
+        };
+        /** CodeMapData */
+        CodeMapData: {
+            /**
+             * Summary
+             * @default
+             */
+            summary: string;
+            /**
+             * Call Stacks
+             * @default []
+             */
+            call_stacks: components["schemas"]["CallStack"][];
+            /**
+             * Sections
+             * @default []
+             */
+            sections: components["schemas"]["CodeMapSection"][];
+        };
+        /** CallStackStep */
+        CallStackStep: {
+            /** Symbol */
+            symbol: string;
+            /**
+             * File Path
+             * @default
+             */
+            file_path: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+        };
+        /** CallStack */
+        CallStack: {
+            /** Title */
+            title: string;
+            /**
+             * Steps
+             * @default []
+             */
+            steps: components["schemas"]["CallStackStep"][];
         };
     };
     responses: never;

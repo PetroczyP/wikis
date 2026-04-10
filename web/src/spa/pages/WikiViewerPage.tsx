@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense } from 'react';
 import {
   Box, Typography, CircularProgress, Dialog, DialogTitle,
   DialogContent, DialogActions, Button, TextField, Chip, Divider,
@@ -10,6 +10,7 @@ import { WikiPageView } from '../components/WikiPageView';
 import { OnThisPage } from '../components/OnThisPage';
 import { useRepoContext } from '../context/RepoContext';
 import { AskBar } from '../components/AskBar';
+import type { AskMode } from '../components/AskBar';
 import { AnswerView } from '../components/AnswerView';
 import { AnswerHeader } from '../components/AnswerHeader';
 import { ToolCallPanel } from '../components/ToolCallPanel';
@@ -21,8 +22,11 @@ import type { WikiPage } from '../components/WikiSidebar';
 import type { WikiDetail } from '../api/wiki';
 import type { components } from '../api/types.generated';
 
+const CodeMapTree = lazy(() => import('../components/CodeMapTree'));
+
 type SourceReference = components['schemas']['SourceReference'];
 type ChatMessage = components['schemas']['ChatMessage'];
+type CodeMapData = components['schemas']['CodeMapData'];
 
 interface WikiViewerPageProps {
   mode?: 'light' | 'dark';
@@ -36,7 +40,8 @@ interface AskState {
   todos: TodoItem[];
   loading: boolean;
   error: boolean;
-  mode: 'fast' | 'deep';
+  mode: AskMode;
+  codeMap?: CodeMapData | null;
 }
 
 interface PageData {
@@ -242,7 +247,7 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
   );
 
   const handleAsk = useCallback(
-    (question: string, useDeepResearch: boolean) => {
+    (question: string, mode: AskMode) => {
       if (!wikiId) return;
 
       // Cancel any in-flight research stream
@@ -252,13 +257,14 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
       // Append a new turn to the thread
       setChatTurns((prev) => [
         ...prev,
-        { question, answer: null, sources: [], toolCalls: [], todos: [], loading: true, error: false, mode: useDeepResearch ? 'deep' : 'fast' },
+        { question, answer: null, sources: [], toolCalls: [], todos: [], loading: true, error: false, mode },
       ]);
 
-      if (useDeepResearch) {
+      if (mode === 'deep' || mode === 'codemap') {
+        const researchType = mode === 'codemap' ? 'codemap' : 'general';
         const cancel = subscribeResearchSSE(
           '/api/v1/research',
-          { wiki_id: wikiId, question, research_type: 'general', chat_history: convHistory },
+          { wiki_id: wikiId, question, research_type: researchType, chat_history: convHistory },
           (event) => {
             if (event.type === 'thinking_step') {
               const e = event;
@@ -298,9 +304,22 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
               });
             } else if (event.type === 'answer_chunk') {
               updateLastTurn((prev) => ({ ...prev, answer: (prev.answer ?? '') + event.chunk }));
+            } else if (event.type === 'code_map_ready') {
+              // Code map arrives early (before refine_answer finishes)
+              const codeMap = (event as { type: string; code_map?: unknown }).code_map as AskState['codeMap'] | undefined;
+              if (codeMap) {
+                updateLastTurn((prev) => ({ ...prev, codeMap }));
+              }
             } else if (event.type === 'research_complete') {
               const answer = event.report ?? '';
-              updateLastTurn((prev) => ({ ...prev, answer, loading: false, error: false }));
+              const codeMap = event.code_map as AskState['codeMap'] | undefined;
+              updateLastTurn((prev) => ({
+                ...prev,
+                answer,
+                loading: false,
+                error: false,
+                ...(codeMap ? { codeMap } : {}),
+              }));
             } else if (event.type === 'research_error') {
               updateLastTurn((prev) => ({ ...prev, answer: `Error: ${event.error}`, loading: false, error: true }));
             } else if (event.type === 'task_failed') {
@@ -526,6 +545,7 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                     ...thinScrollbar,
                     borderRight: '1px solid',
                     borderColor: 'divider',
+                    pb: 12,
                   }}
                 >
                   {chatTurns.map((turn, i) => (
@@ -541,16 +561,24 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
                   ))}
                   <div ref={threadEndRef} />
                 </Box>
-                {/* Right: Tool Calls for the latest turn */}
+                {/* Right: Tool Calls / Code Map for the latest turn */}
                 <Box
                   sx={{
                     width: { xs: 0, md: '40%' },
                     maxWidth: 400,
                     flexShrink: 0,
-                    overflow: 'hidden',
+                    overflowY: 'auto',
                     display: { xs: 'none', md: 'block' },
+                    ...thinScrollbar,
                   }}
                 >
+                  {/* Code map first (primary content when available) */}
+                  {chatTurns[chatTurns.length - 1].codeMap && (
+                    <Suspense fallback={<Box sx={{ p: 2, display: 'flex', justifyContent: 'center' }}><CircularProgress size={24} /></Box>}>
+                      <CodeMapTree data={chatTurns[chatTurns.length - 1].codeMap!} />
+                    </Suspense>
+                  )}
+                  {/* Tool calls below */}
                   <ToolCallPanel
                     toolCalls={chatTurns[chatTurns.length - 1].toolCalls}
                     todos={chatTurns[chatTurns.length - 1].todos}
