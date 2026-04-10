@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import { ShareButton } from './ShareButton';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
+import rehypeSlug from 'rehype-slug';
 import { MermaidDiagram } from './MermaidDiagram';
 import { CodeBlock } from './CodeBlock';
 import type { Components } from 'react-markdown';
@@ -422,7 +423,7 @@ export function WikiPageView({ content, mode = 'dark', onNavigate, pages = [] }:
       <WikiProperties meta={meta} mode={mode} />
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight]}
+        rehypePlugins={[rehypeSlug, rehypeHighlight]}
         components={components}
         urlTransform={(url) => (url.startsWith('javascript:') ? '' : url)}
       >

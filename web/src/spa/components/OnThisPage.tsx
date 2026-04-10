@@ -28,15 +28,9 @@ export function OnThisPage({ contentRef }: OnThisPageProps) {
       nodes.forEach((node) => {
         const text = node.textContent?.trim() ?? '';
         if (!text) return;
-        let id = node.id;
-        if (!id) {
-          id = text
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, '-')
-            .replace(/^-|-$/g, '');
-          node.id = id;
-        }
-        if (seenIds.has(id)) return;
+        // rehype-slug sets the id; fall back to slugifying if missing
+        const id = node.id || text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        if (!id || seenIds.has(id)) return;
         seenIds.add(id);
         result.push({ id, text, level: node.tagName === 'H2' ? 2 : 3 });
       });
