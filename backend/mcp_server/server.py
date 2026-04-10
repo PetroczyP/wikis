@@ -12,11 +12,19 @@ import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("wikis", streamable_http_path="/")
+# Disable MCP SDK's built-in DNS rebinding protection — the endpoint is mounted
+# behind FastAPI (which handles CORS) and must accept requests from any Host
+# (e.g. host.docker.internal, custom domains, reverse proxies).
+mcp = FastMCP(
+    "wikis",
+    streamable_http_path="/",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 # Service references — set by mount_mcp() when embedded in FastAPI
 _wiki_management = None
