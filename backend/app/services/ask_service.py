@@ -127,8 +127,8 @@ class AskService:
         has_context = bool(request.chat_history)
         embedding = None
 
-        # Cache lookup
-        if self._qa_service:
+        # Cache lookup (wiki asks only — project asks have no single wiki_id to key on)
+        if self._qa_service and request.wiki_id and not request.project_id:
             cached_record, embedding = await self._qa_service.lookup_cache(
                 request.wiki_id, request.question, chat_history=_to_chat_dicts(request),
             )
@@ -151,7 +151,7 @@ class AskService:
 
         # Cache miss — get current commit for recording, then stream from agent
         source_commit_hash = None
-        if self._qa_service:
+        if self._qa_service and request.wiki_id:
             source_commit_hash = await self._qa_service.get_wiki_commit_hash(request.wiki_id)
 
         completed = False
@@ -171,7 +171,7 @@ class AskService:
                     completed = True
                 yield event
         finally:
-            if completed and self._qa_service:
+            if completed and self._qa_service and request.wiki_id and not request.project_id:
                 payload = QARecordingPayload(
                     qa_id=qa_id, wiki_id=request.wiki_id,
                     question=request.question, answer=final_answer,
@@ -192,8 +192,8 @@ class AskService:
         cached_record = None
         embedding = None
 
-        # Cache lookup
-        if self._qa_service:
+        # Cache lookup (wiki asks only — project asks have no single wiki_id to key on)
+        if self._qa_service and request.wiki_id and not request.project_id:
             cached_record, embedding = await self._qa_service.lookup_cache(
                 request.wiki_id, request.question, chat_history=_to_chat_dicts(request),
             )
@@ -240,7 +240,7 @@ class AskService:
         )
 
         recording = None
-        if self._qa_service:
+        if self._qa_service and request.wiki_id and not request.project_id:
             source_commit_hash = await self._qa_service.get_wiki_commit_hash(request.wiki_id)
             sources_json = json.dumps([s.model_dump() for s in sources])
             recording = QARecordingPayload(
