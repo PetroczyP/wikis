@@ -807,6 +807,11 @@
             ],
             "default": null,
             "title": "Embedding Model"
+          },
+          "visibility": {
+            "default": "personal",
+            "title": "Visibility",
+            "type": "string"
           }
         },
         "required": [
@@ -1221,6 +1226,58 @@
             ],
             "default": null,
             "title": "Error"
+          },
+          "indexed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Indexed At"
+          },
+          "commit_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Commit Hash"
+          },
+          "owner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Owner Id"
+          },
+          "visibility": {
+            "default": "personal",
+            "title": "Visibility",
+            "type": "string"
+          },
+          "is_owner": {
+            "default": false,
+            "title": "Is Owner",
+            "type": "boolean"
+          },
+          "requires_token": {
+            "default": false,
+            "title": "Requires Token",
+            "type": "boolean"
           }
         },
         "required": [

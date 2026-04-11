@@ -310,6 +310,11 @@ export interface components {
              * @default null
              */
             embedding_model: string | null;
+            /**
+             * Visibility
+             * @default personal
+             */
+            visibility: string;
         };
         /**
          * GenerateWikiResponse
@@ -512,6 +517,36 @@ export interface components {
              * @default null
              */
             error: string | null;
+            /**
+             * Indexed At
+             * @default null
+             */
+            indexed_at: string | null;
+            /**
+             * Commit Hash
+             * @default null
+             */
+            commit_hash: string | null;
+            /**
+             * Owner Id
+             * @default null
+             */
+            owner_id: string | null;
+            /**
+             * Visibility
+             * @default personal
+             */
+            visibility: string;
+            /**
+             * Is Owner
+             * @default false
+             */
+            is_owner: boolean;
+            /**
+             * Requires Token
+             * @default false
+             */
+            requires_token: boolean;
         };
         /**
          * SSEEvent
