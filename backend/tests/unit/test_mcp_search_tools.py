@@ -177,10 +177,18 @@ async def test_get_page_neighbors_returns_links_to_and_linked_from():
     mock_cache = AsyncMock()
     mock_cache.get = AsyncMock(return_value=page_index)
 
+    # Access-control mock: user can see "wiki-1".
+    wiki_list = MagicMock()
+    wiki_list.wikis = [_make_wiki_record("wiki-1")]
+    mock_mgmt = AsyncMock()
+    mock_mgmt.list_wikis = AsyncMock(return_value=wiki_list)
+
     token = srv._current_user_id.set("user-1")
     old_cache = srv._page_index_cache
+    old_mgmt = srv._wiki_management
     try:
         srv._page_index_cache = mock_cache
+        srv._wiki_management = mock_mgmt
         result = await srv.get_page_neighbors(wiki_id="wiki-1", page_title="Overview")
 
         assert result["wiki_id"] == "wiki-1"
@@ -192,6 +200,7 @@ async def test_get_page_neighbors_returns_links_to_and_linked_from():
     finally:
         srv._current_user_id.reset(token)
         srv._page_index_cache = old_cache
+        srv._wiki_management = old_mgmt
 
 
 @pytest.mark.asyncio
@@ -203,13 +212,22 @@ async def test_get_page_neighbors_raises_on_unknown_page():
     mock_cache = AsyncMock()
     mock_cache.get = AsyncMock(return_value=page_index)
 
+    # Access-control mock: user can see "wiki-1" so we reach the page check.
+    wiki_list = MagicMock()
+    wiki_list.wikis = [_make_wiki_record("wiki-1")]
+    mock_mgmt = AsyncMock()
+    mock_mgmt.list_wikis = AsyncMock(return_value=wiki_list)
+
     old_cache = srv._page_index_cache
+    old_mgmt = srv._wiki_management
     try:
         srv._page_index_cache = mock_cache
+        srv._wiki_management = mock_mgmt
         with pytest.raises(ValueError, match="Page not found"):
             await srv.get_page_neighbors(wiki_id="wiki-1", page_title="NonExistent")
     finally:
         srv._page_index_cache = old_cache
+        srv._wiki_management = old_mgmt
 
 
 @pytest.mark.asyncio
@@ -398,10 +416,18 @@ async def test_get_page_neighbors_auth_direct_mode():
     mock_cache = AsyncMock()
     mock_cache.get = AsyncMock(return_value=page_index)
 
+    # Access-control mock: "auth-user-99" can see "wiki-1".
+    wiki_list = MagicMock()
+    wiki_list.wikis = [_make_wiki_record("wiki-1")]
+    mock_mgmt = AsyncMock()
+    mock_mgmt.list_wikis = AsyncMock(return_value=wiki_list)
+
     token = srv._current_user_id.set("auth-user-99")
     old_cache = srv._page_index_cache
+    old_mgmt = srv._wiki_management
     try:
         srv._page_index_cache = mock_cache
+        srv._wiki_management = mock_mgmt
         result = await srv.get_page_neighbors(wiki_id="wiki-1", page_title="Overview")
         # Should succeed and return the right structure
         assert result["wiki_id"] == "wiki-1"
@@ -409,6 +435,7 @@ async def test_get_page_neighbors_auth_direct_mode():
     finally:
         srv._current_user_id.reset(token)
         srv._page_index_cache = old_cache
+        srv._wiki_management = old_mgmt
 
 
 @pytest.mark.asyncio
@@ -458,3 +485,42 @@ async def test_search_project_auth_direct_mode():
         srv._page_index_cache = old_cache
         srv._settings = old_settings
         srv._session_factory = old_factory
+
+
+@pytest.mark.asyncio
+async def test_search_wiki_blocks_inaccessible_wiki():
+    """search_wiki must return an error dict when the wiki is not in the user's list."""
+    import mcp_server.server as srv
+
+    wiki_list_result = MagicMock()
+    wiki_list_result.wikis = []  # user has no wikis
+
+    mock_mgmt = AsyncMock()
+    mock_mgmt.list_wikis = AsyncMock(return_value=wiki_list_result)
+
+    mock_cache = AsyncMock()
+    mock_settings = MagicMock()
+    mock_settings.cache_dir = "/tmp"
+
+    token = srv._current_user_id.set("test-user")
+    old_mgmt = srv._wiki_management
+    old_cache = srv._page_index_cache
+    old_settings = srv._settings
+    try:
+        srv._wiki_management = mock_mgmt
+        srv._page_index_cache = mock_cache
+        srv._settings = mock_settings
+
+        result = await srv.search_wiki(wiki_id="secret-wiki", query="anything")
+
+        assert "error" in result
+        assert "Wiki not found" in result["error"]
+        # Cache must NOT be touched for an inaccessible wiki.
+        mock_cache.get.assert_not_called()
+        # user_id must be passed through.
+        mock_mgmt.list_wikis.assert_called_once_with(user_id="test-user")
+    finally:
+        srv._current_user_id.reset(token)
+        srv._wiki_management = old_mgmt
+        srv._page_index_cache = old_cache
+        srv._settings = old_settings
