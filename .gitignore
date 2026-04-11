@@ -43,6 +43,9 @@ data/
 .claude/plans
 .claude/image-cache
 .claude/tasks
+
+.octobots/memory
+
 # Playwright
 .playwright-mcp/
 
