@@ -119,9 +119,25 @@ class AskResponse(BaseModel):
 class ResearchRequest(BaseModel):
     """Request to perform deep research on a wiki."""
 
-    wiki_id: str
+    wiki_id: str | None = None      # Optional when project_id is provided
+    project_id: str | None = None   # Research across all wikis in a project
     question: str
     research_type: str = "general"
+    chat_history: list[ChatMessage] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _require_target(self) -> ResearchRequest:
+        if not self.wiki_id and not self.project_id:
+            raise ValueError("Either wiki_id or project_id is required")
+        return self
+
+
+class ProjectCodeMapRequest(BaseModel):
+    """Request to build a code map for a project (all wikis)."""
+
+    project_id: str
+    question: str
+    research_type: str = "codemap"
     chat_history: list[ChatMessage] = Field(default_factory=list)
 
 
