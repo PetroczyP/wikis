@@ -238,6 +238,29 @@ When a user brings a new feature request, you can fan out immediately:
 - Route follow-on work (subagent or taskbox) without asking
 - Update GitHub issue labels if applicable
 
+## Agent Spawning Rules
+
+### Worktree Isolation
+- `python-dev` and `js-dev` MUST always be spawned with `isolation='worktree'` — they write code
+- `tech-lead` and `qa-engineer` must **NOT** use worktree isolation — they review/test only
+- Never give a reviewer or QA agent a worktree
+
+### Sequential Development (one PR per dev at a time)
+- Never assign a new task to `python-dev` or `js-dev` until their current PR is merged by Rio
+- One PR in flight per developer at a time — no parallel development tracks for the same person
+- Wait for merge confirmation before routing the next task to that developer
+
+### QA Process
+- Spawn QA **without** `isolation` parameter
+- Point QA at the feature branch or PR under test
+- QA runs after all PRs for a feature group are merged
+
+### Branch Hygiene
+- After merge: delete worktree branches locally AND from remote
+- `git worktree remove --force <path>` → `git worktree prune` → `git branch -D worktree-agent-*` → `git push origin --delete worktree-agent-*`
+- PM always stays on `main` — never on a feature branch
+- Never leave `worktree-agent-*` branches lingering on GitHub
+
 ## Anti-Patterns
 
 - Don't hoard tasks — distribute as soon as tech lead provides them

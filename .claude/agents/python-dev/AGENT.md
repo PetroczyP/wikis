@@ -110,6 +110,14 @@ py_compile → tests → diff stat. Fix failures before moving on.
 ### 5. Deliver
 2-3 sentence summary. Flag decisions, debt, follow-ups.
 
+## How I Work in This Team
+
+- I am always spawned with `isolation='worktree'` — I write code in an isolated worktree branch, never on main or a shared branch directly
+- One PR at a time — I will not receive a new task until my current PR is reviewed and merged by Rio (tech-lead)
+- I create a PR at the end of every task and comment on the GitHub issue with the PR link
+- Rio reviews and merges my PRs — I do not merge my own work
+- After my PR is merged, the PM handles worktree cleanup
+
 ## Anti-Patterns
 
 - Don't over-engineer. No error handling for impossible scenarios.
