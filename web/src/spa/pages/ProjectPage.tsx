@@ -5,6 +5,7 @@ import {
   Box,
   Button,
   Card,
+  CardActionArea,
   Chip,
   CircularProgress,
   Dialog,
@@ -19,6 +20,7 @@ import {
   Tooltip,
   Typography,
 } from '@mui/material';
+import AddIcon from '@mui/icons-material/Add';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import CheckIcon from '@mui/icons-material/Check';
 import CloseIcon from '@mui/icons-material/Close';
@@ -49,7 +51,6 @@ import {
 import { subscribeAskSSE, subscribeResearchSSE } from '../api/sse';
 import type { ToolCallRecord, TodoItem } from '../api/sse';
 import { listWikis } from '../api/wiki';
-import { useAuth } from '../hooks/useAuth';
 import type { components } from '../api/types.generated';
 
 const CodeMapTree = lazy(() => import('../components/CodeMapTree'));
@@ -112,8 +113,6 @@ function extractOwnerRepo(url: string): string {
 export function ProjectPage() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
-  const { user } = useAuth();
-
   const [project, setProject] = useState<ProjectResponse | null>(null);
   const [wikis, setWikis] = useState<WikiSummary[]>([]);
   const [allWikis, setAllWikis] = useState<WikiSummary[]>([]);
@@ -132,7 +131,8 @@ export function ProjectPage() {
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
-  // Add wiki state
+  // Add wiki modal state
+  const [addWikiModalOpen, setAddWikiModalOpen] = useState(false);
   const [wikiToAdd, setWikiToAdd] = useState<WikiSummary | null>(null);
   const [addingWiki, setAddingWiki] = useState(false);
   const [removingWikiId, setRemovingWikiId] = useState<string | null>(null);
@@ -196,7 +196,7 @@ export function ProjectPage() {
       setProject(proj);
       setWikis(wikiRes.wikis ?? []);
       // Only fetch all wikis if current user is owner (needed for "add wiki" panel)
-      if (user?.id === proj.owner_id) {
+      if (proj.is_owner) {
         const allWikiRes = await listWikis();
         setAllWikis(allWikiRes.wikis ?? []);
       }
@@ -205,13 +205,13 @@ export function ProjectPage() {
     } finally {
       setLoading(false);
     }
-  }, [projectId, user?.id]);
+  }, [projectId]);
 
   useEffect(() => {
     load();
   }, [load]);
 
-  const isOwner = user?.id === project?.owner_id;
+  const isOwner = project?.is_owner ?? false;
 
   // Wikis not yet in this project
   const memberIds = new Set(wikis.map((w) => w.wiki_id));
@@ -683,12 +683,41 @@ export function ProjectPage() {
       </Box>
 
       {/* Wiki grid */}
-      {wikis.length === 0 ? (
+      {wikis.length === 0 && !isOwner ? (
         <Alert severity="info">
-          No wikis in this project yet. Click the edit button above to add wikis.
+          No wikis in this project yet.
         </Alert>
       ) : (
         <Grid container spacing={2.5} sx={{ mb: 4 }}>
+          {isOwner && (
+            <Grid item xs={12} sm={6} md={4}>
+              <Card
+                variant="outlined"
+                sx={{
+                  height: 140,
+                  borderRadius: 3,
+                  border: '2px dashed',
+                  borderColor: 'divider',
+                  '&:hover': { borderColor: 'primary.main' },
+                }}
+              >
+                <CardActionArea
+                  onClick={() => setAddWikiModalOpen(true)}
+                  sx={{
+                    height: '100%',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    justifyContent: 'center',
+                  }}
+                >
+                  <AddIcon sx={{ fontSize: 32, color: 'text.secondary', mb: 1 }} />
+                  <Typography variant="body2" color="text.secondary">
+                    Add a repository
+                  </Typography>
+                </CardActionArea>
+              </Card>
+            </Grid>
+          )}
           {wikis.map((wiki) => {
             const gradient = cardGradient(wiki.wiki_id);
             return (
@@ -822,62 +851,87 @@ export function ProjectPage() {
         />
       )}
 
-      {/* Edit Project Modal */}
+      {/* Edit Description Modal */}
       <Dialog
         open={descModalOpen}
         onClose={handleCloseDescModal}
         maxWidth="md"
         fullWidth
         PaperProps={{
-          sx: { bgcolor: 'background.default', backgroundImage: 'none', minHeight: '60vh' },
+          sx: { bgcolor: 'background.default', backgroundImage: 'none', minHeight: '50vh' },
         }}
       >
         <DialogTitle sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          Edit Project
+          Edit Description
           <IconButton size="small" onClick={handleCloseDescModal}>
             <CloseIcon fontSize="small" />
           </IconButton>
         </DialogTitle>
-        <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 3, pt: '8px !important' }}>
-          {/* Description */}
-          <Box>
-            <Typography variant="subtitle2" sx={{ mb: 1 }}>
-              Description
-            </Typography>
-            <TextField
-              value={descDraft}
-              onChange={(e) => setDescDraft(e.target.value)}
-              placeholder="Write your project description in Markdown..."
-              multiline
-              fullWidth
-              minRows={8}
-              maxRows={15}
-              disabled={savingDesc}
-              InputProps={{
-                sx: {
-                  fontFamily: '"JetBrains Mono", "Fira Code", monospace',
-                  fontSize: '0.9rem',
-                  lineHeight: 1.7,
-                  '& textarea': { p: 0 },
-                },
-              }}
-              sx={{
-                '& .MuiOutlinedInput-root': {
-                  bgcolor: 'rgba(255,255,255,0.02)',
-                  p: 2.5,
-                  borderRadius: 2,
-                },
-              }}
-            />
-          </Box>
+        <DialogContent sx={{ pt: '8px !important' }}>
+          <TextField
+            value={descDraft}
+            onChange={(e) => setDescDraft(e.target.value)}
+            placeholder="Write your project description in Markdown..."
+            multiline
+            fullWidth
+            minRows={12}
+            maxRows={20}
+            disabled={savingDesc}
+            InputProps={{
+              sx: {
+                fontFamily: '"JetBrains Mono", "Fira Code", monospace',
+                fontSize: '0.9rem',
+                lineHeight: 1.7,
+                '& textarea': { p: 0 },
+              },
+            }}
+            sx={{
+              '& .MuiOutlinedInput-root': {
+                bgcolor: 'rgba(255,255,255,0.02)',
+                p: 2.5,
+                borderRadius: 2,
+              },
+            }}
+          />
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={handleCloseDescModal} disabled={savingDesc}>
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            onClick={handleSaveDesc}
+            disabled={savingDesc || !descHasChanges}
+            startIcon={savingDesc ? <CircularProgress size={14} /> : <CheckIcon />}
+          >
+            Save
+          </Button>
+        </DialogActions>
+      </Dialog>
 
-          {/* Wikis in project */}
-          <Box>
-            <Typography variant="subtitle2" sx={{ mb: 1 }}>
-              Wikis
-            </Typography>
-            {wikis.length > 0 && (
-              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 2 }}>
+      {/* Add Repository Modal */}
+      <Dialog
+        open={addWikiModalOpen}
+        onClose={() => setAddWikiModalOpen(false)}
+        maxWidth="sm"
+        fullWidth
+        PaperProps={{
+          sx: { bgcolor: 'background.default', backgroundImage: 'none' },
+        }}
+      >
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          Add Repository
+          <IconButton size="small" onClick={() => setAddWikiModalOpen(false)}>
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: '8px !important' }}>
+          {wikis.length > 0 && (
+            <Box>
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Current wikis
+              </Typography>
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
                 {wikis.map((wiki) => {
                   const isRemoving = removingWikiId === wiki.wiki_id;
                   return (
@@ -893,7 +947,7 @@ export function ProjectPage() {
                         borderColor: 'divider',
                         borderRadius: 2,
                         minWidth: 0,
-                        flex: { xs: '0 1 100%', sm: '0 1 calc(50% - 8px)', md: '0 1 calc(33.333% - 8px)' },
+                        flex: { xs: '0 1 100%', sm: '0 1 calc(50% - 8px)' },
                       }}
                     >
                       <Box sx={{ flex: 1, minWidth: 0 }}>
@@ -924,8 +978,13 @@ export function ProjectPage() {
                   );
                 })}
               </Box>
-            )}
-            {availableToAdd.length > 0 && (
+            </Box>
+          )}
+          {availableToAdd.length > 0 ? (
+            <Box>
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Add a wiki
+              </Typography>
               <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'center' }}>
                 <Autocomplete
                   options={availableToAdd}
@@ -949,25 +1008,16 @@ export function ProjectPage() {
                   Add
                 </Button>
               </Box>
-            )}
-            {wikis.length === 0 && availableToAdd.length === 0 && (
-              <Typography variant="body2" color="text.secondary">
-                No wikis available to add.
-              </Typography>
-            )}
-          </Box>
+            </Box>
+          ) : (
+            <Typography variant="body2" color="text.secondary">
+              No more wikis available to add.
+            </Typography>
+          )}
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2 }}>
-          <Button onClick={handleCloseDescModal} disabled={savingDesc}>
-            Cancel
-          </Button>
-          <Button
-            variant="contained"
-            onClick={handleSaveDesc}
-            disabled={savingDesc || !descHasChanges}
-            startIcon={savingDesc ? <CircularProgress size={14} /> : <CheckIcon />}
-          >
-            Save
+          <Button onClick={() => setAddWikiModalOpen(false)}>
+            Done
           </Button>
         </DialogActions>
       </Dialog>

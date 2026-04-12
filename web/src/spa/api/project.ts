@@ -9,6 +9,7 @@ export interface ProjectResponse {
   description: string | null;
   visibility: 'personal' | 'shared';
   owner_id: string;
+  is_owner: boolean;
   created_at: string;
   wiki_count: number;
 }

@@ -1028,13 +1028,14 @@ async def import_wiki(
 # ---------------------------------------------------------------------------
 
 
-def _project_response(project, wiki_count: int = 0) -> ProjectResponse:
+def _project_response(project, wiki_count: int = 0, user_id: str | None = None) -> ProjectResponse:
     return ProjectResponse(
         id=project.id,
         name=project.name,
         description=project.description,
         visibility=project.visibility,
         owner_id=project.owner_id,
+        is_owner=(user_id is not None and (project.owner_id == user_id or not project.owner_id)),
         created_at=project.created_at,
         wiki_count=wiki_count,
     )
@@ -1052,7 +1053,7 @@ async def create_project(
         description=body.description,
         visibility=body.visibility,
     )
-    return _project_response(project)
+    return _project_response(project, user_id=user.id)
 
 
 @router.get("/projects", response_model=ProjectListResponse)
@@ -1062,7 +1063,7 @@ async def list_projects(
 ) -> ProjectListResponse:
     projects = await svc.list_projects(user_id=user.id)
     counts = await svc.batch_get_wiki_counts([p.id for p in projects])
-    items = [_project_response(p, counts.get(p.id, 0)) for p in projects]
+    items = [_project_response(p, counts.get(p.id, 0), user_id=user.id) for p in projects]
     return ProjectListResponse(projects=items)
 
 
@@ -1076,7 +1077,7 @@ async def get_project(
     if project is None:
         raise HTTPException(404, f"Project not found: {project_id}")
     count = await svc.get_wiki_count(project_id)
-    return _project_response(project, count)
+    return _project_response(project, count, user_id=user.id)
 
 
 @router.patch("/projects/{project_id}", response_model=ProjectResponse)
@@ -1096,7 +1097,7 @@ async def update_project(
     if updated is None:
         raise HTTPException(403, "Only the project owner can modify this project")
     count = await svc.get_wiki_count(project_id)
-    return _project_response(updated, count)
+    return _project_response(updated, count, user_id=user.id)
 
 
 @router.delete("/projects/{project_id}", status_code=200)
@@ -1137,7 +1138,7 @@ async def add_wiki_to_project(
         # Wiki already in project — idempotent, return current state
         pass
     count = await svc.get_wiki_count(project_id)
-    return _project_response(existing, count)
+    return _project_response(existing, count, user_id=user.id)
 
 
 @router.delete("/projects/{project_id}/wikis/{wiki_id}", status_code=200)

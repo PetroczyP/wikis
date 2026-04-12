@@ -286,6 +286,7 @@ class ProjectResponse(BaseModel):
     description: str | None
     visibility: str
     owner_id: str
+    is_owner: bool = False
     created_at: datetime
     wiki_count: int = 0
 

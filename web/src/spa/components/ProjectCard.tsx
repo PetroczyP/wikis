@@ -16,7 +16,6 @@ import PublicOutlinedIcon from '@mui/icons-material/PublicOutlined';
 import ShareIcon from '@mui/icons-material/Share';
 import { useNavigate } from 'react-router-dom';
 import { deleteProject, updateProject, type ProjectResponse } from '../api/project';
-import { useAuth } from '../hooks/useAuth';
 
 interface ProjectCardProps {
   project: ProjectResponse;
@@ -27,8 +26,7 @@ interface ProjectCardProps {
 
 export function ProjectCard({ project, gradient, onDelete, onUpdate }: ProjectCardProps) {
   const navigate = useNavigate();
-  const { user } = useAuth();
-  const isOwner = user?.id === project.owner_id;
+  const isOwner = project.is_owner;
   const [deleting, setDeleting] = useState(false);
   const [toggling, setToggling] = useState(false);
   const [snack, setSnack] = useState<{ message: string; severity: 'success' | 'error' } | null>(null);
