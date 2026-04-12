@@ -87,8 +87,7 @@ async def test_search_wiki_returns_correct_shape_direct_mode():
     mock_cache = AsyncMock()
     mock_cache.get = AsyncMock(return_value=_make_page_index())
 
-    mock_settings = MagicMock()
-    mock_settings.cache_dir = "./data/cache"
+    mock_session_factory = MagicMock()
 
     mock_mgmt = AsyncMock()
     wiki_list = MagicMock()
@@ -100,15 +99,14 @@ async def test_search_wiki_returns_correct_shape_direct_mode():
 
     token = srv._current_user_id.set("user-1")
     old_cache = srv._page_index_cache
-    old_settings = srv._settings
+    old_session_factory = srv._session_factory
     old_mgmt = srv._wiki_management
     try:
         srv._page_index_cache = mock_cache
-        srv._settings = mock_settings
+        srv._session_factory = mock_session_factory
         srv._wiki_management = mock_mgmt
 
-        with patch("app.core.unified_db.UnifiedWikiDB") as MockDB, \
-             patch("app.core.wiki_search_engine.WikiSearchEngine") as MockEngine:
+        with patch("app.core.wiki_search_engine.WikiSearchEngine") as MockEngine:
             MockEngine.return_value = mock_engine
             result = await srv.search_wiki(wiki_id="wiki-1", query="authentication")
 
@@ -118,7 +116,7 @@ async def test_search_wiki_returns_correct_shape_direct_mode():
     finally:
         srv._current_user_id.reset(token)
         srv._page_index_cache = old_cache
-        srv._settings = old_settings
+        srv._session_factory = old_session_factory
         srv._wiki_management = old_mgmt
 
 
@@ -146,10 +144,10 @@ async def test_search_wiki_calls_http_fallback_in_standalone_mode():
     import mcp_server.server as srv
 
     old_cache = srv._page_index_cache
-    old_settings = srv._settings
+    old_session_factory = srv._session_factory
     try:
         srv._page_index_cache = None
-        srv._settings = None
+        srv._session_factory = None
 
         with patch("mcp_server.server._http_search_wiki", new_callable=AsyncMock) as mock_http:
             mock_http.return_value = {"query": "test", "results": [], "wiki_summary": []}
@@ -159,7 +157,7 @@ async def test_search_wiki_calls_http_fallback_in_standalone_mode():
         assert "results" in result
     finally:
         srv._page_index_cache = old_cache
-        srv._settings = old_settings
+        srv._session_factory = old_session_factory
 
 
 # ---------------------------------------------------------------------------
@@ -289,9 +287,6 @@ async def test_search_project_fans_out_across_wikis_direct_mode():
     mock_cache = AsyncMock()
     mock_cache.get = AsyncMock(return_value=page_index)
 
-    mock_settings = MagicMock()
-    mock_settings.cache_dir = "./data/cache"
-
     merged_result = _make_search_result(
         "auth",
         items=[_make_result_item("wiki-1"), _make_result_item("wiki-2")],
@@ -300,15 +295,12 @@ async def test_search_project_fans_out_across_wikis_direct_mode():
 
     token = srv._current_user_id.set("user-1")
     old_cache = srv._page_index_cache
-    old_settings = srv._settings
     old_factory = srv._session_factory
     try:
         srv._page_index_cache = mock_cache
-        srv._settings = mock_settings
         srv._session_factory = fake_factory
 
         with patch("app.services.project_service.ProjectService") as MockPS, \
-             patch("app.core.unified_db.UnifiedWikiDB"), \
              patch("app.core.wiki_search_engine.WikiSearchEngine"), \
              patch("app.core.project_search_engine.ProjectSearchEngine") as MockPSE:
             MockPS.return_value = mock_project_svc
@@ -323,7 +315,6 @@ async def test_search_project_fans_out_across_wikis_direct_mode():
     finally:
         srv._current_user_id.reset(token)
         srv._page_index_cache = old_cache
-        srv._settings = old_settings
         srv._session_factory = old_factory
 
 
@@ -342,11 +333,9 @@ async def test_search_project_calls_http_fallback_in_standalone_mode():
     import mcp_server.server as srv
 
     old_cache = srv._page_index_cache
-    old_settings = srv._settings
     old_factory = srv._session_factory
     try:
         srv._page_index_cache = None
-        srv._settings = None
         srv._session_factory = None
 
         with patch("mcp_server.server._http_search_project", new_callable=AsyncMock) as mock_http:
@@ -357,7 +346,6 @@ async def test_search_project_calls_http_fallback_in_standalone_mode():
         assert "results" in result
     finally:
         srv._page_index_cache = old_cache
-        srv._settings = old_settings
         srv._session_factory = old_factory
 
 
@@ -374,8 +362,7 @@ async def test_search_wiki_passes_user_id_to_wiki_management():
     mock_cache = AsyncMock()
     mock_cache.get = AsyncMock(return_value=_make_page_index())
 
-    mock_settings = MagicMock()
-    mock_settings.cache_dir = "./data/cache"
+    mock_session_factory = MagicMock()
 
     mock_mgmt = AsyncMock()
     wiki_list = MagicMock()
@@ -387,15 +374,14 @@ async def test_search_wiki_passes_user_id_to_wiki_management():
 
     token = srv._current_user_id.set("expected-user-42")
     old_cache = srv._page_index_cache
-    old_settings = srv._settings
+    old_session_factory = srv._session_factory
     old_mgmt = srv._wiki_management
     try:
         srv._page_index_cache = mock_cache
-        srv._settings = mock_settings
+        srv._session_factory = mock_session_factory
         srv._wiki_management = mock_mgmt
 
-        with patch("app.core.unified_db.UnifiedWikiDB"), \
-             patch("app.core.wiki_search_engine.WikiSearchEngine") as MockEngine:
+        with patch("app.core.wiki_search_engine.WikiSearchEngine") as MockEngine:
             MockEngine.return_value = mock_engine
             await srv.search_wiki(wiki_id="wiki-1", query="test")
 
@@ -403,7 +389,7 @@ async def test_search_wiki_passes_user_id_to_wiki_management():
     finally:
         srv._current_user_id.reset(token)
         srv._page_index_cache = old_cache
-        srv._settings = old_settings
+        srv._session_factory = old_session_factory
         srv._wiki_management = old_mgmt
 
 
@@ -453,22 +439,16 @@ async def test_search_project_auth_direct_mode():
     mock_cache = AsyncMock()
     mock_cache.get = AsyncMock(return_value=page_index)
 
-    mock_settings = MagicMock()
-    mock_settings.cache_dir = "./data/cache"
-
     merged_result = _make_search_result("q")
 
     token = srv._current_user_id.set("auth-user-77")
     old_cache = srv._page_index_cache
-    old_settings = srv._settings
     old_factory = srv._session_factory
     try:
         srv._page_index_cache = mock_cache
-        srv._settings = mock_settings
         srv._session_factory = fake_factory
 
         with patch("app.services.project_service.ProjectService") as MockPS, \
-             patch("app.core.unified_db.UnifiedWikiDB"), \
              patch("app.core.wiki_search_engine.WikiSearchEngine"), \
              patch("app.core.project_search_engine.ProjectSearchEngine") as MockPSE:
             MockPS.return_value = mock_project_svc
@@ -483,7 +463,6 @@ async def test_search_project_auth_direct_mode():
     finally:
         srv._current_user_id.reset(token)
         srv._page_index_cache = old_cache
-        srv._settings = old_settings
         srv._session_factory = old_factory
 
 
@@ -499,17 +478,16 @@ async def test_search_wiki_blocks_inaccessible_wiki():
     mock_mgmt.list_wikis = AsyncMock(return_value=wiki_list_result)
 
     mock_cache = AsyncMock()
-    mock_settings = MagicMock()
-    mock_settings.cache_dir = "/tmp"
+    mock_session_factory = MagicMock()
 
     token = srv._current_user_id.set("test-user")
     old_mgmt = srv._wiki_management
     old_cache = srv._page_index_cache
-    old_settings = srv._settings
+    old_session_factory = srv._session_factory
     try:
         srv._wiki_management = mock_mgmt
         srv._page_index_cache = mock_cache
-        srv._settings = mock_settings
+        srv._session_factory = mock_session_factory
 
         result = await srv.search_wiki(wiki_id="secret-wiki", query="anything")
 
@@ -523,4 +501,4 @@ async def test_search_wiki_blocks_inaccessible_wiki():
         srv._current_user_id.reset(token)
         srv._wiki_management = old_mgmt
         srv._page_index_cache = old_cache
-        srv._settings = old_settings
+        srv._session_factory = old_session_factory

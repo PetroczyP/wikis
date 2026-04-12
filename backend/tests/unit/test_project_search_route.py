@@ -86,8 +86,12 @@ def _build_app(
     mock_cache = AsyncMock()
     mock_cache.get = AsyncMock(return_value=MagicMock(pages={}))
 
-    # Mock settings
+    # Mock settings, session factory, and wiki management
     app.state.settings = MagicMock(cache_dir="/tmp/test_cache")
+    app.state.session_factory = MagicMock()
+    mock_management = AsyncMock()
+    mock_management.ensure_pages_indexed = AsyncMock()
+    app.state.wiki_management = mock_management
     app.state.wiki_index_cache = mock_cache
 
     # Store result for use in patch
@@ -124,9 +128,8 @@ class TestProjectSearchRoute:
             mock_engine.search = AsyncMock(return_value=result)
             MockEngine.return_value = mock_engine
 
-            with patch("app.core.unified_db.UnifiedWikiDB"):
-                client = TestClient(app)
-                resp = client.get("/api/v1/projects/proj-1/search?q=auth")
+            client = TestClient(app)
+            resp = client.get("/api/v1/projects/proj-1/search?q=auth")
 
         assert resp.status_code == 200
         data = resp.json()
@@ -198,9 +201,8 @@ class TestProjectSearchRoute:
             mock_engine.search = AsyncMock(return_value=merged_result)
             MockEngine.return_value = mock_engine
 
-            with patch("app.core.unified_db.UnifiedWikiDB"):
-                client = TestClient(app)
-                resp = client.get("/api/v1/projects/proj-1/search?q=auth")
+            client = TestClient(app)
+            resp = client.get("/api/v1/projects/proj-1/search?q=auth")
 
         assert resp.status_code == 200
         data = resp.json()
@@ -222,9 +224,8 @@ class TestProjectSearchRoute:
             mock_engine.search = AsyncMock(return_value=empty_result)
             MockEngine.return_value = mock_engine
 
-            with patch("app.core.unified_db.UnifiedWikiDB"):
-                client = TestClient(app)
-                resp = client.get("/api/v1/projects/proj-1/search?q=q&top_k=5")
+            client = TestClient(app)
+            resp = client.get("/api/v1/projects/proj-1/search?q=q&top_k=5")
 
         assert resp.status_code == 200
         # Verify top_k was passed to engine.search
@@ -246,9 +247,8 @@ class TestProjectSearchRoute:
             mock_engine.search = AsyncMock(return_value=empty_result)
             MockEngine.return_value = mock_engine
 
-            with patch("app.core.unified_db.UnifiedWikiDB"):
-                client = TestClient(app)
-                resp = client.get("/api/v1/projects/proj-1/search?q=q&hop_depth=3")
+            client = TestClient(app)
+            resp = client.get("/api/v1/projects/proj-1/search?q=q&hop_depth=3")
 
         assert resp.status_code == 200
         call_kwargs = mock_engine.search.call_args

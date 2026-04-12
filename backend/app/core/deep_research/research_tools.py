@@ -32,8 +32,6 @@ from .hybrid_fusion import (
 
 logger = logging.getLogger(__name__)
 
-# Feature flag: use UnifiedWikiDB for deep-research graph search
-UNIFIED_RETRIEVER_ENABLED = os.environ.get("WIKIS_UNIFIED_RETRIEVER", "0") == "1"
 
 # Container types that can own child methods/functions via 'defines' edges.
 # Used by orphan FTS fallback to discover string-based references.
@@ -145,164 +143,6 @@ def _search_graph_by_text(code_graph: Any, query: str, k: int = 10) -> list[Docu
     return documents
 
 
-# ---------------------------------------------------------------------------
-# Unified-DB-backed helpers (used when WIKIS_UNIFIED_RETRIEVER=1 and
-# there is no in-memory NX code_graph or FTS5 index).
-# ---------------------------------------------------------------------------
-
-
-def _open_unified_db_readonly(db_path: str):
-    """Open a UnifiedWikiDB in read-only mode, or return None on failure."""
-    try:
-        from ..unified_db import UnifiedWikiDB
-
-        return UnifiedWikiDB(db_path, readonly=True)
-    except Exception as exc:
-        logger.warning("[RESEARCH_TOOLS] Failed to open unified DB %s: %s", db_path, exc)
-        return None
-
-
-def _search_unified_db_fts(db_path: str, query: str, k: int = 10) -> list[Document]:
-    """FTS5 full-text search against the unified .wiki.db.
-
-    Equivalent of _search_graph_by_text / graph_text_index.search_smart but
-    backed by the SQLite FTS5 index in repo_fts.
-
-    Returns up to *k* LangChain Documents.
-    """
-    db = _open_unified_db_readonly(db_path)
-    if db is None:
-        return []
-    try:
-        conn = db.conn
-        # Build FTS5 query: split on non-word chars, join with OR
-        keywords = [w for w in re.split(r"\W+", query) if len(w) >= 2]
-        if not keywords:
-            return []
-        fts_query = " OR ".join(keywords)
-
-        sql = """
-            SELECT n.node_id, n.symbol_name, n.symbol_type,
-                   n.rel_path, n.start_line, n.end_line,
-                   n.content, n.docstring,
-                   rank
-            FROM repo_fts f
-            JOIN repo_nodes n ON n.node_id = f.node_id
-            WHERE repo_fts MATCH ?
-              AND n.symbol_type NOT IN ('module_doc', 'file_doc', 'readme')
-            ORDER BY rank
-            LIMIT ?
-        """
-        rows = conn.execute(sql, (fts_query, k)).fetchall()
-
-        docs: list[Document] = []
-        for row in rows:
-            (node_id, sym_name, sym_type, rel_path, start_line, end_line, content, docstring, _rank) = row
-            page_content = content or docstring or ""
-            if not page_content.strip():
-                continue
-            docs.append(
-                Document(
-                    page_content=page_content,
-                    metadata={
-                        "source": rel_path or "unknown",
-                        "rel_path": rel_path or "",
-                        "symbol_name": sym_name or "",
-                        "symbol_type": sym_type or "unknown",
-                        "start_line": start_line or "",
-                        "end_line": end_line or "",
-                        "search_source": "unified_db_fts",
-                    },
-                )
-            )
-        return docs
-    except Exception as exc:
-        logger.warning("[RESEARCH_TOOLS] Unified DB FTS search failed: %s", exc)
-        return []
-    finally:
-        try:
-            db.close()
-        except Exception:  # noqa: S110
-            pass
-
-
-def _get_unified_db_relationships(db_path: str, symbol_name: str, max_depth: int = 2) -> str | None:
-    """Look up symbol relationships via SQL against unified DB edges table.
-
-    Returns a formatted Markdown string, or None if the DB is unavailable.
-    """
-    db = _open_unified_db_readonly(db_path)
-    if db is None:
-        return None
-    try:
-        conn = db.conn
-
-        # Resolve symbol to node_id (best match)
-        rows = conn.execute(
-            "SELECT node_id, symbol_name, symbol_type FROM repo_nodes WHERE LOWER(symbol_name) = LOWER(?) LIMIT 5",
-            (symbol_name,),
-        ).fetchall()
-        if not rows:
-            # Fallback: LIKE search
-            rows = conn.execute(
-                "SELECT node_id, symbol_name, symbol_type FROM repo_nodes WHERE LOWER(symbol_name) LIKE ? LIMIT 5",
-                (f"%{symbol_name.lower()}%",),
-            ).fetchall()
-        if not rows:
-            return f"Symbol '{symbol_name}' not found in unified DB."
-
-        target_id = rows[0][0]
-        target_name = rows[0][1]
-
-        # Outgoing edges
-        outgoing = conn.execute(
-            "SELECT e.target_id, e.relationship_type, n.symbol_name, n.symbol_type "
-            "FROM repo_edges e "
-            "JOIN repo_nodes n ON n.node_id = e.target_id "
-            "WHERE e.source_id = ? "
-            "LIMIT 50",
-            (target_id,),
-        ).fetchall()
-
-        # Incoming edges
-        incoming = conn.execute(
-            "SELECT e.source_id, e.relationship_type, n.symbol_name, n.symbol_type "
-            "FROM repo_edges e "
-            "JOIN repo_nodes n ON n.node_id = e.source_id "
-            "WHERE e.target_id = ? "
-            "LIMIT 50",
-            (target_id,),
-        ).fetchall()
-
-        lines = [
-            f"# Relationships for `{target_name}`\n",
-            f"**Matched Node:** `{target_id}`",
-            f"**Outgoing:** {len(outgoing)}, **Incoming:** {len(incoming)}\n",
-        ]
-
-        if len(rows) > 1:
-            others = ", ".join(f"`{r[1]}`" for r in rows[1:])
-            lines.append(f"**Other Matches:** {others}\n")
-
-        if outgoing:
-            lines.append("\n## Outgoing Relationships")
-            for _tid, rel_type, sym_name, sym_type in outgoing:
-                lines.append(f"- `{target_name}` → `{sym_name}` ({sym_type}) [{rel_type}]")
-
-        if incoming:
-            lines.append("\n## Incoming Relationships")
-            for _sid, rel_type, sym_name, sym_type in incoming:
-                lines.append(f"- `{sym_name}` ({sym_type}) → `{target_name}` [{rel_type}]")
-
-        return "\n".join(lines)
-    except Exception as exc:
-        logger.warning("[RESEARCH_TOOLS] Unified DB relationship query failed: %s", exc)
-        return None
-    finally:
-        try:
-            db.close()
-        except Exception:  # noqa: S110
-            pass
 
 
 def _find_graph_node(code_graph: Any, symbol_name: str, rel_path: str = "") -> str | None:
@@ -392,7 +232,6 @@ def create_codebase_tools(
     event_callback: Callable | None = None,
     similarity_threshold: float = 0.75,
     graph_text_index: Any = None,  # GraphTextIndex (FTS5)
-    unified_db_path: str | None = None,  # Path to .wiki.db (Phase 6)
     repo_path: str | None = None,  # Path to cloned repo for direct file access
     query_service: Any = None,  # Pre-built GraphQueryService or MultiGraphQueryService (projects)
 ) -> list:
@@ -404,11 +243,6 @@ def create_codebase_tools(
     - Bounded output (configurable k)
     - Threshold filtering (default 0.75)
 
-    When ``code_graph`` is None but ``unified_db_path`` is set (i.e. the
-    Unified Retriever is active), graph search branches fall back to FTS5
-    queries against the ``.wiki.db`` file.  Gated by
-    ``WIKIS_UNIFIED_RETRIEVER=1``.
-
     Args:
         retriever_stack: WikiRetrieverStack instance for codebase search
         graph_manager: GraphManager instance for graph operations
@@ -416,7 +250,6 @@ def create_codebase_tools(
         repo_analysis: Pre-loaded repository analysis (optional)
         event_callback: Callback for emitting thinking events
         similarity_threshold: Minimum similarity for EmbeddingsFilter (0.0-1.0)
-        unified_db_path: Path to unified .wiki.db (used when code_graph is None)
 
     Returns:
         List of LangChain tools for DeepAgents
@@ -427,18 +260,6 @@ def create_codebase_tools(
     # Use pre-built query_service when provided (e.g. MultiGraphQueryService for projects)
     if query_service is None:
         query_service = GraphQueryService(code_graph, fts_index=graph_text_index) if code_graph else None
-
-    # Resolve unified_db_path: auto-detect when flag is on but path not provided
-    _udb_path = unified_db_path
-    if _udb_path is None and UNIFIED_RETRIEVER_ENABLED and code_graph is None:
-        # Try to get path from retriever_stack (UnifiedRetriever stores it)
-        _udb_path = getattr(getattr(retriever_stack, "db", None), "db_path", None)
-        if _udb_path:
-            _udb_path = str(_udb_path)
-    # Only use DB fallback when there's genuinely no NX graph
-    _use_db_fallback = bool(_udb_path and code_graph is None)
-    if _use_db_fallback:
-        logger.info("[RESEARCH_TOOLS] Unified DB fallback enabled: %s", _udb_path)
 
     # Get embeddings from retriever_stack for reranking
     embeddings = None
@@ -514,10 +335,6 @@ def create_codebase_tools(
                     # Fallback: brute-force keyword scan
                     graph_docs = _search_graph_by_text(code_graph, query, k=k_code)
                     logger.info(f"[SEARCH_CODEBASE][BRUTE] {len(graph_docs)} results (query={query!r:.60})")
-                elif _use_db_fallback:
-                    # Phase 6 fallback: FTS5 search against unified .wiki.db
-                    graph_docs = _search_unified_db_fts(_udb_path, query, k=k_code)
-                    logger.info(f"[SEARCH_CODEBASE][UNIFIED_DB] {len(graph_docs)} results (query={query!r:.60})")
             except Exception as e:
                 logger.warning(f"[SEARCH_CODEBASE] Graph search failed: {e}")
 
@@ -632,19 +449,6 @@ def create_codebase_tools(
         )
 
         if code_graph is None:
-            # Phase 6: try unified DB fallback for relationships
-            if _use_db_fallback:
-                db_result = _get_unified_db_relationships(_udb_path, symbol_name, max_depth)
-                if db_result:
-                    emit(
-                        {
-                            "type": "tool_end",
-                            "tool": "get_symbol_relationships",
-                            "result_count": 1,
-                            "timestamp": datetime.now().isoformat(),
-                        }
-                    )
-                    return db_result
             return "Code graph not available for relationship analysis"
 
         try:
@@ -813,38 +617,6 @@ def create_codebase_tools(
         emit({"type": "tool_start", "tool": "search_graph", "input": query, "timestamp": datetime.now().isoformat()})
 
         if code_graph is None:
-            # Phase 6: return FTS5 results from unified DB (no neighbors available)
-            if _use_db_fallback:
-                db_docs = _search_unified_db_fts(_udb_path, query, k=k)
-                if db_docs:
-                    sections = []
-                    for i, doc in enumerate(db_docs[:k]):
-                        sym_name = doc.metadata.get("symbol_name", "")
-                        sym_type = doc.metadata.get("symbol_type", "")
-                        rel_path = doc.metadata.get("rel_path", "")
-                        start_line = doc.metadata.get("start_line", "")
-                        end_line = doc.metadata.get("end_line", "")
-                        content_preview = (doc.page_content or "")[:500]
-                        if len(doc.page_content or "") > 500:
-                            content_preview += "\n... (truncated)"
-                        sections.append(
-                            f"### [{i + 1}] `{sym_name}` ({sym_type})\n"
-                            f"**File:** {rel_path}  **Lines:** {start_line}-{end_line}\n"
-                            f"\n```\n{content_preview}\n```\n"
-                            f"*(graph neighbors unavailable — unified DB mode)*"
-                        )
-                    emit(
-                        {
-                            "type": "tool_end",
-                            "tool": "search_graph",
-                            "result_count": len(sections),
-                            "timestamp": datetime.now().isoformat(),
-                        }
-                    )
-                    return (
-                        f"## Graph Search: {query}\n\nFound {len(sections)} symbols (unified DB):\n\n"
-                        + "\n\n---\n\n".join(sections)
-                    )
             return "Code graph not available for graph search."
 
         try:

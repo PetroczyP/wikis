@@ -141,16 +141,27 @@ class ImportService:
                 )
                 logger.info("Removed existing wiki %s before import", wiki_id)
 
-            # Step 7 — Write pages to artifact storage
+            # Step 7 — Write pages to artifact storage and collect content for FTS indexing
             page_entries = [
                 name for name in zf.namelist()
                 if name.startswith("pages/") and not name.endswith("/")
             ]
+            pages_for_index: dict[str, str] = {}
             for entry_name in page_entries:
                 # Strip the leading "pages/" prefix to get the storage key
                 artifact_key = entry_name[len("pages/"):]
                 artifact_data = zf.read(entry_name)
                 await self.storage.upload("wiki_artifacts", artifact_key, artifact_data)
+
+                # Collect page content for FTS indexing (only .md files under the wiki_id prefix)
+                if artifact_key.endswith(".md"):
+                    try:
+                        content = artifact_data.decode("utf-8")
+                        # page_id = filename without .md extension
+                        page_id = artifact_key.rsplit("/", 1)[-1][:-3]
+                        pages_for_index[page_id] = content
+                    except UnicodeDecodeError:
+                        pass
 
             # Step 8 — Write cache files
             cache_key: str | None = None
@@ -212,7 +223,14 @@ class ImportService:
             commit_hash=commit_hash,
         )
 
-        # Step 11 — Return the upserted WikiRecord
+        # Step 11 — Index pages for full-text search
+        if pages_for_index:
+            try:
+                await self.wiki_management.index_wiki_pages(wiki_id, pages_for_index)
+            except Exception as e:
+                logger.warning("Failed to index imported pages for FTS: %s", e)
+
+        # Step 12 — Return the upserted WikiRecord
         record = await self.wiki_management.get_wiki_record(wiki_id)
         assert record is not None, "WikiRecord must exist after register_wiki"
         return record

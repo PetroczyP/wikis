@@ -539,7 +539,6 @@ async def search_wiki(
     index_cache=Depends(get_wiki_index_cache),
 ) -> WikiSearchResponse:
     """Full-text search over wiki pages with graph-expansion re-ranking."""
-    from app.core.unified_db import UnifiedWikiDB
     from app.core.wiki_search_engine import WikiSearchEngine
 
     user_id = user.id if user else None
@@ -549,15 +548,13 @@ async def search_wiki(
 
     page_index = await index_cache.get(wiki_id)
 
-    settings = request.app.state.settings
-    db_path = f"{settings.cache_dir}/{wiki_id}.wiki.db"
-    db = UnifiedWikiDB(db_path, readonly=True)
-    try:
-        wiki_name = getattr(wiki, "title", wiki_id) or wiki_id
-        engine = WikiSearchEngine(wiki_id, wiki_name, db, page_index)
-        result = await engine.search(q, hop_depth=hop_depth, top_k=top_k)
-    finally:
-        db.close()
+    # Lazy backfill: ensure old wikis have pages indexed for FTS.
+    await management.ensure_pages_indexed(wiki_id)
+
+    session_factory = request.app.state.session_factory
+    wiki_name = getattr(wiki, "title", wiki_id) or wiki_id
+    engine = WikiSearchEngine(wiki_id, wiki_name, session_factory, page_index)
+    result = await engine.search(q, hop_depth=hop_depth, top_k=top_k)
 
     return WikiSearchResponse(
         query=result.query,
@@ -1197,7 +1194,6 @@ async def search_project(
 ) -> ProjectSearchResponse:
     """Full-text search over all wiki pages in a project with graph-expansion re-ranking."""
     from app.core.project_search_engine import ProjectSearchEngine
-    from app.core.unified_db import UnifiedWikiDB
     from app.core.wiki_search_engine import WikiSearchEngine
 
     user_id = user.id if user else ""
@@ -1205,29 +1201,22 @@ async def search_project(
     if wikis is None:
         raise HTTPException(404, f"Project not found: {project_id}")
 
-    settings = request.app.state.settings
+    session_factory = request.app.state.session_factory
 
-    # Pre-load page indexes concurrently so the factory can be synchronous.
+    # Pre-load page indexes and lazy-backfill FTS for old wikis.
     wiki_tuples = [(w.id, getattr(w, "title", w.id) or w.id) for w in wikis]
+    management = request.app.state.wiki_management
     page_indexes = {}
     for wiki_id, _ in wiki_tuples:
         page_indexes[wiki_id] = await index_cache.get(wiki_id)
-
-    open_dbs: list[UnifiedWikiDB] = []
+        await management.ensure_pages_indexed(wiki_id)
 
     def wiki_engine_factory(wiki_id: str, wiki_name: str) -> WikiSearchEngine:
         page_index = page_indexes[wiki_id]
-        db_path = f"{settings.cache_dir}/{wiki_id}.wiki.db"
-        db = UnifiedWikiDB(db_path, readonly=True)
-        open_dbs.append(db)
-        return WikiSearchEngine(wiki_id, wiki_name, db, page_index)
+        return WikiSearchEngine(wiki_id, wiki_name, session_factory, page_index)
 
     engine = ProjectSearchEngine(wiki_engine_factory)
-    try:
-        result = await engine.search(q, wikis=wiki_tuples, hop_depth=hop_depth, top_k=top_k)
-    finally:
-        for db in open_dbs:
-            db.close()
+    result = await engine.search(q, wikis=wiki_tuples, hop_depth=hop_depth, top_k=top_k)
 
     return ProjectSearchResponse(
         query=result.query,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Column, DateTime, Index, Integer, String, func
+from sqlalchemy import Column, DateTime, Index, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase
 
 
@@ -93,4 +93,20 @@ class ProjectWikiRecord(Base):
     __table_args__ = (
         Index("ix_project_wiki_project", "project_id"),
         Index("ix_project_wiki_wiki", "wiki_id"),
+    )
+
+
+class WikiPageRecord(Base):
+    """Indexed wiki page for PostgreSQL full-text search."""
+
+    __tablename__ = "wiki_page"
+
+    id = Column(String, primary_key=True)          # "{wiki_id}/{page_title}" deterministic
+    wiki_id = Column(String, nullable=False)
+    page_title = Column(String, nullable=False)
+    description = Column(String, nullable=True)     # From YAML frontmatter
+    content = Column(Text, nullable=False)          # Full markdown body
+
+    __table_args__ = (
+        Index("ix_wiki_page_wiki", "wiki_id"),
     )

@@ -64,12 +64,12 @@ def _make_engine(
 ) -> WikiSearchEngine:
     """Build a WikiSearchEngine with a mocked adapter and page index."""
     page_index = _make_page_index(titles, forward, backward)
-    db = MagicMock()
+    session_factory = MagicMock()
 
-    engine = WikiSearchEngine(wiki_id, wiki_name, db, page_index)
+    engine = WikiSearchEngine(wiki_id, wiki_name, session_factory, page_index)
 
     # Patch the adapter's search method directly on the instance.
-    def _search(query: str, top_k: int = 10) -> list[PageHit]:
+    async def _search(query: str, top_k: int = 10) -> list[PageHit]:
         return [
             PageHit(
                 page_title=title,
@@ -220,9 +220,13 @@ async def test_rel_linked_from_for_backlinks():
 async def test_hop_depth_passed_through_to_page_index():
     """hop_depth is forwarded to page_index.neighbors() calls."""
     page_index = _make_page_index(titles=["A", "B"])
-    db = MagicMock()
-    engine = WikiSearchEngine("wiki1", "Wiki One", db, page_index)
-    engine._adapter.search = lambda q, top_k=10: [PageHit("A", 1.0, "Desc of A")]
+    session_factory = MagicMock()
+    engine = WikiSearchEngine("wiki1", "Wiki One", session_factory, page_index)
+
+    async def _mock_search(q, top_k=10):
+        return [PageHit("A", 1.0, "Desc of A")]
+
+    engine._adapter.search = _mock_search
 
     await engine.search("query", hop_depth=3)
 

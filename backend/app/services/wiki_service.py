@@ -282,6 +282,15 @@ class WikiService:
                 except Exception as e:
                     logger.warning(f"Failed to save page {page_id}: {e}")
 
+            # Index pages into PostgreSQL for full-text search
+            if self.wiki_management and generated_pages:
+                try:
+                    await self.wiki_management.index_wiki_pages(
+                        invocation.wiki_id, generated_pages,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to index pages for FTS: %s", e)
+
             # Store export artifacts (index, summary, etc.)
             artifacts = result.get("artifacts", [])
             for artifact in artifacts:

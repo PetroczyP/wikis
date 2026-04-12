@@ -137,6 +137,20 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
     }
   }, [urlGenerating, urlInvocationId]); // intentionally excludes activeInvocationId to avoid re-trigger loops
 
+  // Navigate to page when search params change (e.g. from QuickSearch)
+  useEffect(() => {
+    if (pages.length === 0) return;
+    const urlPageTitle = searchParams.get('page_title');
+    const urlPage = searchParams.get('page');
+    if (urlPageTitle) {
+      const matched = pages.find((p) => p.title === urlPageTitle);
+      if (matched) setActivePageId(matched.id);
+    } else if (urlPage) {
+      const matched = pages.find((p) => p.id === urlPage);
+      if (matched) setActivePageId(matched.id);
+    }
+  }, [searchParams, pages]);
+
   // Fetch wiki data from API
   useEffect(() => {
     if (!wikiId) return;

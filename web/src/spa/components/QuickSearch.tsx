@@ -179,9 +179,9 @@ export function QuickSearch({ open, onClose, wikiId, projectId }: QuickSearchPro
                       </Box>
                       {result.neighbors.length > 0 && (
                         <Box component="span" sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
-                          {result.neighbors.slice(0, 3).map((neighbor) => (
+                          {result.neighbors.slice(0, 3).map((neighbor, idx) => (
                             <Chip
-                              key={neighbor.title}
+                              key={`${neighbor.title}-${neighbor.rel}-${idx}`}
                               label={neighbor.title}
                               size="small"
                               variant="outlined"

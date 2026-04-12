@@ -131,8 +131,6 @@ class TestWikiSearch:
         mock_cache.get = AsyncMock(return_value=fake_index)
         app.state.wiki_index_cache = mock_cache
 
-        # Mock both UnifiedWikiDB (file access) and WikiSearchEngine.search
-        from app.core.unified_db import UnifiedWikiDB
         from app.core.wiki_search_engine import WikiSearchEngine
 
         fake_result = MagicMock()
@@ -140,13 +138,7 @@ class TestWikiSearch:
         fake_result.results = []
         fake_result.wiki_summary = []
 
-        mock_db = MagicMock(spec=UnifiedWikiDB)
-        mock_db.close = MagicMock()
-
-        with (
-            patch("app.core.unified_db.UnifiedWikiDB", return_value=mock_db),
-            patch.object(WikiSearchEngine, "search", new_callable=AsyncMock, return_value=fake_result),
-        ):
+        with patch.object(WikiSearchEngine, "search", new_callable=AsyncMock, return_value=fake_result):
             resp = await c.get(f"/api/v1/wikis/{wiki_id}/search?q=test")
 
         assert resp.status_code == 200, resp.text
@@ -209,7 +201,6 @@ class TestWikiSearch:
         mock_cache.get = AsyncMock(return_value=fake_index)
         app.state.wiki_index_cache = mock_cache
 
-        from app.core.unified_db import UnifiedWikiDB
         from app.core.wiki_search_engine import WikiSearchEngine
 
         captured: dict = {}
@@ -222,13 +213,7 @@ class TestWikiSearch:
             result.wiki_summary = []
             return result
 
-        mock_db = MagicMock(spec=UnifiedWikiDB)
-        mock_db.close = MagicMock()
-
-        with (
-            patch("app.core.unified_db.UnifiedWikiDB", return_value=mock_db),
-            patch.object(WikiSearchEngine, "search", new=_mock_search),
-        ):
+        with patch.object(WikiSearchEngine, "search", new=_mock_search):
             resp = await c.get(f"/api/v1/wikis/{wiki_id}/search?q=hello")
 
         assert resp.status_code == 200, resp.text
@@ -435,7 +420,6 @@ class TestAuthEnabledFalseMode:
         mock_cache.get = AsyncMock(return_value=fake_index)
         app.state.wiki_index_cache = mock_cache
 
-        from app.core.unified_db import UnifiedWikiDB
         from app.core.wiki_search_engine import WikiSearchEngine
 
         fake_result = MagicMock()
@@ -443,13 +427,7 @@ class TestAuthEnabledFalseMode:
         fake_result.results = []
         fake_result.wiki_summary = []
 
-        mock_db = MagicMock(spec=UnifiedWikiDB)
-        mock_db.close = MagicMock()
-
-        with (
-            patch("app.core.unified_db.UnifiedWikiDB", return_value=mock_db),
-            patch.object(WikiSearchEngine, "search", new_callable=AsyncMock, return_value=fake_result),
-        ):
+        with patch.object(WikiSearchEngine, "search", new_callable=AsyncMock, return_value=fake_result):
             # Deliberately send no Authorization header
             resp = await c.get(f"/api/v1/wikis/{wiki_id}/search?q=auth")
 

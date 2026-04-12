@@ -89,6 +89,10 @@ async def create_tables(engine: AsyncEngine) -> None:
     # Auto-migrate: add columns that create_all can't add to existing tables.
     # Each statement is idempotent (IF NOT EXISTS / OR IGNORE).
     await _add_missing_columns(engine)
+
+    # PostgreSQL-only: add tsvector column + GIN index for wiki page FTS.
+    await _ensure_wiki_page_fts(engine)
+
     logger.info("Database tables ensured")
 
 
@@ -125,6 +129,32 @@ async def _add_missing_columns(engine: AsyncEngine) -> None:
                         pass  # Column already exists
                     else:
                         logger.warning("Migration failed for %s.%s: %s", table, column, e)
+
+
+async def _ensure_wiki_page_fts(engine: AsyncEngine) -> None:
+    """Add tsvector column + GIN index to wiki_page (PostgreSQL only, idempotent)."""
+    from sqlalchemy import text
+
+    if "postgresql" not in str(engine.url):
+        return  # SQLite — skip tsvector; search will use LIKE fallback
+
+    async with engine.begin() as conn:
+        # Add the tsvector column if it doesn't exist yet.
+        await conn.execute(text(
+            "ALTER TABLE wiki_page ADD COLUMN IF NOT EXISTS "
+            "search_vector tsvector "
+            "GENERATED ALWAYS AS ("
+            "  setweight(to_tsvector('english', coalesce(page_title, '')), 'A') || "
+            "  setweight(to_tsvector('english', coalesce(description, '')), 'B') || "
+            "  setweight(to_tsvector('english', coalesce(content, '')), 'C')"
+            ") STORED"
+        ))
+        # Create GIN index for fast full-text lookups.
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_wiki_page_search "
+            "ON wiki_page USING gin(search_vector)"
+        ))
+    logger.info("wiki_page FTS column + GIN index ensured")
 
 
 def get_engine() -> AsyncEngine:

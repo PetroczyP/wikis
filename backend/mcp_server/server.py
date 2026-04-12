@@ -553,8 +553,7 @@ async def search_wiki(
     if not 1 <= hop_depth <= 5:
         raise ValueError(f"hop_depth must be between 1 and 5, got {hop_depth}")
 
-    if _page_index_cache and _settings:
-        from app.core.unified_db import UnifiedWikiDB
+    if _page_index_cache and _session_factory:
         from app.core.wiki_search_engine import WikiSearchEngine
 
         user_id = _current_user_id.get()
@@ -569,14 +568,13 @@ async def search_wiki(
         wiki_name = getattr(wiki, "title", wiki_id) or wiki_id
 
         page_index = await _page_index_cache.get(wiki_id)
-        cache_dir = getattr(_settings, "cache_dir", "./data/cache")
-        db_path = f"{cache_dir}/{wiki_id}.wiki.db"
-        db = UnifiedWikiDB(db_path, readonly=True)
-        try:
-            engine = WikiSearchEngine(wiki_id, wiki_name, db, page_index)
-            result = await engine.search(query, hop_depth=hop_depth, top_k=top_k)
-        finally:
-            db.close()
+
+        # Lazy backfill: ensure old wikis have pages indexed for FTS.
+        if _wiki_management:
+            await _wiki_management.ensure_pages_indexed(wiki_id)
+
+        engine = WikiSearchEngine(wiki_id, wiki_name, _session_factory, page_index)
+        result = await engine.search(query, hop_depth=hop_depth, top_k=top_k)
 
         return {
             "query": result.query,
@@ -671,9 +669,8 @@ async def search_project(
     if not 1 <= hop_depth <= 5:
         raise ValueError(f"hop_depth must be between 1 and 5, got {hop_depth}")
 
-    if _page_index_cache and _settings and _session_factory:
+    if _page_index_cache and _session_factory:
         from app.core.project_search_engine import ProjectSearchEngine
-        from app.core.unified_db import UnifiedWikiDB
         from app.core.wiki_search_engine import WikiSearchEngine
         from app.services.project_service import ProjectService
 
@@ -687,27 +684,19 @@ async def search_project(
 
         wiki_tuples = [(w.id, getattr(w, "title", w.id) or w.id) for w in wikis]
 
-        # Pre-load page indexes.
+        # Pre-load page indexes and lazy-backfill FTS for old wikis.
         page_indexes: dict[str, Any] = {}
         for wid, _ in wiki_tuples:
             page_indexes[wid] = await _page_index_cache.get(wid)
-
-        cache_dir = getattr(_settings, "cache_dir", "./data/cache")
-        open_dbs: list[Any] = []
+            if _wiki_management:
+                await _wiki_management.ensure_pages_indexed(wid)
 
         def _wiki_engine_factory(wid: str, wiki_name: str) -> WikiSearchEngine:
             page_index = page_indexes[wid]
-            db_path = f"{cache_dir}/{wid}.wiki.db"
-            db = UnifiedWikiDB(db_path, readonly=True)
-            open_dbs.append(db)
-            return WikiSearchEngine(wid, wiki_name, db, page_index)
+            return WikiSearchEngine(wid, wiki_name, _session_factory, page_index)
 
         engine = ProjectSearchEngine(_wiki_engine_factory)
-        try:
-            result = await engine.search(query, wikis=wiki_tuples, hop_depth=hop_depth, top_k=top_k)
-        finally:
-            for db in open_dbs:
-                db.close()
+        result = await engine.search(query, wikis=wiki_tuples, hop_depth=hop_depth, top_k=top_k)
 
         return {
             "query": result.query,

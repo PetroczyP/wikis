@@ -93,8 +93,9 @@ def _build_app(
     mock_cache = AsyncMock(spec=WikiPageIndexCache)
     mock_cache.get = AsyncMock(return_value=page_index or MagicMock(spec=WikiPageIndex, pages={}))
 
-    # Mock settings and other state
+    # Mock settings, session factory, and other state
     app.state.settings = MagicMock(cache_dir="/tmp/test_cache")
+    app.state.session_factory = MagicMock()
     app.state.wiki_management = mock_management
     app.state.wiki_index_cache = mock_cache
 
@@ -145,17 +146,13 @@ class TestSearchEndpoint:
         search_result = self._make_search_result()
         app = _build_app(wiki_record=wiki, page_index=page_index, search_result=search_result)
 
-        with patch("app.core.unified_db.UnifiedWikiDB") as MockDB:
-            mock_db = MagicMock()
-            MockDB.return_value = mock_db
+        with patch("app.core.wiki_search_engine.WikiSearchEngine") as MockEngine:
+            mock_engine = MagicMock()
+            mock_engine.search = AsyncMock(return_value=search_result)
+            MockEngine.return_value = mock_engine
 
-            with patch("app.core.wiki_search_engine.WikiSearchEngine") as MockEngine:
-                mock_engine = MagicMock()
-                mock_engine.search = AsyncMock(return_value=search_result)
-                MockEngine.return_value = mock_engine
-
-                client = TestClient(app)
-                resp = client.get("/api/v1/wikis/wiki-1/search?q=auth")
+            client = TestClient(app)
+            resp = client.get("/api/v1/wikis/wiki-1/search?q=auth")
 
         assert resp.status_code == 200
         data = resp.json()
@@ -190,17 +187,13 @@ class TestSearchEndpoint:
         empty_result = WikiSearchResult(query="", results=[], wiki_summary=[])
         app = _build_app(wiki_record=wiki, page_index=page_index)
 
-        with patch("app.core.unified_db.UnifiedWikiDB") as MockDB:
-            mock_db = MagicMock()
-            MockDB.return_value = mock_db
+        with patch("app.core.wiki_search_engine.WikiSearchEngine") as MockEngine:
+            mock_engine = MagicMock()
+            mock_engine.search = AsyncMock(return_value=empty_result)
+            MockEngine.return_value = mock_engine
 
-            with patch("app.core.wiki_search_engine.WikiSearchEngine") as MockEngine:
-                mock_engine = MagicMock()
-                mock_engine.search = AsyncMock(return_value=empty_result)
-                MockEngine.return_value = mock_engine
-
-                client = TestClient(app)
-                resp = client.get("/api/v1/wikis/wiki-1/search?q=")
+            client = TestClient(app)
+            resp = client.get("/api/v1/wikis/wiki-1/search?q=")
 
         assert resp.status_code == 200
         data = resp.json()

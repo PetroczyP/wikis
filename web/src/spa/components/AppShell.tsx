@@ -81,6 +81,7 @@ export function AppShell({ mode, onToggleTheme, repoContext }: AppShellProps) {
   const isDashboard = !wikiId && !projectId;
 
   useEffect(() => {
+    if (isDashboard) return;
     function handleKeyDown(e: KeyboardEvent) {
       if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
         e.preventDefault();
@@ -89,7 +90,7 @@ export function AppShell({ mode, onToggleTheme, repoContext }: AppShellProps) {
     }
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
+  }, [isDashboard]);
 
   const handleOpenMenu = useCallback((e: React.MouseEvent<HTMLElement>) => {
     setAnchorEl(e.currentTarget);
@@ -274,17 +275,19 @@ export function AppShell({ mode, onToggleTheme, repoContext }: AppShellProps) {
             </Tooltip>
           )}
 
-          {/* Search button */}
-          <Tooltip title={shortcutHint}>
-            <IconButton
-              onClick={() => setSearchOpen(true)}
-              aria-label="Search"
-              size="small"
-              sx={{ color: 'text.secondary', mr: 0.5, '&:hover': { color: 'text.primary' } }}
-            >
-              <SearchIcon sx={{ fontSize: 16 }} />
-            </IconButton>
-          </Tooltip>
+          {/* Search button — only shown on wiki/project pages */}
+          {!isDashboard && (
+            <Tooltip title={shortcutHint}>
+              <IconButton
+                onClick={() => setSearchOpen(true)}
+                aria-label="Search"
+                size="small"
+                sx={{ color: 'text.secondary', mr: 0.5, '&:hover': { color: 'text.primary' } }}
+              >
+                <SearchIcon sx={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+          )}
 
           {/* Theme toggle */}
           <IconButton

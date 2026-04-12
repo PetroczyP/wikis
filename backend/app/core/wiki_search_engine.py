@@ -1,4 +1,4 @@
-"""Wiki search engine — FTS5 hits + graph expansion + composite re-ranking.
+"""Wiki search engine — FTS hits + graph expansion + composite re-ranking.
 
 This module is pure Python: no LLM, no FAISS.
 """
@@ -8,7 +8,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from app.core.unified_db import UnifiedWikiDB
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
 from app.core.wiki_page_index import WikiPageIndex
 from app.core.wiki_page_search import WikiPageSearchAdapter
 
@@ -69,7 +70,7 @@ class WikiSummaryItem:
     Attributes:
         wiki_id: Identifier of the wiki.
         wiki_name: Human-readable name of the wiki.
-        match_count: Number of pages returned by the FTS5 search (before expansion).
+        match_count: Number of pages returned by FTS (before expansion).
         relevance: ``hit_count / total_pages`` for this wiki; ``0.0`` when the
             wiki has no pages.
     """
@@ -102,7 +103,7 @@ class WikiSearchResult:
 
 
 class WikiSearchEngine:
-    """Core search pipeline: FTS5 hits → graph expansion → composite re-ranking.
+    """Core search pipeline: FTS hits → graph expansion → composite re-ranking.
 
     Re-ranking formula::
 
@@ -118,7 +119,7 @@ class WikiSearchEngine:
     Args:
         wiki_id: Identifier of the wiki to search.
         wiki_name: Human-readable name of the wiki.
-        db: UnifiedWikiDB instance used by WikiPageSearchAdapter.
+        session_factory: SQLAlchemy async session factory for PostgreSQL FTS queries.
         page_index: WikiPageIndex for graph traversal and description look-ups.
     """
 
@@ -126,13 +127,13 @@ class WikiSearchEngine:
         self,
         wiki_id: str,
         wiki_name: str,
-        db: UnifiedWikiDB,
+        session_factory: async_sessionmaker[AsyncSession],
         page_index: WikiPageIndex,
     ) -> None:
         self._wiki_id = wiki_id
         self._wiki_name = wiki_name
         self._page_index = page_index
-        self._adapter = WikiPageSearchAdapter(wiki_id, db, page_index)
+        self._adapter = WikiPageSearchAdapter(wiki_id, session_factory, page_index)
 
     async def search(
         self,
@@ -152,8 +153,8 @@ class WikiSearchEngine:
         Returns:
             WikiSearchResult with ranked results and per-wiki summary.
         """
-        # --- 1. FTS5 search (over-fetch for re-ranking headroom) ---
-        candidates = self._adapter.search(query, top_k=top_k * _OVERFETCH_FACTOR)
+        # --- 1. FTS search (over-fetch for re-ranking headroom) ---
+        candidates = await self._adapter.search(query, top_k=top_k * _OVERFETCH_FACTOR)
 
         total_pages = len(self._page_index.pages)
         hit_count = len(candidates)
@@ -178,7 +179,7 @@ class WikiSearchEngine:
                 wiki_summary=[wiki_summary],
             )
 
-        # --- 3. Build FTS5 hit set for neighborhood_density calculation ---
+        # --- 3. Build FTS hit set for neighborhood_density calculation ---
         hit_titles: set[str] = {hit.page_title for hit in candidates}
 
         # --- 4. Re-rank ---
