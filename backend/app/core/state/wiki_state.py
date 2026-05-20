@@ -130,6 +130,7 @@ class WikiPage(BaseModel):
     validation_result: ValidationResult | None = None
     retry_count: int = 0
     generated_at: datetime = Field(default_factory=datetime.now)
+    metadata: dict = Field(default_factory=dict)
 
 
 class WikiPageBatch(BaseModel):

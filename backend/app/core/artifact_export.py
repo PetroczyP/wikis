@@ -35,6 +35,21 @@ from .state.wiki_state import WikiPage, WikiStructureSpec
 logger = logging.getLogger(__name__)
 
 
+def _slugify(title: str) -> str:
+    """Convert a title to a URL-safe slug.
+
+    Examples::
+
+        _slugify("Test Results Database Layer") == "test-results-database-layer"
+        _slugify("") == "page"
+    """
+    s = title.lower().strip()
+    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"[\s_]+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s or "page"
+
+
 # Import normalize_wiki_id from registry_manager for consistency
 # Note: For standalone use, the function also handles owner/repo/branch parameters
 def normalize_wiki_id(
@@ -281,30 +296,109 @@ class ArtifactExporter:
                             if matching_page.title not in source_files_map[fpath]:
                                 source_files_map[fpath].append(matching_page.title)
         else:
-            # Fallback: group by section derived from page_id
-            pages_by_section: dict[str, list] = {}
-            for page in wiki_pages:
-                section_name = "general"
-                if "#" in page.page_id:
-                    try:
-                        section_idx = int(page.page_id.split("#")[0])
-                        if wiki_structure.sections and section_idx < len(wiki_structure.sections):
-                            section_name = wiki_structure.sections[section_idx].section_name
-                        else:
-                            section_name = f"section_{section_idx}"
-                    except (ValueError, IndexError):
-                        pass
-                pages_by_section.setdefault(section_name, []).append(page)
+            # Check whether any pages carry chaptered metadata (#291).
+            has_chaptered = any(
+                page.metadata.get("is_chapter_index") or "chapter_cluster_id" in page.metadata
+                for page in wiki_pages
+            )
 
-            for section_name, pages in pages_by_section.items():
-                section_dir = markdown_dir / self._create_safe_filename(section_name)
-                section_dir.mkdir(exist_ok=True)
-                for page in pages:
-                    refs = self._create_markdown_page_in_section(page, section_dir)
-                    for fpath in refs:
-                        source_files_map.setdefault(fpath, [])
-                        if page.title not in source_files_map[fpath]:
-                            source_files_map[fpath].append(page.title)
+            if has_chaptered:
+                # Chaptered layout: chapter index → <chapter-slug>/_index.md,
+                # sub-pages → <chapter-slug>/<subpage-slug>.md.
+                # Build a cluster_id → chapter_slug lookup from index pages first.
+                # Keys are stored as strings (WikiPage.page_id is str) but the
+                # chapter_cluster_id in sub-page metadata may be an int — normalise
+                # both sides to str for a reliable lookup.
+                chapter_slug_by_cluster: dict[str, str] = {}
+                for page in wiki_pages:
+                    if page.metadata.get("is_chapter_index"):
+                        chapter_slug_by_cluster[str(page.page_id)] = _slugify(page.title)
+
+                # Track used slugs per chapter to avoid collisions (e.g. "Test API"
+                # and "Test  API" both slugify to "test-api").
+                used_slugs_per_chapter: dict[str, set] = {}
+
+                for page in wiki_pages:
+                    if page.metadata.get("is_chapter_index"):
+                        chapter_slug = _slugify(page.title)
+                        chapter_dir = markdown_dir / chapter_slug
+                        chapter_dir.mkdir(parents=True, exist_ok=True)
+                        path = chapter_dir / "_index.md"
+                        frontmatter_fields = {
+                            "title": page.title,
+                            "is_chapter_index": True,
+                        }
+                        content = self._generate_frontmatter(frontmatter_fields) + "\n" + page.content
+                        path.write_text(content, encoding="utf-8")
+                        # Extract code source references for chapter index pages.
+                        for fpath in self._extract_code_sources(page.content):
+                            source_files_map.setdefault(fpath, [])
+                            if page.title not in source_files_map[fpath]:
+                                source_files_map[fpath].append(page.title)
+                    elif "chapter_cluster_id" in page.metadata:
+                        cluster_id = page.metadata["chapter_cluster_id"]
+                        # Prefer slug from the paired index page; fall back to cluster-<id>.
+                        # Normalise cluster_id to str to match the lookup key.
+                        chapter_slug = chapter_slug_by_cluster.get(str(cluster_id)) or f"cluster-{cluster_id}"
+                        chapter_dir = markdown_dir / chapter_slug
+                        chapter_dir.mkdir(parents=True, exist_ok=True)
+
+                        # Deduplicate slugs within the same chapter.
+                        used_in_chapter = used_slugs_per_chapter.setdefault(chapter_slug, set())
+                        base_slug = _slugify(page.title)
+                        subpage_slug = base_slug
+                        counter = 2
+                        while subpage_slug in used_in_chapter:
+                            subpage_slug = f"{base_slug}-{counter}"
+                            counter += 1
+                        used_in_chapter.add(subpage_slug)
+
+                        path = chapter_dir / f"{subpage_slug}.md"
+                        frontmatter_fields = {
+                            "title": page.title,
+                            "chapter": chapter_slug,
+                            "page_order": page.metadata.get("subpage_index", 0),
+                        }
+                        content = self._generate_frontmatter(frontmatter_fields) + "\n" + page.content
+                        path.write_text(content, encoding="utf-8")
+                        # Extract code source references for sub-pages.
+                        for fpath in self._extract_code_sources(page.content):
+                            source_files_map.setdefault(fpath, [])
+                            if page.title not in source_files_map[fpath]:
+                                source_files_map[fpath].append(page.title)
+                    else:
+                        # Non-chaptered page mixed in — flat layout.
+                        flat_dir = markdown_dir
+                        refs = self._create_markdown_page_in_section(page, flat_dir)
+                        for fpath in refs:
+                            source_files_map.setdefault(fpath, [])
+                            if page.title not in source_files_map[fpath]:
+                                source_files_map[fpath].append(page.title)
+            else:
+                # Fallback: group by section derived from page_id
+                pages_by_section: dict[str, list] = {}
+                for page in wiki_pages:
+                    section_name = "general"
+                    if "#" in page.page_id:
+                        try:
+                            section_idx = int(page.page_id.split("#")[0])
+                            if wiki_structure.sections and section_idx < len(wiki_structure.sections):
+                                section_name = wiki_structure.sections[section_idx].section_name
+                            else:
+                                section_name = f"section_{section_idx}"
+                        except (ValueError, IndexError):
+                            pass
+                    pages_by_section.setdefault(section_name, []).append(page)
+
+                for section_name, pages in pages_by_section.items():
+                    section_dir = markdown_dir / self._create_safe_filename(section_name)
+                    section_dir.mkdir(exist_ok=True)
+                    for page in pages:
+                        refs = self._create_markdown_page_in_section(page, section_dir)
+                        for fpath in refs:
+                            source_files_map.setdefault(fpath, [])
+                            if page.title not in source_files_map[fpath]:
+                                source_files_map[fpath].append(page.title)
 
         # Source file stub notes
         if source_files_map:

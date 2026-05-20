@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.core.artifact_export import ArtifactExporter, normalize_wiki_id
+from app.core.artifact_export import ArtifactExporter, _slugify, normalize_wiki_id
 from app.core.state.wiki_state import PageSpec, SectionSpec, WikiPage, WikiStructureSpec
 
 
@@ -679,3 +679,177 @@ class TestCreateSectionMoc:
         assert len(index_artifacts) == 1
         content = index_artifacts[0]["data"]
         assert "Overview" in content or "Details" in content
+
+
+# ---------------------------------------------------------------------------
+# _slugify helper
+# ---------------------------------------------------------------------------
+
+
+class TestSlugify:
+    def test_basic_title(self):
+        assert _slugify("Test Results Database Layer") == "test-results-database-layer"
+
+    def test_empty_string_returns_page(self):
+        assert _slugify("") == "page"
+
+    def test_special_chars_removed(self):
+        result = _slugify("Hello: World!")
+        assert ":" not in result
+        assert "!" not in result
+
+    def test_lowercase(self):
+        assert _slugify("MyModule") == "mymodule"
+
+    def test_multiple_spaces_become_single_dash(self):
+        result = _slugify("A  B")
+        assert "  " not in result
+        assert "-" in result
+
+    def test_leading_trailing_dashes_stripped(self):
+        result = _slugify("---Title---")
+        assert not result.startswith("-")
+        assert not result.endswith("-")
+
+    def test_underscores_become_dashes(self):
+        result = _slugify("my_module_name")
+        assert "_" not in result
+
+    def test_consecutive_dashes_collapsed(self):
+        result = _slugify("A - B")
+        assert "--" not in result
+
+
+# ---------------------------------------------------------------------------
+# WikiPage.metadata field
+# ---------------------------------------------------------------------------
+
+
+class TestWikiPageMetadata:
+    def test_metadata_defaults_to_empty_dict(self):
+        page = WikiPage(page_id="1", title="Title", content="# T", status="completed")
+        assert page.metadata == {}
+
+    def test_metadata_round_trips(self):
+        page = WikiPage(
+            page_id="5",
+            title="Chapter Index",
+            content="# CI",
+            status="completed",
+            metadata={"is_chapter_index": True},
+        )
+        assert page.metadata["is_chapter_index"] is True
+
+    def test_subpage_metadata(self):
+        page = WikiPage(
+            page_id="5001",
+            title="Sub Page",
+            content="# SP",
+            status="completed",
+            metadata={"chapter_cluster_id": 5, "subpage_index": 1},
+        )
+        assert page.metadata["chapter_cluster_id"] == 5
+        assert page.metadata["subpage_index"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Chaptered layout in _export_markdown_format
+# ---------------------------------------------------------------------------
+
+
+def _make_chapter_pages() -> list[WikiPage]:
+    """Chapter index + 2 sub-pages with proper chaptered metadata."""
+    chapter_index = WikiPage(
+        page_id="5",
+        title="Auth Layer",
+        content="# Auth Layer\n\nOverview of auth.",
+        status="completed",
+        metadata={"is_chapter_index": True},
+    )
+    sub1 = WikiPage(
+        page_id="5001",
+        title="JWT Validation",
+        content="# JWT Validation\n\nDetails.",
+        status="completed",
+        metadata={"chapter_cluster_id": 5, "subpage_index": 0},
+    )
+    sub2 = WikiPage(
+        page_id="5002",
+        title="Session Management",
+        content="# Session Management\n\nDetails.",
+        status="completed",
+        metadata={"chapter_cluster_id": 5, "subpage_index": 1},
+    )
+    return [chapter_index, sub1, sub2]
+
+
+class TestChapteredLayout:
+    """#291 — chaptered pages produce folder-based layout."""
+
+    def test_chapter_index_lands_at_chapter_slug_index_md(self, tmp_path):
+        exporter = ArtifactExporter()
+        structure = WikiStructureSpec(wiki_title="T", overview="", sections=[], total_pages=3)
+        pages = _make_chapter_pages()
+        result = exporter._export_markdown_format(structure, pages, _make_repo_metadata(), tmp_path)
+
+        names = [a["name"] for a in result]
+        assert any("auth-layer/_index.md" in n for n in names), f"chapter _index missing in: {names}"
+
+    def test_sub_page_lands_in_chapter_folder(self, tmp_path):
+        exporter = ArtifactExporter()
+        structure = WikiStructureSpec(wiki_title="T", overview="", sections=[], total_pages=3)
+        pages = _make_chapter_pages()
+        result = exporter._export_markdown_format(structure, pages, _make_repo_metadata(), tmp_path)
+
+        names = [a["name"] for a in result]
+        assert any("auth-layer/jwt-validation.md" in n for n in names), f"jwt-validation missing in: {names}"
+        assert any("auth-layer/session-management.md" in n for n in names), f"session-management missing in: {names}"
+
+    def test_chapter_index_frontmatter_has_is_chapter_index(self, tmp_path):
+        exporter = ArtifactExporter()
+        structure = WikiStructureSpec(wiki_title="T", overview="", sections=[], total_pages=3)
+        pages = _make_chapter_pages()
+        result = exporter._export_markdown_format(structure, pages, _make_repo_metadata(), tmp_path)
+
+        index_artifact = next(a for a in result if "auth-layer/_index.md" in a["name"])
+        assert "is_chapter_index: true" in index_artifact["data"]
+
+    def test_sub_page_frontmatter_has_chapter_and_page_order(self, tmp_path):
+        exporter = ArtifactExporter()
+        structure = WikiStructureSpec(wiki_title="T", overview="", sections=[], total_pages=3)
+        pages = _make_chapter_pages()
+        result = exporter._export_markdown_format(structure, pages, _make_repo_metadata(), tmp_path)
+
+        jwt_artifact = next(a for a in result if "jwt-validation.md" in a["name"])
+        assert "chapter: auth-layer" in jwt_artifact["data"]
+        assert "page_order: 0" in jwt_artifact["data"]
+
+    def test_flat_pages_unaffected(self, tmp_path):
+        """Non-chaptered pages (no metadata keys) go to flat layout."""
+        exporter = ArtifactExporter()
+        structure = _make_structure()
+        pages = [_make_wiki_page("0#0", "Overview", "# Overview\nContent")]
+        result = exporter._export_markdown_format(structure, pages, _make_repo_metadata(), tmp_path)
+
+        names = [a["name"] for a in result]
+        # Should contain overview.md somewhere (not inside a chaptered folder)
+        assert any("overview.md" in n for n in names), f"flat overview.md missing in: {names}"
+        # Should not contain _index.md from chaptered logic (section MOC is ok)
+        chapter_index_names = [n for n in names if "auth-layer" in n]
+        assert chapter_index_names == []
+
+    def test_missing_chapter_index_uses_cluster_id_fallback(self, tmp_path):
+        """Sub-page whose chapter index is not in the list falls back to cluster-<id>."""
+        exporter = ArtifactExporter()
+        structure = WikiStructureSpec(wiki_title="T", overview="", sections=[], total_pages=1)
+        orphan = WikiPage(
+            page_id="9001",
+            title="Orphan Sub Page",
+            content="# Orphan",
+            status="completed",
+            metadata={"chapter_cluster_id": 9, "subpage_index": 0},
+        )
+        result = exporter._export_markdown_format(structure, [orphan], _make_repo_metadata(), tmp_path)
+
+        names = [a["name"] for a in result]
+        assert any("cluster-9/orphan-sub-page.md" in n for n in names), f"fallback path missing: {names}"

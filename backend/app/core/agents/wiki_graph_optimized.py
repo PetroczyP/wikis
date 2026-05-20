@@ -2173,6 +2173,7 @@ class OptimizedWikiGenerationAgent:
                     title=gen_page.title,
                     content=gen_page.markdown or f"# {gen_page.title}\n\n{gen_page.description}\n",
                     status="completed",
+                    metadata=gen_page.metadata,
                 )
             )
 
