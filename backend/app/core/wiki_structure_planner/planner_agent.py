@@ -30,7 +30,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from app.core.agent_tools import WIKI_TOOL_SCHEMAS as _TOOL_SCHEMAS
 from app.core.wiki_structure_planner._evidence_utils import safe_join
-from app.core.wiki_structure_planner.evidence import EvidencePack
+from app.core.wiki_structure_planner.evidence import EvidencePack, EvidenceSlice, slice_evidence_pack
 from app.core.wiki_structure_planner.planner_prompts import (
     CHAPTERED_PLANNER_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
@@ -840,21 +840,30 @@ def run_planner_chaptered(
     *,
     llm: BaseChatModel,
     repo_root: str,
-) -> list[ChapterSpec]:
+    storage: Any = None,
+) -> tuple[list[ChapterSpec], dict[int, list[EvidenceSlice]]]:
     """Run the chaptered planner: each cluster -> ChapterSpec with sub-pages.
 
     Tiny clusters (total_artifacts <= 5) are capped at 1 sub-page.
     All clusters are capped at 6 sub-pages.
     Flat LLM responses (old format) are wrapped in 1-subpage ChapterSpec.
 
+    After producing ChapterSpec objects, slices each cluster's evidence pack
+    into per-subpage EvidenceSlice objects so the writer (#290) can receive
+    focused evidence rather than the full cluster pack.
+
     Args:
         skeleton: Completed structure skeleton.
         evidence_packs: Pre-built evidence packs keyed by cluster_id.
         llm: Pre-configured LangChain chat model.
         repo_root: Absolute path to the checked-out repository root.
+        storage: Optional storage object with ``get_node_summary(symbol)``
+            used to populate EvidenceSlice.summary fields.
 
     Returns:
-        List of ChapterSpec objects — one per resolved cluster.
+        Tuple of (list[ChapterSpec], dict[cluster_id, list[EvidenceSlice]]).
+        The ChapterSpec list has one entry per resolved cluster; the dict
+        maps each cluster_id that had an evidence pack to its slices.
 
     Raises:
         ValueError: If repo_root is not a valid directory.
@@ -869,7 +878,7 @@ def run_planner_chaptered(
         clusters = list(skeleton.code_clusters)
     if not clusters:
         logger.info("[PLANNER-CHAPTERED] no clusters — returning empty list")
-        return []
+        return [], {}
     n = len(clusters)
     budget_total = 3 * n
     budget_tracker: list[int] = [0, budget_total]
@@ -904,5 +913,16 @@ def run_planner_chaptered(
                 _flat_spec_to_chapter(flat_spec, cluster), cluster
             )
     result = [chapters_by_id[c.cluster_id] for c in clusters]
-    logger.info("[PLANNER-CHAPTERED] done: %d chapters", len(result))
-    return result
+
+    # ── Slice evidence packs into per-subpage EvidenceSlice objects (#289) ──
+    chapter_evidence: dict[int, list[EvidenceSlice]] = {}
+    for ch in result:
+        pack = evidence_packs.get(ch.cluster_id)
+        if pack is not None:
+            chapter_evidence[ch.cluster_id] = slice_evidence_pack(
+                pack, ch, storage=storage
+            )
+
+    logger.info("[PLANNER-CHAPTERED] done: %d chapters, %d clusters with evidence slices",
+                len(result), len(chapter_evidence))
+    return result, chapter_evidence

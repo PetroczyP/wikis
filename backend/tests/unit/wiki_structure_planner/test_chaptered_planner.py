@@ -2,7 +2,7 @@
 
 Covers:
 - ChapterSpec / SubPageSpec dataclasses have the right fields
-- run_planner_chaptered returns list[ChapterSpec] with >=1 sub-page per chapter
+- run_planner_chaptered returns (list[ChapterSpec], dict[cluster_id, list[EvidenceSlice]])
 - Back-compat: flat (old-format) LLM response wraps into 1-sub-page ChapterSpec
 - Tiny cluster (<=5 symbols) -> 1 sub-page max
 - Sub-page cap: planner tries to emit 8 sub-pages -> capped to 6
@@ -232,7 +232,7 @@ class TestRunPlannerChapteredHappyPath:
         skeleton = _make_skeleton([cluster])
         pack = _make_pack(cluster_id=1)
         llm = FakeLLM(responses=[_chapter_json(1, n_subpages=3)], record_calls=[])
-        chapters = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
+        chapters, _ = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
         assert isinstance(chapters, list)
         assert len(chapters) == 1
         assert isinstance(chapters[0], ChapterSpec)
@@ -242,7 +242,7 @@ class TestRunPlannerChapteredHappyPath:
         skeleton = _make_skeleton([cluster])
         pack = _make_pack(cluster_id=1)
         llm = FakeLLM(responses=[_chapter_json(1, n_subpages=3)], record_calls=[])
-        chapters = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
+        chapters, _ = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
         assert len(chapters[0].subpages) >= 1
 
     def test_subpages_are_subpage_spec_instances(self, tmp_path):
@@ -250,7 +250,7 @@ class TestRunPlannerChapteredHappyPath:
         skeleton = _make_skeleton([cluster])
         pack = _make_pack(cluster_id=1)
         llm = FakeLLM(responses=[_chapter_json(1, n_subpages=3)], record_calls=[])
-        chapters = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
+        chapters, _ = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
         for sp in chapters[0].subpages:
             assert isinstance(sp, SubPageSpec)
 
@@ -259,7 +259,7 @@ class TestRunPlannerChapteredHappyPath:
         skeleton = _make_skeleton([cluster])
         pack = _make_pack(cluster_id=42)
         llm = FakeLLM(responses=[_chapter_json(42, n_subpages=3)], record_calls=[])
-        chapters = run_planner_chaptered(skeleton, {42: pack}, llm=llm, repo_root=str(tmp_path))
+        chapters, _ = run_planner_chaptered(skeleton, {42: pack}, llm=llm, repo_root=str(tmp_path))
         assert chapters[0].cluster_id == 42
 
     def test_chapter_title_from_llm(self, tmp_path):
@@ -270,14 +270,15 @@ class TestRunPlannerChapteredHappyPath:
             responses=[_chapter_json(1, chapter_title="Token Auth Pipeline")],
             record_calls=[],
         )
-        chapters = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
+        chapters, _ = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
         assert chapters[0].chapter_title == "Token Auth Pipeline"
 
     def test_empty_skeleton_returns_empty(self, tmp_path):
         skeleton = _make_skeleton([])
         llm = FakeLLM(responses=[], record_calls=[])
-        chapters = run_planner_chaptered(skeleton, {}, llm=llm, repo_root=str(tmp_path))
+        chapters, chapter_evidence = run_planner_chaptered(skeleton, {}, llm=llm, repo_root=str(tmp_path))
         assert chapters == []
+        assert chapter_evidence == {}
 
     def test_multiple_clusters_each_get_chapter(self, tmp_path):
         clusters = [_make_cluster(cluster_id=i) for i in range(1, 4)]
@@ -285,7 +286,7 @@ class TestRunPlannerChapteredHappyPath:
         packs = {c.cluster_id: _make_pack(c.cluster_id) for c in clusters}
         responses = [_chapter_json(i, n_subpages=3) for i in range(1, 4)]
         llm = FakeLLM(responses=responses, record_calls=[])
-        chapters = run_planner_chaptered(skeleton, packs, llm=llm, repo_root=str(tmp_path))
+        chapters, _ = run_planner_chaptered(skeleton, packs, llm=llm, repo_root=str(tmp_path))
         assert len(chapters) == 3
         assert {ch.cluster_id for ch in chapters} == {1, 2, 3}
 
@@ -299,7 +300,7 @@ class TestBackCompatFlatResponse:
         skeleton = _make_skeleton([cluster])
         pack = _make_pack(cluster_id=1)
         llm = FakeLLM(responses=[_flat_json(1, title="Auth Module")], record_calls=[])
-        chapters = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
+        chapters, _ = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
         assert len(chapters) == 1
         assert isinstance(chapters[0], ChapterSpec)
         assert len(chapters[0].subpages) == 1
@@ -309,7 +310,7 @@ class TestBackCompatFlatResponse:
         skeleton = _make_skeleton([cluster])
         pack = _make_pack(cluster_id=1)
         llm = FakeLLM(responses=[_flat_json(1, title="Auth Module")], record_calls=[])
-        chapters = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
+        chapters, _ = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
         assert "Auth Module" in chapters[0].chapter_title
 
     def test_flat_response_subpage_has_page_order_one(self, tmp_path):
@@ -317,7 +318,7 @@ class TestBackCompatFlatResponse:
         skeleton = _make_skeleton([cluster])
         pack = _make_pack(cluster_id=1)
         llm = FakeLLM(responses=[_flat_json(1)], record_calls=[])
-        chapters = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
+        chapters, _ = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
         assert chapters[0].subpages[0].page_order == 1
 
 
@@ -330,7 +331,7 @@ class TestTinyCluster:
         skeleton = _make_skeleton([tiny])
         pack = _make_pack(cluster_id=1)
         llm = FakeLLM(responses=[_chapter_json(1, n_subpages=3)], record_calls=[])
-        chapters = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
+        chapters, _ = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
         assert len(chapters[0].subpages) == 1
 
     def test_boundary_five_symbols_is_tiny(self, tmp_path):
@@ -338,7 +339,7 @@ class TestTinyCluster:
         skeleton = _make_skeleton([tiny])
         pack = _make_pack(cluster_id=1)
         llm = FakeLLM(responses=[_chapter_json(1, n_subpages=4)], record_calls=[])
-        chapters = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
+        chapters, _ = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
         assert len(chapters[0].subpages) == 1
 
     def test_six_symbols_not_tiny(self, tmp_path):
@@ -346,7 +347,7 @@ class TestTinyCluster:
         skeleton = _make_skeleton([cluster])
         pack = _make_pack(cluster_id=1)
         llm = FakeLLM(responses=[_chapter_json(1, n_subpages=3)], record_calls=[])
-        chapters = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
+        chapters, _ = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
         assert len(chapters[0].subpages) == 3
 
 
@@ -359,7 +360,7 @@ class TestSubPageCap:
         skeleton = _make_skeleton([cluster])
         pack = _make_pack(cluster_id=1)
         llm = FakeLLM(responses=[_chapter_json(1, n_subpages=8)], record_calls=[])
-        chapters = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
+        chapters, _ = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
         assert len(chapters[0].subpages) <= 6
 
     def test_exactly_six_subpages_not_capped(self, tmp_path):
@@ -367,7 +368,7 @@ class TestSubPageCap:
         skeleton = _make_skeleton([cluster])
         pack = _make_pack(cluster_id=1)
         llm = FakeLLM(responses=[_chapter_json(1, n_subpages=6)], record_calls=[])
-        chapters = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
+        chapters, _ = run_planner_chaptered(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
         assert len(chapters[0].subpages) == 6
 
 

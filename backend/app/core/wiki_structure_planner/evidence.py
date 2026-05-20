@@ -23,6 +23,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from ._evidence_utils import safe_join
 from .structure_skeleton import ArtifactInfo, Cluster
@@ -78,6 +79,16 @@ class EvidencePack:
         Head ≤60 lines of the first README found inside the cluster's dirs.
     sql_blocks : list of str
         All ``CREATE TABLE …;`` blocks extracted from *.sql files in cluster dirs.
+    artifact_names : list of str
+        Architectural symbol names in the cluster (used by ``slice_evidence_pack``).
+    path_leaves : list of str
+        Repo-relative file paths for the cluster's artifacts.
+    call_graph_edges : list of (caller, callee) tuples
+        Internal call-graph edges among cluster symbols.
+    cross_cluster_refs : list of str
+        Symbol names from other clusters referenced by this cluster.
+    doc_snippets : list of str
+        Documentation file paths or excerpts attached to this cluster.
     """
 
     cluster_id: int
@@ -86,6 +97,13 @@ class EvidencePack:
     file_heads: list[tuple[str, str]] = field(default_factory=list)
     readme_excerpt: str = ""
     sql_blocks: list[str] = field(default_factory=list)
+    # Fields used by slice_evidence_pack (#289) — populated by build_pack
+    # and by callers that build packs for chaptered clusters.
+    artifact_names: list[str] = field(default_factory=list)
+    path_leaves: list[str] = field(default_factory=list)
+    call_graph_edges: list[tuple] = field(default_factory=list)
+    cross_cluster_refs: list[str] = field(default_factory=list)
+    doc_snippets: list[str] = field(default_factory=list)
 
     def serialize(self) -> str:
         """Render all sections as a prompt-ready string.
@@ -361,6 +379,12 @@ def build_pack(
     sig_budget_chars = int(char_budget * _SECTION_FRACTIONS["signatures"])
     signatures = _truncate_signatures_to_budget(signatures, sig_budget_chars)
 
+    # ── 6. Populate slice-helper fields ──────────────────────────────────
+    # artifact_names: names of all symbol artifacts (not just top-k)
+    artifact_names: list[str] = [a.name for a in symbol_artifacts]
+    # path_leaves: unique source paths across all symbol artifacts
+    path_leaves: list[str] = list(dict.fromkeys(a.source_path for a in symbol_artifacts))
+
     pack = EvidencePack(
         cluster_id=cluster.cluster_id,
         kind=kind,
@@ -368,6 +392,169 @@ def build_pack(
         file_heads=file_heads,
         readme_excerpt=readme_excerpt,
         sql_blocks=sql_blocks,
+        artifact_names=artifact_names,
+        path_leaves=path_leaves,
+        # call_graph_edges and cross_cluster_refs are not available from the
+        # Cluster dataclass alone; callers that build richer packs should set
+        # these directly after calling build_pack().
+        call_graph_edges=[],
+        cross_cluster_refs=[],
+        doc_snippets=[],
     )
     _enforce_total_budget(pack, char_budget)
     return pack
+
+
+# ── EvidenceSlice ─────────────────────────────────────────────────────────────
+
+
+@dataclass
+class EvidenceSlice:
+    """Focused slice of a cluster's evidence pack for one sub-page (#289).
+
+    Attributes
+    ----------
+    subpage_index : int
+        Copied from ``SubPageSpec.page_order`` — the raw LLM integer, which
+        may be 1-based or arbitrary. Do NOT use as an array offset.
+    subpage_title : str
+        Tentative title copied from the corresponding SubPageSpec.
+    symbols : list of str
+        Architectural symbol names for this subtopic.
+    file_paths : list of str
+        Repo-relative file paths relevant to the slice symbols.
+    doc_paths : list of str
+        Documentation file paths shared from the parent cluster pack.
+    call_graph_edges : list of (caller, callee) tuples
+        Call-graph edges where at least one endpoint is in ``symbols``.
+    cross_cluster_refs : list of str
+        Symbol names from other clusters whose names overlap with ``symbols``.
+    summary : str
+        Concatenated LLM summaries for the slice symbols (≤ 1 200 chars),
+        or an empty string when no storage is available.
+    """
+
+    subpage_index: int
+    subpage_title: str
+    symbols: list[str]
+    file_paths: list[str]
+    doc_paths: list[str]
+    call_graph_edges: list[tuple]
+    cross_cluster_refs: list[str]
+    summary: str
+
+
+# ── slice_evidence_pack ───────────────────────────────────────────────────────
+
+_SUMMARY_CHAR_CAP = 1200
+
+
+def slice_evidence_pack(
+    pack: "EvidencePack",
+    chapter_spec: Any,
+    *,
+    storage: Any = None,
+) -> "list[EvidenceSlice]":
+    """Distribute a cluster's EvidencePack across the SubPageSpec entries.
+
+    For each ``SubPageSpec`` in ``chapter_spec.subpages``, builds an
+    ``EvidenceSlice`` by intersecting the pack's artifact names with
+    the subpage's ``target_symbols``.  When ``target_symbols`` is empty,
+    falls back to an even round-robin split.
+
+    Parameters
+    ----------
+    pack : EvidencePack
+        Full evidence pack for the cluster.
+    chapter_spec : ChapterSpec
+        Chapter produced by ``run_planner_chaptered`` — its ``subpages``
+        list drives the slice boundaries.
+    storage : optional
+        Storage object with a ``get_node_summary(symbol: str) -> str``
+        method.  When provided, the ``summary`` field of each slice is
+        populated by concatenating the LLM summaries of its symbols up to
+        ``_SUMMARY_CHAR_CAP`` characters.  Exceptions from ``storage`` are
+        caught and result in an empty summary.
+
+    Returns
+    -------
+    list[EvidenceSlice]
+        One ``EvidenceSlice`` per ``SubPageSpec`` in the chapter.
+    """
+    subpages = chapter_spec.subpages
+    n = len(subpages)
+    all_symbols = pack.artifact_names
+
+    slices: list[EvidenceSlice] = []
+
+    for idx, sp in enumerate(subpages):
+        # ── Symbols for this subpage ──────────────────────────────────────
+        target = sp.target_symbols or []
+        slice_symbols = [s for s in target if s in all_symbols]
+
+        if not slice_symbols:
+            # Even round-robin split using enumeration index, NOT page_order.
+            # page_order is a free-form LLM integer that can be 1-based or
+            # arbitrary; using it as an array index produces empty slices
+            # (e.g. page_order=1, n=1 → start=len, end=2*len → empty).
+            start = idx * len(all_symbols) // n
+            end = (idx + 1) * len(all_symbols) // n
+            slice_symbols = all_symbols[start:end]
+            if not slice_symbols and all_symbols:
+                # Degenerate case: rounding left this slice empty → give it all
+                slice_symbols = all_symbols
+
+        # ── File paths ───────────────────────────────────────────────────
+        if slice_symbols:
+            slice_paths = [
+                p for p in pack.path_leaves
+                if any(sym.lower() in p.lower() for sym in slice_symbols)
+            ]
+        else:
+            slice_paths = []
+        if not slice_paths:
+            slice_paths = list(pack.path_leaves)
+
+        # ── Call-graph edges ─────────────────────────────────────────────
+        sym_set = set(slice_symbols)
+        slice_edges = [
+            (c, e) for (c, e) in pack.call_graph_edges
+            if c in sym_set or e in sym_set
+        ]
+
+        # ── Cross-cluster refs ───────────────────────────────────────────
+        slice_cross = [
+            ref for ref in pack.cross_cluster_refs
+            if any(sym.lower() in ref.lower() for sym in slice_symbols)
+        ]
+
+        # ── Shared doc context (up to 3 snippets from the pack) ──────────
+        slice_docs = pack.doc_snippets[:3]
+
+        # ── Summary from storage ─────────────────────────────────────────
+        summary = ""
+        if storage is not None:
+            parts: list[str] = []
+            for sym in slice_symbols:
+                try:
+                    text = storage.get_node_summary(sym)
+                except Exception:  # noqa: BLE001
+                    text = ""
+                if text:
+                    parts.append(text)
+            if parts:
+                raw = " ".join(parts)
+                summary = raw[:_SUMMARY_CHAR_CAP]
+
+        slices.append(EvidenceSlice(
+            subpage_index=sp.page_order,
+            subpage_title=sp.title,
+            symbols=slice_symbols,
+            file_paths=slice_paths,
+            doc_paths=slice_docs,
+            call_graph_edges=slice_edges,
+            cross_cluster_refs=slice_cross,
+            summary=summary,
+        ))
+
+    return slices

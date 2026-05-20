@@ -37,7 +37,7 @@ from app.core.wiki_content_writer.citation_extractor import CitedClaim, extract_
 from app.core.wiki_content_writer.source_gate import GateReport, ToolCall, apply_gate
 from app.core.wiki_content_writer.writer_agent import WikiContentWriter
 from app.core.wiki_content_writer.writer_tools import WriterTools
-from app.core.wiki_structure_planner.evidence import EvidencePack
+from app.core.wiki_structure_planner.evidence import EvidencePack, EvidenceSlice
 from app.core.feature_flags import get_feature_flags
 from app.core.wiki_structure_planner.planner_agent import (
     ChapterSpec,
@@ -375,9 +375,14 @@ def run_unified_pipeline(
 
     flags = get_feature_flags()
     if flags.chaptered_pages:
-        # Chaptered path (#287): flatten to PageSpec for writer (writer changes in #290).
-        chapters: list[ChapterSpec] = run_planner_chaptered(
-            skeleton, evidence_packs, llm=llm, repo_root=repo_root,
+        # Chaptered path (#287): run_planner_chaptered now returns a tuple
+        # (list[ChapterSpec], dict[cluster_id, list[EvidenceSlice]]) (#289).
+        # The chapter_evidence dict is threaded through for the writer (#290);
+        # for now we flatten to PageSpec to keep the existing writer path.
+        chapters: list[ChapterSpec]
+        chapter_evidence: dict[int, list[EvidenceSlice]]
+        chapters, chapter_evidence = run_planner_chaptered(
+            skeleton, evidence_packs, llm=llm, repo_root=repo_root, storage=storage,
         )
         page_specs = []
         for ch in chapters:
@@ -399,6 +404,11 @@ def run_unified_pipeline(
             tool_budget_exceeded=False,
             pages_emitted=len(page_specs),
             notes=[],
+        )
+        logger.info(
+            "[UNIFIED] chaptered: %d chapters, %d clusters with evidence slices",
+            len(chapters),
+            len(chapter_evidence),
         )
     else:
         page_specs, plan_report = run_planner_with_report(
