@@ -384,3 +384,283 @@ class TestReadAttachmentMeta:
         tools = WriterTools(repo_root=str(tmp_path))
         result = tools.read_attachment_meta("diagram.svg")
         assert result.mime == "image/svg+xml"
+
+
+# ── Storage-wired tool tests ─────────────────────────────────────────────────
+#
+# Each test below mocks the storage protocol so no real DB is needed.
+# The mock returns deterministic rows matching the repo_nodes schema.
+
+
+def _make_node(
+    node_id: str = "n1",
+    symbol_name: str = "WorkerPool",
+    rel_path: str = "app/worker.py",
+    start_line: int = 10,
+    end_line: int = 30,
+    signature: str = "class WorkerPool:",
+    symbol_type: str = "class",
+    docstring: str = "Manages a pool of workers.",
+    source_text: str = "class WorkerPool:\n    pass",
+) -> dict:
+    return {
+        "node_id": node_id,
+        "symbol_name": symbol_name,
+        "rel_path": rel_path,
+        "start_line": start_line,
+        "end_line": end_line,
+        "signature": signature,
+        "symbol_type": symbol_type,
+        "docstring": docstring,
+        "source_text": source_text,
+        "is_architectural": 1,
+        "macro_cluster": None,
+        "micro_cluster": None,
+    }
+
+
+def _make_storage(
+    symbol_rows=None,
+    fts_rows=None,
+    edges_to=None,
+    edges_from=None,
+    nodes_by_prefix=None,
+    node_by_id=None,
+):
+    storage = MagicMock()
+    storage.search_fts_by_symbol_name.return_value = symbol_rows or []
+    storage.search_fts_by_column.return_value = fts_rows or []
+    storage.get_edges_to.return_value = edges_to or []
+    storage.get_edges_from.return_value = edges_from or []
+    storage.get_nodes_by_path_prefix.return_value = nodes_by_prefix or []
+    storage.get_node.return_value = node_by_id
+    return storage
+
+
+class TestGetSignatureWithStorage:
+    def test_found_true_when_storage_returns_match(self, tmp_path):
+        node = _make_node()
+        storage = _make_storage(symbol_rows=[node])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.get_signature("WorkerPool")
+        assert result.found is True
+
+    def test_symbol_echoed_with_storage(self, tmp_path):
+        node = _make_node()
+        storage = _make_storage(symbol_rows=[node])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.get_signature("WorkerPool")
+        assert result.symbol == "WorkerPool"
+
+    def test_file_path_and_lines_in_result(self, tmp_path):
+        node = _make_node(rel_path="app/worker.py")
+        storage = _make_storage(symbol_rows=[node])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.get_signature("WorkerPool")
+        assert result.file_path == "app/worker.py"
+
+    def test_signature_text_populated(self, tmp_path):
+        node = _make_node(signature="class WorkerPool:")
+        storage = _make_storage(symbol_rows=[node])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.get_signature("WorkerPool")
+        assert result.signature == "class WorkerPool:"
+
+    def test_docstring_populated(self, tmp_path):
+        node = _make_node(docstring="Manages a pool of workers.")
+        storage = _make_storage(symbol_rows=[node])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.get_signature("WorkerPool")
+        assert result.docstring == "Manages a pool of workers."
+
+    def test_not_found_when_storage_returns_empty(self, tmp_path):
+        storage = _make_storage(symbol_rows=[])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.get_signature("Nonexistent")
+        assert result.found is False
+
+    def test_storage_queried_with_symbol_name(self, tmp_path):
+        storage = _make_storage(symbol_rows=[])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        tools.get_signature("MyClass")
+        storage.search_fts_by_symbol_name.assert_called_once()
+        call_args = storage.search_fts_by_symbol_name.call_args
+        assert call_args[0][0] == "MyClass" or call_args[1].get("name") == "MyClass"
+
+    def test_no_storage_returns_not_found(self, tmp_path):
+        tools = WriterTools(repo_root=str(tmp_path))
+        result = tools.get_signature("WorkerPool")
+        assert result.found is False
+
+
+class TestGrepWithStorage:
+    def test_returns_grep_matches_from_storage(self, tmp_path):
+        row = _make_node(rel_path="src/queue.py", start_line=5, symbol_name="JobQueue")
+        storage = _make_storage(fts_rows=[row])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.grep("JobQueue")
+        assert len(result) == 1
+        assert isinstance(result[0], GrepMatch)
+
+    def test_file_path_and_line_in_grep_match(self, tmp_path):
+        row = _make_node(rel_path="src/queue.py", start_line=5)
+        storage = _make_storage(fts_rows=[row])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.grep("JobQueue")
+        assert result[0].file_path == "src/queue.py"
+        assert result[0].line_number == 5
+
+    def test_empty_results_when_no_matches(self, tmp_path):
+        storage = _make_storage(fts_rows=[])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.grep("NothingHere")
+        assert result == []
+
+    def test_storage_queried_with_pattern(self, tmp_path):
+        storage = _make_storage(fts_rows=[])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        tools.grep("MyPattern")
+        storage.search_fts_by_column.assert_called_once()
+
+    def test_no_storage_returns_empty(self, tmp_path):
+        tools = WriterTools(repo_root=str(tmp_path))
+        result = tools.grep("anything")
+        assert result == []
+
+
+class TestGetCallersWithStorage:
+    def test_returns_callers_found_true(self, tmp_path):
+        target_node = _make_node(node_id="target", symbol_name="WorkerPool")
+        caller_node = _make_node(node_id="caller1", symbol_name="Main", rel_path="app/main.py")
+        edge = {"source_id": "caller1", "target_id": "target", "rel_type": "calls"}
+        storage = _make_storage(symbol_rows=[target_node], edges_to=[edge])
+        storage.get_node.return_value = caller_node
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.get_callers("WorkerPool")
+        assert result.found is True
+
+    def test_callers_list_populated(self, tmp_path):
+        target_node = _make_node(node_id="target", symbol_name="WorkerPool")
+        caller_node = _make_node(node_id="caller1", symbol_name="Main", rel_path="app/main.py")
+        edge = {"source_id": "caller1", "target_id": "target", "rel_type": "calls"}
+        storage = _make_storage(symbol_rows=[target_node], edges_to=[edge])
+        storage.get_node.return_value = caller_node
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.get_callers("WorkerPool")
+        assert len(result.callers) == 1
+        assert result.callers[0].symbol == "Main"
+        assert result.callers[0].file_path == "app/main.py"
+
+    def test_no_callers_when_edges_empty(self, tmp_path):
+        target_node = _make_node(node_id="target", symbol_name="WorkerPool")
+        storage = _make_storage(symbol_rows=[target_node], edges_to=[])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.get_callers("WorkerPool")
+        assert result.found is True
+        assert result.callers == []
+
+    def test_not_found_when_symbol_missing(self, tmp_path):
+        storage = _make_storage(symbol_rows=[])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.get_callers("Ghost")
+        assert result.found is False
+
+    def test_no_storage_returns_not_found(self, tmp_path):
+        tools = WriterTools(repo_root=str(tmp_path))
+        result = tools.get_callers("fn")
+        assert result.found is False
+
+
+class TestGetCalleesWithStorage:
+    def test_returns_callees_found_true(self, tmp_path):
+        source_node = _make_node(node_id="source", symbol_name="run")
+        callee_node = _make_node(node_id="callee1", symbol_name="WorkerPool", rel_path="app/worker.py")
+        edge = {"source_id": "source", "target_id": "callee1", "rel_type": "calls"}
+        storage = _make_storage(symbol_rows=[source_node], edges_from=[edge])
+        storage.get_node.return_value = callee_node
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.get_callees("run")
+        assert result.found is True
+
+    def test_callees_list_populated(self, tmp_path):
+        source_node = _make_node(node_id="source", symbol_name="run")
+        callee_node = _make_node(node_id="callee1", symbol_name="WorkerPool", rel_path="app/worker.py")
+        edge = {"source_id": "source", "target_id": "callee1", "rel_type": "calls"}
+        storage = _make_storage(symbol_rows=[source_node], edges_from=[edge])
+        storage.get_node.return_value = callee_node
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.get_callees("run")
+        assert len(result.callees) == 1
+        assert result.callees[0].symbol == "WorkerPool"
+        assert result.callees[0].file_path == "app/worker.py"
+
+    def test_edges_filtered_by_calls_and_imports(self, tmp_path):
+        source_node = _make_node(node_id="source", symbol_name="run")
+        storage = _make_storage(symbol_rows=[source_node], edges_from=[])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        tools.get_callees("run")
+        storage.get_edges_from.assert_called_once()
+        call_kwargs = storage.get_edges_from.call_args
+        rel_types = call_kwargs[1].get("rel_types") or (call_kwargs[0][1] if len(call_kwargs[0]) > 1 else None)
+        assert rel_types is not None
+        assert "calls" in rel_types
+        assert "imports" in rel_types
+
+    def test_not_found_when_symbol_missing(self, tmp_path):
+        storage = _make_storage(symbol_rows=[])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.get_callees("Ghost")
+        assert result.found is False
+
+    def test_no_storage_returns_not_found(self, tmp_path):
+        tools = WriterTools(repo_root=str(tmp_path))
+        result = tools.get_callees("fn")
+        assert result.found is False
+
+
+class TestListDocChunksWithStorage:
+    def test_returns_doc_chunks_from_storage(self, tmp_path):
+        node = _make_node(
+            node_id="chunk1",
+            symbol_name="Overview",
+            rel_path="docs/README.md",
+            source_text="# Overview\nSome intro text.",
+        )
+        storage = _make_storage(nodes_by_prefix=[node])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.list_doc_chunks("docs/README.md")
+        assert len(result) == 1
+        assert isinstance(result[0], DocChunk)
+
+    def test_doc_chunk_heading_from_symbol_name(self, tmp_path):
+        node = _make_node(symbol_name="Overview", source_text="# Overview\nIntro.")
+        storage = _make_storage(nodes_by_prefix=[node])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.list_doc_chunks("docs/README.md")
+        assert result[0].heading == "Overview"
+
+    def test_doc_chunk_text_is_snippet(self, tmp_path):
+        node = _make_node(source_text="Some long text content here.")
+        storage = _make_storage(nodes_by_prefix=[node])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.list_doc_chunks("docs/README.md")
+        assert "Some long text" in result[0].text
+
+    def test_empty_when_no_nodes(self, tmp_path):
+        storage = _make_storage(nodes_by_prefix=[])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        result = tools.list_doc_chunks("docs/nonexistent.md")
+        assert result == []
+
+    def test_no_storage_returns_empty(self, tmp_path):
+        tools = WriterTools(repo_root=str(tmp_path))
+        result = tools.list_doc_chunks("docs/README.md")
+        assert result == []
+
+    def test_storage_queried_with_doc_path(self, tmp_path):
+        storage = _make_storage(nodes_by_prefix=[])
+        tools = WriterTools(repo_root=str(tmp_path), storage=storage)
+        tools.list_doc_chunks("docs/guide.md")
+        storage.get_nodes_by_path_prefix.assert_called_once()
+        call_args = storage.get_nodes_by_path_prefix.call_args
+        assert call_args[0][0] == "docs/guide.md" or call_args[1].get("prefix") == "docs/guide.md"

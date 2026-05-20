@@ -355,6 +355,7 @@ def run_unified_pipeline(
     llm: BaseChatModel,
     verifier_llm: BaseChatModel | None = None,
     repo_root: str,
+    storage: Any | None = None,
     name_index: set[str] | None = None,
     gate_mode: dict[str, str] | None = None,
     stream_callback: Callable[[dict], None] | None = None,
@@ -473,7 +474,7 @@ def run_unified_pipeline(
 
     # Build writer once — shared tools and LLM across all pages.
     writer = WikiContentWriter(
-        tools=WriterTools(repo_root=repo_root),
+        tools=WriterTools(repo_root=repo_root, storage=storage),
         llm_client=llm,
     )
 

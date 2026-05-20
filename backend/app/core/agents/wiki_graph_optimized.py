@@ -2109,6 +2109,7 @@ class OptimizedWikiGenerationAgent:
                 llm=self.llm,
                 verifier_llm=self.llm_low,
                 repo_root=repo_root,
+                storage=getattr(self, "_cluster_db", None),
                 name_index=name_index or None,
                 stream_callback=_stream_callback,
                 storage=getattr(self, "_cluster_db", None),

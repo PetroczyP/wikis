@@ -12,13 +12,6 @@ get_callees(symbol)               -- what *symbol* calls (callees graph)
 grep(pattern)                     -- FTS5-backed search over the code graph
 list_doc_chunks(doc_path)         -- doc chunks for a documentation file
 read_attachment_meta(name)        -- {name, mime, parent} — NEVER content
-
-Stubs and TODOs
----------------
-``get_callers``, ``get_callees``, ``get_signature``, ``list_doc_chunks``, and
-``grep`` delegate to the code graph / FTS index and storage respectively.
-All signatures are final; the backends are wired in #243 (epic #227 wiring &
-integration tests).
 """
 
 from __future__ import annotations
@@ -186,13 +179,10 @@ class WriterTools:
         Absolute path to the checked-out repository root.
     storage : WikiStorageProtocol | None
         Optional opened storage instance for FTS and doc-chunk queries.
-        Wired in #243.
     code_graph : nx.DiGraph | None
-        Optional NetworkX graph for signature/caller/callee resolution.
-        Wired in #243.
+        Optional NetworkX graph (unused; kept for API compatibility).
     graph_text_index : GraphTextIndex | StorageTextIndex | None
-        Optional FTS index for ``grep``.
-        Wired in #243.
+        Optional FTS index for ``grep`` (preferred over storage when set).
     """
 
     def __init__(
@@ -258,58 +248,102 @@ class WriterTools:
     # ── get_signature ─────────────────────────────────────────────────────
 
     def get_signature(self, symbol: str) -> SymbolSignature:
-        """Return the signature, layer, and docstring for *symbol*.
-
-        Currently a stub: returns ``found=False`` regardless of whether
-        ``code_graph`` is set. Wiring to ``GraphQueryService`` happens in
-        #243 alongside the other graph-backed tools.
-        """
-        # TODO #243: wire to code_graph via GraphQueryService.resolve_symbol
+        """Return the signature, layer, and docstring for *symbol*."""
+        if self.storage is None:
+            return SymbolSignature(
+                symbol=symbol, signature="", file_path="", layer="", docstring="", found=False
+            )
+        try:
+            rows = self.storage.search_fts_by_symbol_name(symbol, limit=5)
+        except Exception:
+            logger.debug("get_signature fts lookup failed for %r", symbol, exc_info=True)
+            rows = []
+        if not rows:
+            return SymbolSignature(
+                symbol=symbol, signature="", file_path="", layer="", docstring="", found=False
+            )
+        row = rows[0]
         return SymbolSignature(
             symbol=symbol,
-            signature="",
-            file_path="",
-            layer="",
-            docstring="",
-            found=False,
+            signature=row.get("signature", "") or "",
+            file_path=row.get("rel_path", "") or "",
+            layer=row.get("symbol_type", "") or "",
+            docstring=row.get("docstring", "") or "",
+            found=True,
         )
 
     # ── get_callers ───────────────────────────────────────────────────────
 
     def get_callers(self, symbol: str) -> SymbolCallers:
-        """Return symbols that call *symbol*.
-
-        # TODO #243: wire to code_graph edges via GraphQueryService.get_relationships
-        """
-        if self.code_graph is None:
-            return SymbolCallers(symbol=symbol, callers=[])
-
-        # TODO #243: query incoming edges of type 'calls' / 'imports'
-        return SymbolCallers(symbol=symbol, callers=[])
+        """Return symbols that call *symbol*."""
+        if self.storage is None:
+            return SymbolCallers(symbol=symbol, callers=[], found=False)
+        try:
+            rows = self.storage.search_fts_by_symbol_name(symbol, limit=1)
+        except Exception:
+            logger.debug("get_callers fts lookup failed for %r", symbol, exc_info=True)
+            rows = []
+        if not rows:
+            return SymbolCallers(symbol=symbol, callers=[], found=False)
+        node_id = rows[0]["node_id"]
+        try:
+            edges = self.storage.get_edges_to(node_id)
+        except Exception:
+            logger.debug("get_callers edges_to failed for %r", node_id, exc_info=True)
+            return SymbolCallers(symbol=symbol, callers=[], found=True)
+        callers: list[CallerEntry] = []
+        for edge in edges[:20]:
+            src_id = edge.get("source_id", "")
+            try:
+                src = self.storage.get_node(src_id)
+            except Exception:
+                src = None
+            if src:
+                callers.append(CallerEntry(
+                    symbol=src.get("symbol_name", src_id),
+                    file_path=src.get("rel_path", ""),
+                    layer=src.get("symbol_type", ""),
+                ))
+        return SymbolCallers(symbol=symbol, callers=callers, found=True)
 
     # ── get_callees ───────────────────────────────────────────────────────
 
     def get_callees(self, symbol: str) -> SymbolCallees:
-        """Return symbols that *symbol* calls.
-
-        # TODO #243: wire to code_graph edges via GraphQueryService.get_relationships
-        """
-        if self.code_graph is None:
-            return SymbolCallees(symbol=symbol, callees=[])
-
-        # TODO #243: query outgoing edges of type 'calls' / 'imports'
-        return SymbolCallees(symbol=symbol, callees=[])
+        """Return symbols that *symbol* calls."""
+        if self.storage is None:
+            return SymbolCallees(symbol=symbol, callees=[], found=False)
+        try:
+            rows = self.storage.search_fts_by_symbol_name(symbol, limit=1)
+        except Exception:
+            logger.debug("get_callees fts lookup failed for %r", symbol, exc_info=True)
+            rows = []
+        if not rows:
+            return SymbolCallees(symbol=symbol, callees=[], found=False)
+        node_id = rows[0]["node_id"]
+        try:
+            edges = self.storage.get_edges_from(node_id, rel_types=["calls", "imports"])
+        except Exception:
+            logger.debug("get_callees edges_from failed for %r", node_id, exc_info=True)
+            return SymbolCallees(symbol=symbol, callees=[], found=True)
+        callees: list[CalleeEntry] = []
+        for edge in edges[:20]:
+            tgt_id = edge.get("target_id", "")
+            try:
+                tgt = self.storage.get_node(tgt_id)
+            except Exception:
+                tgt = None
+            if tgt:
+                callees.append(CalleeEntry(
+                    symbol=tgt.get("symbol_name", tgt_id),
+                    file_path=tgt.get("rel_path", ""),
+                    layer=tgt.get("symbol_type", ""),
+                ))
+        return SymbolCallees(symbol=symbol, callees=callees, found=True)
 
     # ── grep ──────────────────────────────────────────────────────────────
 
     def grep(self, pattern: str, k: int = 20) -> list[GrepMatch]:
-        """FTS5-backed search returning up to *k* matches.
-
-        Falls back to empty list when no FTS index is available.
-
-        # TODO #243: wire to graph_text_index.search(pattern, k=k) or
-        #           storage.search_fts(pattern, k=k)
-        """
+        """FTS5-backed search returning up to *k* matches."""
         if self.graph_text_index is None and self.storage is None:
             return []
 
@@ -333,21 +367,43 @@ class WriterTools:
                 )
             return matches
 
-        # TODO #243: storage.search_fts path
-        return []
+        # storage path
+        try:
+            rows = self.storage.search_fts_by_column(pattern, column="source_text", limit=k)
+        except Exception:
+            logger.debug("grep storage search failed for %r", pattern, exc_info=True)
+            return []
+        return [
+            GrepMatch(
+                file_path=row.get("rel_path", ""),
+                line_number=int(row.get("start_line", 0) or 0),
+                line_text=f"{row.get('symbol_name', '')} — {row.get('signature', '')}",
+                score=float(row.get("score_norm", row.get("fts_rank", 0.0)) or 0.0),
+            )
+            for row in rows
+        ]
 
     # ── list_doc_chunks ───────────────────────────────────────────────────
 
     def list_doc_chunks(self, doc_path: str) -> list[DocChunk]:
-        """Return doc chunks for the given documentation file path.
-
-        # TODO #243: wire to storage.get_nodes_by_path_prefix(doc_path)
-        """
+        """Return doc chunks for the given documentation file path."""
         if self.storage is None:
             return []
-
-        # TODO #243: fetch nodes for doc_path, split by heading/chunk boundary
-        return []
+        try:
+            nodes = self.storage.get_nodes_by_path_prefix(doc_path, limit=100)
+        except Exception:
+            logger.debug("list_doc_chunks failed for %r", doc_path, exc_info=True)
+            return []
+        chunks: list[DocChunk] = []
+        for i, node in enumerate(nodes):
+            source = node.get("source_text", "") or ""
+            chunks.append(DocChunk(
+                doc_path=node.get("rel_path", doc_path),
+                chunk_index=i,
+                heading=node.get("symbol_name", ""),
+                text=source[:500],
+            ))
+        return chunks
 
     # ── read_attachment_meta ──────────────────────────────────────────────
 
@@ -363,11 +419,5 @@ class WriterTools:
             Attachment filename (e.g. ``"diagram.png"``).
         """
         mime = _guess_mime(name)
-
-        # TODO #243: look up parent doc path from storage attachment registry
         parent: str | None = None
-        if self.storage is not None:
-            # TODO #243: storage.find_attachment_parent(name)
-            pass
-
         return AttachmentMeta(name=name, mime=mime, parent=parent)
