@@ -18,9 +18,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Docker (recommended)
 ```bash
-docker compose up -d          # Start all services
+docker compose up -d          # Start all services (uses pulled GHCR images)
 docker compose up -d --build  # Rebuild and start
 docker compose ps             # Check health status
+
+# Live-mount local source over the container's code (hot-reload dev mode):
+docker compose -f docker-compose.yml -f docker-compose.dev-mount.yml up
 ```
 
 ### Backend (FastAPI)

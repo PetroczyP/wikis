@@ -1,0 +1,37 @@
+# Live-mount dev overlay.
+#
+# Mounts ``./backend/app`` and ``./backend/mcp_server`` into the backend
+# container so code edits take effect without rebuilding the image.  For
+# the web app, also mounts ``./web`` and runs ``npm install + prisma
+# bootstrap + npm run dev`` so the Next.js dev server hot-reloads.
+#
+# This file is OPT-IN — it is not loaded by ``docker compose up`` on its
+# own (the previous name ``docker-compose.override.yml`` auto-applied,
+# which silently masked the pulled GHCR images with local source).
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev-mount.yml up
+#
+# When the goal is to run the merged main exactly as published, omit
+# this file and the default ``docker compose up`` uses the GHCR images
+# verbatim.
+services:
+  backend:
+    volumes:
+      - ./data:/app/data
+      - ./backend/app:/app/app
+      - ./backend/mcp_server:/app/mcp_server
+
+  app:
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+      - /app/.next
+    command: >
+      sh -c "cd /app &&
+        npm install &&
+        ./scripts/prisma-prepare.sh &&
+        npx prisma generate &&
+        npx prisma migrate deploy 2>/dev/null || true &&
+        npx prisma db seed 2>/dev/null || true &&
+        npm run dev"

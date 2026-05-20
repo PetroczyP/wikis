@@ -112,7 +112,10 @@ wikis/
 │   ├── build-push.yml        ← Docker images on tag push → GHCR
 │   └── docs.yml              ← Docs deploy on main push → GitHub Pages
 ├── docker-compose.yml        ← Production compose (GHCR images)
-├── docker-compose.override.yml
+├── docker-compose.dev-mount.yml  ← Live source-mount overlay (opt-in: -f -f)
+├── docker-compose.dev.yml    ← Build images from source (--build, opt-in)
+├── docker-compose.local.yml  ← Ollama overlay (opt-in)
+├── docker-compose.postgres.yml   ← pgvector overlay (opt-in)
 ├── .env.example              ← Source of truth for env vars
 └── CLAUDE.md                 ← Concise quick-reference (auto-loaded)
 ```
