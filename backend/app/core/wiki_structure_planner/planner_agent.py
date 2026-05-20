@@ -28,6 +28,7 @@ from typing import Any
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
+from app.core.agent_tools import WIKI_TOOL_SCHEMAS as _TOOL_SCHEMAS
 from app.core.wiki_structure_planner._evidence_utils import safe_join
 from app.core.wiki_structure_planner.evidence import EvidencePack
 from app.core.wiki_structure_planner.planner_prompts import (
@@ -172,69 +173,11 @@ def _tool_grep(repo_root: str, pattern: str) -> str:
 
 
 # ── Tool dispatch table ───────────────────────────────────────────────────────
-
-_TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": (
-                "Read up to 100 lines of a file inside the repository. "
-                "Use ONLY when the evidence pack is insufficient or wrong."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Repo-relative file path.",
-                    }
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_signature",
-            "description": (
-                "Search for a symbol's definition in the repository source. "
-                "Use ONLY when a symbol's purpose is unclear from the pack."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string",
-                        "description": "Symbol name to look up.",
-                    }
-                },
-                "required": ["symbol"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "grep",
-            "description": (
-                "Search for a pattern in the repository source files. "
-                "Use ONLY when the evidence pack is ambiguous."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Text pattern to search for.",
-                    }
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-]
+# Tool schemas come from the shared catalog (imported at top of file). Planner
+# and writer share a single tool-bound LLM — providers reject duplicate tool
+# names across separate bindings. The planner's prompt narrows usage to
+# read_file / get_signature / grep; calls to writer-only tools fall through
+# ``_dispatch_tool`` with a clear error string for the LLM to self-correct.
 
 
 def _dispatch_tool(repo_root: str, tool_name: str, args: dict[str, Any]) -> str:

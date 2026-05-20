@@ -259,19 +259,35 @@ def safe_bind_tools(llm: Any, tools: list) -> Any:
     TypeError
         When no inner LLM with ``bind_tools`` can be found.
     """
-    # Idempotency check: if the LLM is already a binding whose existing tools
-    # cover the requested schemas, return as-is. Re-calling ``bind_tools()`` on
-    # a ``_ChatModelBinding`` walks down to the BASE LLM and binds there,
-    # stripping any intermediate ``RunnableRetry`` wrapper. The wiki_runner
-    # pre-binds with the union of planner + writer schemas precisely so each
-    # agent's narrower rebind can be skipped here — preserving retry semantics
-    # on the production path.
-    existing_tools = getattr(llm, "kwargs", {}).get("tools") if hasattr(llm, "kwargs") else None
-    if existing_tools:
-        existing_names = _tool_names(existing_tools)
-        desired_names = _tool_names(tools)
-        if desired_names and desired_names.issubset(existing_names):
-            return llm
+    # Idempotency check: if any layer of the LLM wrapper chain already has a
+    # binding whose tools cover the requested schemas, return as-is. Re-calling
+    # ``bind_tools()`` on a ``_ChatModelBinding`` walks down to the BASE LLM
+    # and binds there, stripping any intermediate ``RunnableRetry`` wrapper.
+    # The wiki_runner pre-binds with the canonical WIKI_TOOL_SCHEMAS catalog
+    # so each agent's rebind can be skipped here — preserving retry semantics.
+    #
+    # Walk the chain because the binding may sit BELOW the retry wrapper when
+    # construction order is ``bind_tools → with_retry`` (the create_llm path
+    # with tools= passed). In that case the top-level object is the retry
+    # wrapper with no ``kwargs.tools`` of its own.
+    desired_names = _tool_names(tools)
+    if desired_names:
+        cursor = llm
+        for _ in range(5):  # bounded walk — wrapper chains are shallow
+            if cursor is None:
+                break
+            existing = (
+                getattr(cursor, "kwargs", {}).get("tools")
+                if hasattr(cursor, "kwargs") else None
+            )
+            if existing:
+                if desired_names.issubset(_tool_names(existing)):
+                    return llm
+                break  # binding found but tools differ — fall through to rebind
+            cursor = (
+                getattr(cursor, "bound", None)
+                or getattr(cursor, "runnable", None)
+            )
 
     if hasattr(llm, "bind_tools"):
         return llm.bind_tools(tools)

@@ -806,7 +806,14 @@ class TestBindToolsDirect:
         )
 
     def test_planner_binds_expected_tool_schemas(self, tmp_path):
-        """bind_tools is called with the three planner tool schemas."""
+        """bind_tools is called with the shared WIKI_TOOL_SCHEMAS catalog.
+
+        Planner and writer share one tool-bound LLM so a single ``bind_tools``
+        covers both (provider validators reject duplicate names across
+        bindings). The planner's prompt narrows which tools it actually calls;
+        unknown tool calls fall through ``_dispatch_tool`` with an error
+        string that the LLM uses to self-correct.
+        """
         cluster = _make_cluster(cluster_id=1)
         skeleton = _make_skeleton([cluster])
         pack = _make_pack(cluster_id=1)
@@ -815,7 +822,26 @@ class TestBindToolsDirect:
         run_planner_with_report(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
 
         tool_names = {s["function"]["name"] for s in llm.bind_tools_schemas}
-        assert tool_names == {"read_file", "get_signature", "grep"}
+        # Planner's three "core" tools must be present; writer-only tools may
+        # also appear (shared catalog) but planner's prompt directs the LLM
+        # to use only the first three.
+        assert {"read_file", "get_signature", "grep"}.issubset(tool_names)
+
+    def test_planner_dispatch_returns_error_for_writer_only_tool(self, tmp_path):
+        """Sharing the WIKI_TOOL_SCHEMAS catalog means the LLM sees the writer's
+        ``get_callers`` / ``get_callees`` / ``list_doc_chunks`` even though the
+        planner can't service them. ``_dispatch_tool`` must return a clear
+        error string so the LLM self-corrects (instead of raising and
+        aborting the whole planner loop).
+        """
+        from app.core.wiki_structure_planner.planner_agent import _dispatch_tool
+
+        for unsupported in ("get_callers", "get_callees", "list_doc_chunks", "nonsense"):
+            result = _dispatch_tool(str(tmp_path), unsupported, {"symbol": "X"})
+            assert result.startswith("[error]"), (
+                f"Expected error string for unsupported tool {unsupported!r}, got {result!r}"
+            )
+            assert unsupported in result, "Error message should name the unsupported tool"
 
     def test_planner_handles_retry_wrapped_llm(self, tmp_path):
         """Regression for #295 Copilot follow-up: planner works when the LLM

@@ -345,6 +345,40 @@ class TestSafeBindTools:
         )
         assert isinstance(rebound.bound, RunnableRetry)
 
+    def test_idempotency_walks_wrapper_chain(self) -> None:
+        """The idempotency short-circuit must walk the wrapper chain — a binding
+        can live BELOW the retry wrapper when the construction order is
+        ``with_retry(bind_tools(base))``. The top-level RunnableRetry has no
+        ``kwargs.tools`` of its own; the binding's tools live on the inner layer.
+        """
+
+        class _FakeBinding:
+            """Mimics _ChatModelBinding with kwargs.tools."""
+
+            def __init__(self, inner: Any, tools: list[Any]) -> None:
+                self.bound = inner
+                self.kwargs = {"tools": tools}
+
+            def bind_tools(self, tools: list[Any]) -> "_FakeBinding":
+                return _FakeBinding(self.bound, tools)
+
+        class _FakeRetryWithoutKwargs:
+            """Mimics RunnableRetry: wraps an inner runnable but has no kwargs."""
+
+            def __init__(self, inner: Any) -> None:
+                self.bound = inner
+
+        inner_binding = _FakeBinding(self._BindCaptureLLM(), self._TOOLS)
+        retry_on_top = _FakeRetryWithoutKwargs(inner_binding)
+
+        # Subset of inner binding's tools → must short-circuit at the inner layer
+        # and return the WHOLE chain (retry-on-top intact).
+        result = safe_bind_tools(retry_on_top, self._TOOLS)
+        assert result is retry_on_top, (
+            "Idempotency must walk past the retry wrapper to find the inner "
+            "binding; otherwise we rebind and lose the retry layer."
+        )
+
     def test_rebind_when_desired_tools_not_in_existing(self) -> None:
         """If the requested tools are NOT a subset of the existing binding,
         safe_bind_tools rebinds. (Loses retry, but that's the safety trade-off

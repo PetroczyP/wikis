@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
+from app.core.agent_tools import WIKI_TOOL_SCHEMAS as _WRITER_TOOL_SCHEMAS
 from app.services.llm_factory import safe_bind_tools
 
 from .prompts import CITATION_FORMAT_DESCRIPTION, CITATION_PROMPT_RULES
@@ -92,99 +93,10 @@ def compute_page_budget(
 # ── WikiContentWriter ─────────────────────────────────────────────────────────
 
 
-# ── Writer tool schemas ───────────────────────────────────────────────────────
-
-_WRITER_TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": (
-                "Read lines from a repo-relative file. "
-                "Use to find the exact line spans you will cite."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Repo-relative file path."},
-                    "start_line": {"type": "integer", "description": "1-indexed first line (optional)."},
-                    "end_line": {"type": "integer", "description": "1-indexed last line (optional)."},
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_signature",
-            "description": "Look up a symbol's signature, file path, and layer.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "symbol": {"type": "string", "description": "Symbol name to look up."},
-                },
-                "required": ["symbol"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "grep",
-            "description": "Search for a text pattern across repository source files.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Text pattern to search for."},
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_callers",
-            "description": "List symbols that call the given symbol.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "symbol": {"type": "string", "description": "Symbol name."},
-                },
-                "required": ["symbol"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_callees",
-            "description": "List symbols that the given symbol calls.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "symbol": {"type": "string", "description": "Symbol name."},
-                },
-                "required": ["symbol"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_doc_chunks",
-            "description": "Return documentation chunks for a doc file path.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "doc_path": {"type": "string", "description": "Documentation file path."},
-                },
-                "required": ["doc_path"],
-            },
-        },
-    },
-]
+# Writer tool schemas — imported from the shared catalog at top of file.
+# Aliased ``_WRITER_TOOL_SCHEMAS`` for back-compat with callers that imported
+# the old private name (and to preserve the local-symbol narrative in tests
+# that introspect ``llm.bind_tools_schemas``).
 
 # System prompt prefix — matches the role-detection prefix in integration tests.
 _SYSTEM_PROMPT_PREFIX = "You are a technical documentation writer."
