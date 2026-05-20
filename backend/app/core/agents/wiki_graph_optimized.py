@@ -2090,6 +2090,10 @@ class OptimizedWikiGenerationAgent:
                     except Exception:
                         pass
         # ── Phase 3: unified pipeline (planner + writer + gate) ──────
+        # Open the cluster DB now so DiagramGenerator receives a real storage
+        # object (not None). _cluster_db is set lazily and is None unless
+        # explicitly initialised before this point.
+        self._open_cluster_db()
         try:
             result = run_unified_pipeline(
                 skeleton,
