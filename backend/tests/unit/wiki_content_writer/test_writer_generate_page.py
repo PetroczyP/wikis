@@ -414,18 +414,24 @@ class TestMultiToolCallBudgetCapping:
     _WRITER_MD = "Grep results cited. [src/auth.py:1]"
 
     def test_budget_caps_total_tool_invocations(self, tmp_path):
-        """When a single response contains N tool calls > budget, only budget calls execute."""
+        """Budget is a soft cap: all tool_calls in the CURRENT response are
+        processed before the budget is checked.  A response with N > budget
+        tool calls is fully executed so Bedrock's message-structure contract
+        is upheld (every tool_use must have a tool_result immediately after).
+        Subsequent LLM rounds are suppressed, so the total can exceed budget
+        by at most N-1 within one response."""
         tools = WriterTools(repo_root=str(tmp_path))
-        # LLM will try to emit 5 tool calls in one round, budget is 3.
+        # LLM emits 5 tool calls in one round, budget is 3.
         llm = MultiToolCallFakeLLM(n_tools=5, writer_response=self._WRITER_MD)
-        # max_iterations=3 sets the hard cap
         writer = WikiContentWriter(tools=tools, llm_client=llm, max_iterations=3)
         _, trace = writer.generate_page(
             {"title": "T", "description": "D", "retrieval_query": "q",
              "target_symbols": [], "target_folders": [], "target_docs": []}
         )
-        assert len(trace) <= 3, (
-            f"Expected at most 3 tool invocations (budget), got {len(trace)}"
+        # All 5 calls in the single response are processed (soft cap).
+        # No further rounds run, so total == 5, not > 5+budget.
+        assert len(trace) == 5, (
+            f"Expected exactly 5 (one full response), got {len(trace)}"
         )
 
     def test_budget_not_exceeded_across_rounds(self, tmp_path):

@@ -316,27 +316,15 @@ class WikiContentWriter:
                 content = response.content if isinstance(response.content, str) else str(response.content)
                 break
 
-            # Execute each tool call and append results to the message thread.
+            # Execute ALL tool calls in this response before checking budget.
+            # Breaking mid-response leaves tool_use blocks without corresponding
+            # tool_result blocks — Bedrock rejects this with ValidationException.
             messages.append(response)
             for tc in tool_calls:
-                # Guard: stop immediately if we've hit the tool-call budget.
-                if tool_calls_made >= tool_call_budget:
-                    logger.warning(
-                        "[WRITER] tool-call budget (%d) reached mid-response; skipping remaining calls",
-                        tool_call_budget,
-                    )
-                    break
-
                 tc_name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
                 tc_args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
                 tc_id = tc.get("id", str(_round)) if isinstance(tc, dict) else getattr(tc, "id", str(_round))
 
-                # Coerce tc_args to dict — some providers/versions return a
-                # JSON string instead of a pre-parsed dict.  Without this,
-                # str.get(...) returns None, _dispatch_tool is called with
-                # path="", read_file returns "[empty file]", the LLM produces
-                # uncited prose, and the verifier strips it (the empty-page
-                # regression this PR is fixing).
                 if isinstance(tc_args, str):
                     try:
                         tc_args = json.loads(tc_args)
@@ -347,7 +335,6 @@ class WikiContentWriter:
 
                 result_text = self._dispatch_tool(tc_name, tc_args)
                 tool_calls_made += 1
-
                 tool_trace.append(ToolCall(tool=tc_name, args=tc_args, result_text=result_text))
 
                 if stream_callback:
@@ -356,19 +343,12 @@ class WikiContentWriter:
                     except Exception:
                         pass
 
-                messages.append(
-                    ToolMessage(content=result_text, tool_call_id=tc_id, name=tc_name)
-                )
+                messages.append(ToolMessage(content=result_text, tool_call_id=tc_id, name=tc_name))
 
-            logger.debug(
-                "[WRITER] tool round %d/%d: %d calls this round, %d total",
-                _round + 1,
-                tool_call_budget,
-                len(tool_calls),
-                tool_calls_made,
-            )
+            logger.debug("[WRITER] tool round %d/%d: %d calls this round, %d total",
+                         _round + 1, tool_call_budget, len(tool_calls), tool_calls_made)
 
-            # Break after appending results if the budget was hit during this round.
+            # Check budget AFTER finishing the full response (never mid-response).
             if tool_calls_made >= tool_call_budget:
                 break
 
