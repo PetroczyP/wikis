@@ -78,10 +78,14 @@ describe('AddSourceWizard', () => {
     expect(screen.getByText('Configure')).toBeInTheDocument();
     expect(screen.getByText('Scan')).toBeInTheDocument();
     expect(screen.getByText('Confirm')).toBeInTheDocument();
-    // Step 1 cards are present.
+    // Step 1 cards are present — live connectors first, placeholders after.
     expect(screen.getByTestId('connector-git')).toBeInTheDocument();
     expect(screen.getByTestId('connector-confluence')).toBeInTheDocument();
     expect(screen.getByTestId('connector-jira')).toBeInTheDocument();
+    expect(screen.getByTestId('connector-local-fs')).toBeInTheDocument();
+    // Placeholders are rendered (with the "Soon" badge) but disabled.
+    expect(screen.getByTestId('connector-ado')).toBeDisabled();
+    expect(screen.getByTestId('connector-notion')).toBeDisabled();
   });
 
   it('clicking a connector auto-advances to Configure', async () => {
@@ -90,6 +94,18 @@ describe('AddSourceWizard', () => {
     await user.click(screen.getByTestId('connector-git'));
     // Step 2's Git URL field appears.
     expect(await screen.findByTestId('git-repo-url')).toBeInTheDocument();
+  });
+
+  it('clicking Local FS lands on the Git Configure step (filesystem path)', async () => {
+    // Local FS reuses the Git source-type because GitToolkit already
+    // handles non-git local directories. The user lands on the same
+    // Configure form whose placeholder mentions "/abs/path for local".
+    const user = userEvent.setup();
+    renderWizard();
+    await user.click(screen.getByTestId('connector-local-fs'));
+    const urlField = (await screen.findByTestId('git-repo-url')) as HTMLInputElement;
+    expect(urlField).toBeInTheDocument();
+    expect(urlField.placeholder).toMatch(/local/i);
   });
 
   it('Next is disabled until the URL passes validation', async () => {

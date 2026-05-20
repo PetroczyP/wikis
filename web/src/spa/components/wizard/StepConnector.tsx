@@ -1,8 +1,8 @@
 /**
  * Step 1 of the AddSource wizard: pick a connector.
  *
- * Cartograph-style 6-card 3-column grid. Three connectors are live (Git,
- * Confluence, Jira); three are placeholders (Azure DevOps, Local Git,
+ * Cartograph-style 6-card 3-column grid. Four connectors are live (Git,
+ * Confluence, Jira, Local FS); two are placeholders (Azure DevOps,
  * Notion) marked "Soon" — disabled and dimmed so the surface communicates
  * the roadmap without offering a broken choice. Clicking a live card both
  * sets ``source_type`` on the wizard state and advances to Step 2.
@@ -16,12 +16,14 @@ import {
   Tooltip,
   Typography,
 } from '@mui/material';
-import GitHubIcon from '@mui/icons-material/GitHub';
-import ArticleOutlinedIcon from '@mui/icons-material/ArticleOutlined';
-import BugReportOutlinedIcon from '@mui/icons-material/BugReportOutlined';
-import CloudOutlinedIcon from '@mui/icons-material/CloudOutlined';
-import FolderOutlinedIcon from '@mui/icons-material/FolderOutlined';
-import StickyNote2OutlinedIcon from '@mui/icons-material/StickyNote2Outlined';
+import {
+  AzureDevOpsBrandIcon,
+  ConfluenceBrandIcon,
+  GitBrandIcon,
+  JiraBrandIcon,
+  LocalFsBrandIcon,
+  NotionBrandIcon,
+} from './connectors/BrandIcons';
 import type { WikiSourceType } from '../../api/wiki';
 
 // ---------------------------------------------------------------------------
@@ -31,10 +33,24 @@ import type { WikiSourceType } from '../../api/wiki';
 // compile error.)
 // ---------------------------------------------------------------------------
 
-type PlaceholderId = 'ado' | 'local_git' | 'notion';
+type PlaceholderId = 'ado' | 'notion';
+
+// Per-card unique key separate from the runtime ``id``.  Two cards can
+// share an ``id`` (Local FS routes through ``source_type='git'`` like
+// the Git card) — the ``key`` field stays unique so React list keys,
+// active-state highlighting, and the click handler all agree on which
+// card the user picked.
+type ConnectorKey =
+  | 'git'
+  | 'confluence'
+  | 'jira'
+  | 'ado'
+  | 'local_fs'
+  | 'notion';
 
 type ConnectorOption =
   | {
+      key: ConnectorKey;
       disabled: false;
       id: WikiSourceType;
       label: string;
@@ -44,6 +60,7 @@ type ConnectorOption =
       testId: string;
     }
   | {
+      key: ConnectorKey;
       disabled: true;
       id: PlaceholderId;
       label: string;
@@ -55,56 +72,68 @@ type ConnectorOption =
 
 const CONNECTORS: ConnectorOption[] = [
   {
+    key: 'git',
     disabled: false,
     id: 'git',
     label: 'Git',
     description: 'GitHub, GitLab, Bitbucket, or a local path',
-    icon: <GitHubIcon sx={{ fontSize: 28 }} />,
+    icon: <GitBrandIcon />,
     iconColor: 'text.primary',
     testId: 'connector-git',
   },
   {
+    key: 'confluence',
     disabled: false,
     id: 'confluence',
     label: 'Confluence',
     description: 'Atlassian Cloud spaces',
-    icon: <ArticleOutlinedIcon sx={{ fontSize: 28 }} />,
-    iconColor: '#2684FF',
+    icon: <ConfluenceBrandIcon />,
+    iconColor: 'text.primary',
     testId: 'connector-confluence',
   },
   {
+    key: 'jira',
     disabled: false,
     id: 'jira',
     label: 'Jira',
     description: 'Issues matching a JQL query',
-    icon: <BugReportOutlinedIcon sx={{ fontSize: 28 }} />,
-    iconColor: '#0052CC',
+    icon: <JiraBrandIcon />,
+    iconColor: 'text.primary',
     testId: 'connector-jira',
   },
   {
+    key: 'ado',
     disabled: true,
     id: 'ado',
     label: 'Azure DevOps',
     description: 'Repos & boards',
-    icon: <CloudOutlinedIcon sx={{ fontSize: 28 }} />,
-    iconColor: '#0078D7',
+    icon: <AzureDevOpsBrandIcon />,
+    iconColor: 'text.primary',
     testId: 'connector-ado',
   },
   {
-    disabled: true,
-    id: 'local_git',
-    label: 'Local Git',
-    description: 'Filesystem path',
-    icon: <FolderOutlinedIcon sx={{ fontSize: 28 }} />,
+    // Local FS — backend-accessible filesystem path. Routes through the
+    // Git connector because GitToolkit.test_connection already supports
+    // "Connected to local directory (non-git)" — the wizard just lands
+    // the user on the same configure form with a path-friendly placeholder.
+    // ``key`` stays unique even though ``id === 'git'`` so React keys and
+    // the per-card active state don't collide with the Git card.
+    key: 'local_fs',
+    disabled: false,
+    id: 'git',
+    label: 'Local FS',
+    description: 'Filesystem path on the server',
+    icon: <LocalFsBrandIcon />,
     iconColor: '#FB923C',
-    testId: 'connector-local-git',
+    testId: 'connector-local-fs',
   },
   {
+    key: 'notion',
     disabled: true,
     id: 'notion',
     label: 'Notion',
     description: 'Databases & pages',
-    icon: <StickyNote2OutlinedIcon sx={{ fontSize: 28 }} />,
+    icon: <NotionBrandIcon />,
     iconColor: 'text.primary',
     testId: 'connector-notion',
   },
@@ -137,8 +166,14 @@ export function StepConnector({ selected, onSelect }: StepConnectorProps) {
           gap: 1.25,
         }}
       >
-        {CONNECTORS.map((c) => {
-          const active = !c.disabled && c.id === selected;
+        {CONNECTORS.map((c, idx) => {
+          // ``id`` can be shared (Local FS reuses ``id: 'git'``).  Only the
+          // FIRST card with a matching id is rendered "active" on revisit
+          // so the wizard doesn't highlight two cards at once.
+          const firstMatchIdx = CONNECTORS.findIndex(
+            (other) => !other.disabled && other.id === selected,
+          );
+          const active = !c.disabled && c.id === selected && idx === firstMatchIdx;
           const card = (
             <Card
               variant="outlined"
@@ -214,7 +249,7 @@ export function StepConnector({ selected, onSelect }: StepConnectorProps) {
           );
 
           return (
-            <Box key={c.id}>
+            <Box key={c.key}>
               {c.disabled ? (
                 <Tooltip arrow placement="top" title="Coming soon">
                   <Box>{card}</Box>
