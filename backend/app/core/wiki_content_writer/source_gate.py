@@ -1,7 +1,7 @@
 """Source-kind gating pre-filter (#240).
 
-Deterministic pre-filter that runs *before* the LLM verifier (#239),
-catching obvious hallucination classes without an LLM call.
+Deterministic pre-filter that catches obvious hallucination classes
+without an LLM call.
 
 Three rules
 -----------
@@ -22,8 +22,6 @@ Per-rule modes (configurable via the ``mode`` dict)
 ----------------------------------------------------
 ``"flag"`` (default) — emit GateFlag, keep the paragraph.
 ``"strip"``           — emit GateFlag, remove paragraph from output.
-``"verifier"``        — emit GateFlag with action="verifier", keep paragraph
-                        (signals the LLM verifier to apply extra scrutiny).
 
 Public API
 ----------
@@ -95,8 +93,7 @@ class GateFlag:
         Human-readable detail — e.g. the matching SQL keyword, the
         identifier name.
     action : str
-        What the gate decided.  One of ``"flag"``, ``"strip"``,
-        ``"verifier"``.
+        What the gate decided.  One of ``"flag"``, ``"strip"``.
     """
 
     paragraph_index: int
@@ -242,7 +239,7 @@ _DEFAULT_MODE: dict[str, str] = {
     "identifier": "flag",
 }
 
-_VALID_ACTIONS: frozenset[str] = frozenset({"flag", "strip", "verifier"})
+_VALID_ACTIONS: frozenset[str] = frozenset({"flag", "strip"})
 _VALID_RULES: frozenset[str] = frozenset(_DEFAULT_MODE.keys())
 
 
@@ -279,8 +276,8 @@ def apply_gate(
         design (two title-case segments) and they will otherwise be flagged.
     mode :
         Per-rule action override.  Keys: ``"readme"``, ``"sql"``,
-        ``"identifier"``.  Values: ``"flag"`` (default), ``"strip"``,
-        ``"verifier"``.  Unspecified rules default to ``"flag"``.
+        ``"identifier"``.  Values: ``"flag"`` (default), ``"strip"``.
+        Unspecified rules default to ``"flag"``.
 
     Returns
     -------

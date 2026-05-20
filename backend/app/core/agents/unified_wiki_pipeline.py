@@ -1,29 +1,28 @@
 """Unified wiki pipeline orchestrator (#243, default path since #242).
 
-Wires the unified planner → writer → source-kind gate → citation verifier
-into a single end-to-end pipeline.  This is the sole structure-planning
-path; the legacy graph-first, deepagents, and cluster-based paths were
-removed in #242.
+Wires the unified planner → writer → source-kind gate into a single
+end-to-end pipeline.  This is the sole structure-planning path; the
+legacy graph-first, deepagents, and cluster-based paths were removed
+in #242.  The citation verifier was removed in #318.
 
 Public API
 ----------
-``run_unified_pipeline(skeleton, evidence_packs, *, llm, verifier_llm,
-                        repo_root, name_index, stream_callback)``
+``run_unified_pipeline(skeleton, evidence_packs, *, llm, repo_root,
+                        name_index, stream_callback)``
     → ``UnifiedPipelineResult``
 
 ``UnifiedPipelineResult``
-    ``pages``          – list of ``GeneratedPage`` (final, post-verified)
+    ``pages``          – list of ``GeneratedPage`` (final, post-gate)
     ``plan_report``    – ``PlanReport`` from the unified planner
     ``gate_reports``   – ``dict[int, GateReport]`` keyed by ``page_id``
-    ``verify_reports`` – ``dict[int, VerifyReport]`` keyed by ``page_id``
 
 ``GeneratedPage``
     ``page_id``        – ``cluster_id`` from the originating ``PageSpec``
     ``title``          – page title (from planner or fallback)
     ``description``    – 1-2 sentence description
-    ``markdown``       – final stripped / verified markdown
-    ``cited_claims``   – kept ``CitedClaim`` list (post-verifier)
-    ``metadata``       – dict with target_* fields + gate/verifier flags
+    ``markdown``       – final stripped markdown
+    ``cited_claims``   – kept ``CitedClaim`` list (post-gate)
+    ``metadata``       – dict with target_* fields + gate flags
 """
 
 from __future__ import annotations
@@ -35,7 +34,6 @@ from typing import Any, Callable
 from langchain_core.language_models import BaseChatModel
 
 from app.core.wiki_content_writer.citation_extractor import CitedClaim, extract_citations
-from app.core.wiki_content_writer.citation_verifier import VerifyReport, verify_citations
 from app.core.wiki_content_writer.source_gate import GateReport, ToolCall, apply_gate
 from app.core.wiki_content_writer.writer_agent import WikiContentWriter
 from app.core.wiki_content_writer.writer_tools import WriterTools
@@ -52,15 +50,12 @@ from app.core.wiki_structure_planner.structure_skeleton import StructureSkeleton
 
 logger = logging.getLogger(__name__)
 
-# Default gate mode: README + SQL use strip, identifier defers to the verifier.
+# Default gate mode: README + SQL strip, identifier is flagged only.
 _DEFAULT_GATE_MODE: dict[str, str] = {
     "readme": "strip",
     "sql": "strip",
-    "identifier": "verifier",
+    "identifier": "flag",
 }
-
-# Batch size for the citation verifier LLM calls.
-_VERIFIER_BATCH_SIZE = 4
 
 
 # ── Result dataclasses ────────────────────────────────────────────────────────
@@ -81,11 +76,11 @@ class GeneratedPage:
     markdown : str
         Final markdown content after gate and verifier stripping.
     cited_claims : list[CitedClaim]
-        Kept ``CitedClaim`` objects (post-verifier) for downstream use.
+        Kept ``CitedClaim`` objects (post-gate) for downstream use.
     metadata : dict
         Carries ``target_symbols``, ``target_folders``, ``target_docs`` from
-        the skeleton plus ``gate_flags_total``, ``gate_stripped_total``,
-        ``verify_stripped_total``, ``verify_partial_total`` for observability.
+        the skeleton plus ``gate_flags_total``, ``gate_stripped_total``
+        for observability.
     """
 
     page_id: int
@@ -108,14 +103,11 @@ class UnifiedPipelineResult:
         Budget and coverage summary from the unified planner.
     gate_reports : dict[int, GateReport]
         Per-page gate reports keyed by ``cluster_id``.
-    verify_reports : dict[int, VerifyReport]
-        Per-page verifier reports keyed by ``cluster_id``.
     """
 
     pages: list[GeneratedPage]
     plan_report: PlanReport
     gate_reports: dict[int, GateReport] = field(default_factory=dict)
-    verify_reports: dict[int, VerifyReport] = field(default_factory=dict)
 
 
 # (stub removed in #285 — real writer agent is WikiContentWriter.generate_page)
@@ -128,26 +120,24 @@ def _run_page(
     spec: PageSpec,
     *,
     writer: WikiContentWriter,
-    verifier_llm: BaseChatModel,
     repo_root: str,
     name_index: set[str] | None,
     gate_mode: dict[str, str],
     stream_callback: Callable[[dict], None] | None,
     storage: Any = None,
-) -> tuple[GeneratedPage, GateReport, VerifyReport]:
-    """Run the writer → gate → verifier pipeline for one ``PageSpec``.
+) -> tuple[GeneratedPage, GateReport]:
+    """Run the writer → gate pipeline for one ``PageSpec``.
 
     Args:
         spec: Planner output for this page.
         writer: Pre-constructed WikiContentWriter (shared across pages).
-        verifier_llm: LLM used for citation verification.
         repo_root: Absolute path to the checked-out repository root.
         name_index: Set of known symbol names for identifier grounding.
         gate_mode: Per-rule gate actions (passed through to ``apply_gate``).
         stream_callback: Optional SSE event emitter.
 
     Returns:
-        ``(page, gate_report, verify_report)``
+        ``(page, gate_report)``
     """
     page_id = spec.cluster_id
 
@@ -235,56 +225,12 @@ def _run_page(
             except Exception as cb_exc:
                 logger.debug("stream_callback error (gate.page_done): %s", cb_exc)
 
-    # ── 5. Citation verifier ──────────────────────────────────────────
-    logger.info(
-        "[UNIFIED] verifier: page_id=%d paragraphs=%d",
-        page_id,
-        len(kept_after_gate),
-    )
-    kept_after_verify, verify_report = verify_citations(
-        kept_after_gate,
-        llm=verifier_llm,
-        repo_root=repo_root,
-        batch_size=_VERIFIER_BATCH_SIZE,
-    )
+    kept_after_verify = kept_after_gate
 
-    n_verify_stripped = verify_report.paragraphs_stripped
-    n_verify_partial = verify_report.paragraphs_partial
-
-    logger.info(
-        "[UNIFIED] verifier done: page_id=%d kept=%d stripped=%d partial=%d",
-        page_id,
-        verify_report.paragraphs_kept,
-        n_verify_stripped,
-        n_verify_partial,
-    )
-
-    if stream_callback:
-        try:
-            stream_callback({
-                "event": "verifier.page_done",
-                "page_id": page_id,
-                "n_kept": verify_report.paragraphs_kept,
-                "n_stripped": n_verify_stripped,
-                "n_partial": n_verify_partial,
-            })
-        except Exception as cb_exc:
-            logger.debug("stream_callback error (verifier.page_done): %s", cb_exc)
-
-    # Log partial-verdict warnings
-    for verdict in verify_report.verdicts:
-        if verdict.verdict == "partial":
-            logger.warning(
-                "[UNIFIED] partial citation in page_id=%d para=%d: %s",
-                page_id,
-                verdict.paragraph_index,
-                verdict.reason,
-            )
-
-    # ── 6. Reconstruct final markdown from kept paragraphs ────────────
+    # ── 5. Reconstruct final markdown from kept paragraphs ────────────
     final_markdown = _claims_to_markdown(kept_after_verify)
 
-    # ── 6b. Prepend architecture diagram ──────────────────────────────
+    # ── 5b. Prepend architecture diagram ──────────────────────────────
     if storage is not None:
         from app.core.wiki_content_writer.diagram_generator import DiagramGenerator  # noqa: PLC0415
         dg = DiagramGenerator(storage)
@@ -304,11 +250,9 @@ def _run_page(
             "target_docs": spec.target_docs,
             "gate_flags_total": n_flagged,
             "gate_stripped_total": n_gate_stripped,
-            "verify_stripped_total": n_verify_stripped,
-            "verify_partial_total": n_verify_partial,
         },
     )
-    return page, gate_report, verify_report
+    return page, gate_report
 
 
 # ── Markdown reconstruction ───────────────────────────────────────────────────
@@ -356,14 +300,14 @@ def run_unified_pipeline(
     evidence_packs: dict[int, EvidencePack],
     *,
     llm: BaseChatModel,
-    verifier_llm: BaseChatModel | None = None,
+    verifier_llm: BaseChatModel | None = None,  # kept for back-compat; unused since #318
     repo_root: str,
     storage: Any | None = None,
     name_index: set[str] | None = None,
     gate_mode: dict[str, str] | None = None,
     stream_callback: Callable[[dict], None] | None = None,
 ) -> UnifiedPipelineResult:
-    """Run the unified planner → writer → gate → verifier pipeline.
+    """Run the unified planner → writer → gate pipeline.
 
     This is the single public entrypoint for the unified wiki generation
     pipeline.  It is deliberately synchronous — async orchestration is the
@@ -382,25 +326,24 @@ def run_unified_pipeline(
         Primary LangChain ``BaseChatModel`` used for both the planner and the
         writer content generation.
     verifier_llm :
-        LangChain ``BaseChatModel`` used for citation verification.  Defaults
-        to *llm* if ``None``.
+        Accepted for backwards compatibility but unused since #318 (citation
+        verifier removed).  Pass ``None`` or omit entirely.
     repo_root :
         Absolute path to the checked-out repository root.  Passed to the
-        planner (tool IO), the gate (identifier grounding), and the verifier
-        (span reading).
+        planner (tool IO) and the gate (identifier grounding).
     name_index :
         Set of known symbol names from the code graph.  Used by the source-
         kind gate (rule 3 — identifier grounding).  Pass ``None`` to rely
         solely on the tool trace for grounding.
     gate_mode :
         Per-rule action override for :func:`apply_gate`.  Defaults to
-        ``{"readme": "strip", "sql": "strip", "identifier": "verifier"}``.
+        ``{"readme": "strip", "sql": "strip", "identifier": "flag"}``.
     stream_callback :
         Optional function called with a ``dict`` event payload for each
         pipeline milestone.  Events: ``planner.started``, ``planner.done``,
-        ``writer.page_started``, ``writer.page_done``, ``gate.page_done``,
-        ``verifier.page_done``.  All callbacks are wrapped in try/except so
-        a misbehaving callback never breaks the pipeline.
+        ``writer.page_started``, ``writer.page_done``, ``gate.page_done``.
+        All callbacks are wrapped in try/except so a misbehaving callback
+        never breaks the pipeline.
 
     Returns
     -------
@@ -409,14 +352,12 @@ def run_unified_pipeline(
         has no clusters).
         ``plan_report`` — planner budget / coverage summary.
         ``gate_reports`` — per-page gate reports (empty dict when no pages).
-        ``verify_reports`` — per-page verifier reports (empty dict when no pages).
 
     Raises
     ------
     ValueError
         If *repo_root* is not a valid directory (propagated from the planner).
     """
-    effective_verifier_llm = verifier_llm if verifier_llm is not None else llm
     effective_gate_mode = gate_mode if gate_mode is not None else _DEFAULT_GATE_MODE
 
     # ── Planner phase ─────────────────────────────────────────────────
@@ -494,13 +435,11 @@ def run_unified_pipeline(
             pages=[],
             plan_report=plan_report,
             gate_reports={},
-            verify_reports={},
         )
 
-    # ── Per-page writer → gate → verifier ────────────────────────────
+    # ── Per-page writer → gate ────────────────────────────────────────
     pages: list[GeneratedPage] = []
     gate_reports: dict[int, GateReport] = {}
-    verify_reports: dict[int, VerifyReport] = {}
 
     # Build writer once — shared tools and LLM across all pages.
     writer = WikiContentWriter(
@@ -510,10 +449,9 @@ def run_unified_pipeline(
 
     for spec in page_specs:
         try:
-            page, gate_report, verify_report = _run_page(
+            page, gate_report = _run_page(
                 spec,
                 writer=writer,
-                verifier_llm=effective_verifier_llm,
                 repo_root=repo_root,
                 name_index=name_index,
                 gate_mode=effective_gate_mode,
@@ -522,7 +460,6 @@ def run_unified_pipeline(
             )
             pages.append(page)
             gate_reports[spec.cluster_id] = gate_report
-            verify_reports[spec.cluster_id] = verify_report
         except Exception as exc:
             logger.error(
                 "[UNIFIED] page pipeline failed for cluster_id=%d title=%r: %s",
@@ -548,20 +485,15 @@ def run_unified_pipeline(
                 )
             )
             gate_reports[spec.cluster_id] = GateReport()
-            from app.core.wiki_content_writer.citation_verifier import VerifyReport  # noqa: PLC0415
-
-            verify_reports[spec.cluster_id] = VerifyReport()
 
     logger.info(
-        "[UNIFIED] pipeline complete: pages=%d gate_stripped_total=%d verify_stripped_total=%d",
+        "[UNIFIED] pipeline complete: pages=%d gate_stripped_total=%d",
         len(pages),
         sum(len(r.stripped_paragraphs) for r in gate_reports.values()),
-        sum(r.paragraphs_stripped for r in verify_reports.values()),
     )
 
     return UnifiedPipelineResult(
         pages=pages,
         plan_report=plan_report,
         gate_reports=gate_reports,
-        verify_reports=verify_reports,
     )

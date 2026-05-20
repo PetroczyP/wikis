@@ -1,8 +1,8 @@
-"""End-to-end integration tests for the unified wiki pipeline (#243).
+"""End-to-end integration tests for the unified wiki pipeline (#243, #318).
 
-Tests run the full pipeline (planner → writer → gate → verifier) against tiny
-fixture repos in backend/tests/fixtures/unified_pipeline/.  All LLM calls use
-a deterministic ``FakeLLM`` that returns well-formed JSON for both the planner
+Tests run the full pipeline (planner → writer → gate) against tiny fixture
+repos in backend/tests/fixtures/unified_pipeline/.  All LLM calls use a
+deterministic ``FakeLLM`` that returns well-formed JSON for both the planner
 and the writer roles, detected via the system-prompt prefix.
 
 Fixture repos
@@ -19,9 +19,8 @@ Each fixture test asserts:
 
 Adversarial tests
 -----------------
-- Code repo: writer hallucinates a symbol not in any trace →
-  gate or verifier strips the paragraph → final markdown does NOT contain
-  the hallucinated symbol name.
+- Code repo: writer hallucinates README content without reading a README →
+  gate strips the paragraph (readme=strip) → final markdown does NOT contain it.
 """
 
 from __future__ import annotations
@@ -67,16 +66,13 @@ class RoleAwareFakeLLM(BaseChatModel):
     Role detection (in order):
     1. System prompt starts with "You are a technical documentation writer"
        → writer role: return ``writer_response``.
-    2. System prompt contains "verifier" (case-insensitive)
-       → verifier role: return ``verifier_response``.
-    3. Otherwise → planner role: return ``planner_response``.
+    2. Otherwise → planner role: return ``planner_response``.
 
     Pydantic fields required for BaseChatModel subclass.
     """
 
     planner_response: str = ""
     writer_response: str = ""
-    verifier_response: str = ""
     record_calls: list[dict] = []
     model_name: str = "role-aware-fake"
 
@@ -105,8 +101,6 @@ class RoleAwareFakeLLM(BaseChatModel):
 
         if system_content.startswith("You are a technical documentation writer"):
             text = self.writer_response
-        elif "verifier" in system_content.lower():
-            text = self.verifier_response
         else:
             text = self.planner_response
 
@@ -131,12 +125,8 @@ def _planner_json(
 
 
 def _writer_md(content: str, cite_path: str = "src/auth/service.py") -> str:
-    """Return markdown with a citation token so the verifier can run."""
+    """Return markdown with a citation token."""
     return f"{content} [{cite_path}:1-5]"
-
-
-def _verifier_supported(n: int = 1) -> str:
-    return json.dumps([{"verdict": "supported", "reason": "Grounded."} for _ in range(n)])
 
 
 def _make_cluster(
@@ -193,7 +183,6 @@ def _run(
         skeleton,
         packs,
         llm=llm,
-        verifier_llm=llm,
         repo_root=repo_root,
         gate_mode=gate_mode,
     )
@@ -209,7 +198,6 @@ class TestTinyCodeRepo:
         return RoleAwareFakeLLM(
             planner_response=_planner_json(title="Auth Module", description="Authentication logic."),
             writer_response=_writer_md("AuthService manages login.", "src/auth/service.py"),
-            verifier_response=_verifier_supported(1),
         )
 
     def _skeleton(self) -> StructureSkeleton:
@@ -247,27 +235,21 @@ class TestTinyCodeRepo:
 
 
 class TestTinyCodeRepoAdversarial:
-    """Writer hallucinates a symbol; gate/verifier should strip that paragraph."""
+    """Writer hallucinates README content; gate strips the paragraph (readme=strip)."""
 
     _REPO = str(_FIXTURES_DIR / "tiny_code_repo")
 
-    HALLUCINATED_SYMBOL = "HallucinatedDatabaseManager"
+    HALLUCINATED_README = "The README explains how to set up the project."
 
     def _llm(self) -> RoleAwareFakeLLM:
-        # Writer emits two paragraphs: one real, one with a hallucinated class name.
-        # We use a citation that points to a nonexistent file so the verifier strips.
+        # Writer emits two paragraphs: one real, one that hallucinates README content.
         writer_md = (
             f"AuthService manages login. [src/auth/service.py:1-5]\n\n"
-            f"The {self.HALLUCINATED_SYMBOL} handles caching. [does_not_exist.py:1]"
+            f"{self.HALLUCINATED_README}"
         )
         return RoleAwareFakeLLM(
             planner_response=_planner_json(title="Auth Module"),
             writer_response=writer_md,
-            # First paragraph: supported.  Second: absent (hallucinated).
-            verifier_response=json.dumps([
-                {"verdict": "supported", "reason": "Grounded."},
-                {"verdict": "absent", "reason": "No evidence for HallucinatedDatabaseManager."},
-            ]),
         )
 
     def _skeleton(self) -> StructureSkeleton:
@@ -280,29 +262,29 @@ class TestTinyCodeRepoAdversarial:
         )
         return _make_skeleton([cluster])
 
-    def test_hallucinated_symbol_not_in_final_markdown(self):
+    def test_readme_hallucination_stripped_by_gate(self):
         result = _run(
             self._skeleton(),
             {1: _make_pack(1)},
             self._REPO,
             self._llm(),
-            gate_mode={"readme": "flag", "sql": "flag", "identifier": "flag"},
+            gate_mode={"readme": "strip", "sql": "strip", "identifier": "flag"},
         )
         assert len(result.pages) > 0
         final_md = result.pages[0].markdown
-        assert self.HALLUCINATED_SYMBOL not in final_md, (
-            f"Hallucinated symbol {self.HALLUCINATED_SYMBOL!r} survived into final markdown"
+        assert "README" not in final_md, (
+            "README hallucination survived into final markdown — gate should have stripped it"
         )
 
-    def test_verifier_stripped_count_positive(self):
+    def test_gate_stripped_count_positive(self):
         result = _run(
             self._skeleton(),
             {1: _make_pack(1)},
             self._REPO,
             self._llm(),
-            gate_mode={"readme": "flag", "sql": "flag", "identifier": "flag"},
+            gate_mode={"readme": "strip", "sql": "strip", "identifier": "flag"},
         )
-        total_stripped = sum(r.paragraphs_stripped for r in result.verify_reports.values())
+        total_stripped = sum(len(r.stripped_paragraphs) for r in result.gate_reports.values())
         assert total_stripped >= 1
 
 
@@ -316,7 +298,6 @@ class TestTinyDocRepo:
         return RoleAwareFakeLLM(
             planner_response=_planner_json(title="System Docs", description="System documentation overview."),
             writer_response=_writer_md("This system handles requests.", "docs/overview.md"),
-            verifier_response=_verifier_supported(1),
         )
 
     def _skeleton(self) -> StructureSkeleton:
@@ -363,7 +344,6 @@ class TestTinyDocRepoAdversarial:
         return RoleAwareFakeLLM(
             planner_response=_planner_json(title="System Docs"),
             writer_response=writer_md,
-            verifier_response=_verifier_supported(1),
         )
 
     def _skeleton(self) -> StructureSkeleton:
@@ -406,7 +386,6 @@ class TestTinyConfluenceExport:
                 "Engineering processes documented here.",
                 "spaces/ENG/auth_design.md",
             ),
-            verifier_response=_verifier_supported(1),
         )
 
     def _skeleton(self) -> StructureSkeleton:
@@ -450,7 +429,6 @@ class TestTinyConfluenceAdversarial:
         return RoleAwareFakeLLM(
             planner_response=_planner_json(title="Engineering Confluence"),
             writer_response=writer_md,
-            verifier_response=_verifier_supported(1),
         )
 
     def _skeleton(self) -> StructureSkeleton:
@@ -493,7 +471,6 @@ class TestTinyJiraExport:
                 "Authentication epic AUTH-1 captures the full auth scope.",
                 "epics/AUTH-1.md",
             ),
-            verifier_response=_verifier_supported(1),
         )
 
     def _skeleton(self) -> StructureSkeleton:
@@ -523,26 +500,20 @@ class TestTinyJiraExport:
 
 
 class TestTinyJiraAdversarial:
-    """Writer references a nonexistent path; verifier strips the citation_missing paragraph."""
+    """Writer hallucinates SQL; gate strips the SQL paragraph (sql=strip)."""
 
     _REPO = str(_FIXTURES_DIR / "tiny_jira_export")
 
-    HALLUCINATED_PATH = "stories/AUTH-999.md"  # does not exist
+    HALLUCINATED_SQL = "SELECT * FROM issues WHERE project = 'AUTH'"
 
     def _llm(self) -> RoleAwareFakeLLM:
         writer_md = (
-            f"Story AUTH-999 defines the token refresh flow. [{self.HALLUCINATED_PATH}:1]\n\n"
+            f"{self.HALLUCINATED_SQL};\n\n"
             "Epic AUTH-1 covers authentication. [epics/AUTH-1.md:1-5]"
         )
-        # The verifier processes AUTH-999 as citation_missing (file not readable) BEFORE
-        # calling the LLM.  Only AUTH-1 paragraph is sent to the LLM verifier — as a
-        # single-element batch.  So the canned response needs exactly 1 verdict.
         return RoleAwareFakeLLM(
             planner_response=_planner_json(title="Auth Epic"),
             writer_response=writer_md,
-            verifier_response=json.dumps([
-                {"verdict": "supported", "reason": "Grounded in AUTH-1."},
-            ]),
         )
 
     def _skeleton(self) -> StructureSkeleton:
@@ -556,31 +527,30 @@ class TestTinyJiraAdversarial:
         )
         return _make_skeleton([cluster])
 
-    def test_hallucinated_path_not_in_final_markdown(self):
+    def test_sql_paragraph_stripped_by_gate(self):
         result = _run(
             self._skeleton(),
             {4: _make_pack(4, "jira")},
             self._REPO,
             self._llm(),
-            gate_mode={"readme": "flag", "sql": "flag", "identifier": "flag"},
+            gate_mode={"readme": "strip", "sql": "strip", "identifier": "flag"},
         )
         assert len(result.pages) > 0
         final_md = result.pages[0].markdown
-        # The paragraph that cited the nonexistent path should be stripped
-        assert "AUTH-999" not in final_md, (
-            "Hallucinated story reference AUTH-999 survived into final markdown"
+        assert "SELECT" not in final_md, (
+            "SQL hallucination survived into final markdown — gate should have stripped it"
         )
 
     def test_at_least_one_paragraph_kept(self):
-        """The supported paragraph (AUTH-1) should remain after stripping."""
+        """The legitimate paragraph (AUTH-1) should remain after SQL stripping."""
         result = _run(
             self._skeleton(),
             {4: _make_pack(4, "jira")},
             self._REPO,
             self._llm(),
-            gate_mode={"readme": "flag", "sql": "flag", "identifier": "flag"},
+            gate_mode={"readme": "strip", "sql": "strip", "identifier": "flag"},
         )
         page = result.pages[0]
         assert "AUTH-1" in page.markdown, (
-            "The legitimate AUTH-1 paragraph should survive after stripping"
+            "The legitimate AUTH-1 paragraph should survive after SQL stripping"
         )

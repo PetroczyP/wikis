@@ -1,8 +1,8 @@
-"""Integration tests for the real WikiContentWriter inside the unified pipeline (#285).
+"""Integration tests for the real WikiContentWriter inside the unified pipeline (#285, #318).
 
 Regression guard: after a pipeline run, each generated page must have at least
-one paragraph that survives the gate + verifier.  This test closes the
-"silent empty page" regression described in issue #285.
+one paragraph that survives the gate.  This test closes the "silent empty page"
+regression described in issue #285.
 
 The FakeLLM pattern mirrors test_unified_pipeline_e2e.py (RoleAwareFakeLLM).
 We use a single-cluster fixture so the test is fast and deterministic.
@@ -32,11 +32,10 @@ from app.core.wiki_structure_planner.structure_skeleton import (
 
 
 class RoleAwareFakeLLM(BaseChatModel):
-    """Detects writer / planner / verifier role from system prompt prefix."""
+    """Detects writer vs planner role from system prompt prefix."""
 
     planner_response: str = ""
     writer_response: str = ""
-    verifier_response: str = ""
     model_name: str = "role-aware-fake"
 
     @property
@@ -61,8 +60,6 @@ class RoleAwareFakeLLM(BaseChatModel):
 
         if system_content.startswith("You are a technical documentation writer"):
             text = self.writer_response
-        elif "verifier" in system_content.lower():
-            text = self.verifier_response
         else:
             text = self.planner_response
 
@@ -119,15 +116,11 @@ def _planner_json(title: str = "Auth Module", description: str = "Handles auth."
     return json.dumps({"title": title, "description": description, "retrieval_query": "auth login"})
 
 
-def _verifier_supported(n: int) -> str:
-    return json.dumps([{"verdict": "supported", "reason": "Grounded."} for _ in range(n)])
-
-
 # ── Regression guard: pages must have cited, surviving paragraphs ─────────────
 
 
 class TestWriterProducesNonEmptyPages:
-    """Each generated page must have at least one paragraph surviving gate + verifier.
+    """Each generated page must have at least one paragraph surviving the gate.
 
     This is the regression guard for #285: the stub produced zero citations, every
     paragraph was stripped, and pages were reduced to 32-line frontmatter skeletons.
@@ -138,22 +131,20 @@ class TestWriterProducesNonEmptyPages:
         cited.parent.mkdir(parents=True, exist_ok=True)
         cited.write_text("class AuthService:\n    def login(self, user, pwd): ...\n")
 
-    def test_page_markdown_non_empty_after_gate_and_verifier(self, tmp_path):
-        """The final page markdown is non-empty after gate and verifier pass."""
+    def test_page_markdown_non_empty_after_gate(self, tmp_path):
+        """The final page markdown is non-empty after gate pass."""
         self._setup_cited_file(tmp_path)
 
         writer_md = "The AuthService handles user login. [src/auth/service.py:1-2]"
         llm = RoleAwareFakeLLM(
             planner_response=_planner_json(),
             writer_response=writer_md,
-            verifier_response=_verifier_supported(1),
         )
 
         result = run_unified_pipeline(
             _make_skeleton([_make_cluster()]),
             {1: _make_pack(1)},
             llm=llm,
-            verifier_llm=llm,
             repo_root=str(tmp_path),
             gate_mode={"readme": "strip", "sql": "strip", "identifier": "flag"},
         )
@@ -166,21 +157,19 @@ class TestWriterProducesNonEmptyPages:
         )
 
     def test_page_has_at_least_one_kept_cited_claim(self, tmp_path):
-        """cited_claims on the page must be non-empty after verifier."""
+        """cited_claims on the page must be non-empty after gate."""
         self._setup_cited_file(tmp_path)
 
         writer_md = "AuthService validates JWT tokens. [src/auth/service.py:1-2]"
         llm = RoleAwareFakeLLM(
             planner_response=_planner_json(),
             writer_response=writer_md,
-            verifier_response=_verifier_supported(1),
         )
 
         result = run_unified_pipeline(
             _make_skeleton([_make_cluster()]),
             {1: _make_pack(1)},
             llm=llm,
-            verifier_llm=llm,
             repo_root=str(tmp_path),
         )
 
@@ -197,7 +186,6 @@ class TestWriterProducesNonEmptyPages:
         llm = RoleAwareFakeLLM(
             planner_response=_planner_json(),
             writer_response="This paragraph has no citation at all.",
-            verifier_response=_verifier_supported(1),
         )
 
         events: list[dict] = []
@@ -205,7 +193,6 @@ class TestWriterProducesNonEmptyPages:
             _make_skeleton([_make_cluster()]),
             {1: _make_pack(1)},
             llm=llm,
-            verifier_llm=llm,
             repo_root=str(tmp_path),
             stream_callback=events.append,
         )
@@ -240,11 +227,8 @@ class TestWriterProducesNonEmptyPages:
             depth_range=(1, 2),
         )
 
-        # FakeLLM cycles: planner response repeated, writer response repeated
-        call_idx = [0]
         planner_resp = _planner_json()
         writer_resp = "Component handles requests. [src/auth/service.py:1]"
-        verifier_resp = _verifier_supported(1)
 
         class CyclingFakeLLM(BaseChatModel):
             model_name: str = "cycling-fake"
@@ -267,8 +251,6 @@ class TestWriterProducesNonEmptyPages:
                         break
                 if system_content.startswith("You are a technical documentation writer"):
                     text = writer_resp
-                elif "verifier" in system_content.lower():
-                    text = verifier_resp
                 else:
                     text = planner_resp
                 msg = AIMessage(content=text)
@@ -286,7 +268,6 @@ class TestWriterProducesNonEmptyPages:
             _make_skeleton([cluster1, cluster2]),
             {1: _make_pack(1), 2: _make_pack(2)},
             llm=llm,
-            verifier_llm=llm,
             repo_root=str(tmp_path),
             gate_mode={"readme": "flag", "sql": "flag", "identifier": "flag"},
         )

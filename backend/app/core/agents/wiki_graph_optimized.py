@@ -2089,27 +2089,12 @@ class OptimizedWikiGenerationAgent:
                         )
                     except Exception:
                         pass
-            elif ev_type == "verifier.page_done":
-                title = event.get("title", "")
-                n_kept = event.get("n_kept", 0)
-                n_stripped = event.get("n_stripped", 0)
-                n_partial = event.get("n_partial", 0)
-                if self.progress_callback:
-                    try:
-                        self.progress_callback(
-                            "generating", 0.78,
-                            f"Verified: {title} — kept={n_kept} stripped={n_stripped} partial={n_partial}",
-                        )
-                    except Exception:
-                        pass
-
-        # ── Phase 3: unified pipeline (planner + writer + gate + verifier) ──
+        # ── Phase 3: unified pipeline (planner + writer + gate) ──────
         try:
             result = run_unified_pipeline(
                 skeleton,
                 evidence_packs,
                 llm=self.llm,
-                verifier_llm=self.llm_low,
                 repo_root=repo_root,
                 storage=getattr(self, "_cluster_db", None),
                 name_index=name_index or None,
