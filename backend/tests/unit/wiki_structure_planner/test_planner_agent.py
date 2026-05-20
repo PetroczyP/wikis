@@ -18,6 +18,8 @@ import json
 from collections.abc import Iterator
 from typing import Any
 
+from pydantic import Field
+
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -77,6 +79,10 @@ class FakeLLM(BaseChatModel):
 
     def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
         raise NotImplementedError("FakeLLM does not support streaming")
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> "FakeLLM":  # type: ignore[override]
+        """Return self — tools are ignored in the fake."""
+        return self
 
 
 # ── Cluster / skeleton builders ───────────────────────────────────────────────
@@ -410,6 +416,9 @@ class TestBudgetExhaustion:
 
             def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
                 raise NotImplementedError
+
+            def bind_tools(self, tools: Any, **kwargs: Any) -> "ToolCallingFakeLLM":
+                return self
 
         cluster = _make_cluster(cluster_id=1, kind="code", dirs=["src"])
         skeleton = _make_skeleton([cluster])
@@ -755,3 +764,89 @@ class TestEmptyFieldRejection:
 
         assert pages[0].description.strip()
         assert any("missing" in n and "description" in n for n in report.notes)
+
+
+# ── Regression: bind_tools called directly (no _unwrap_llm) ──────────────────
+
+
+class TestBindToolsDirect:
+    """Regression for #295: planner must call bind_tools on the LLM directly.
+
+    Before the fix, _run_planner_core called _unwrap_llm() then bind_tools(),
+    which peeled off the RunnableRetry wrapper.  The root cause was that
+    create_llm() wrapped with .with_retry() BEFORE bind_tools(), so
+    RunnableRetry became the outermost wrapper and .bind_tools() was
+    unreachable on it.  The fix binds tools in create_llm() before wrapping,
+    and the planner calls bind_tools() directly.
+    """
+
+    class BindToolsRecordingLLM(FakeLLM):
+        """FakeLLM that records whether bind_tools was called on it."""
+
+        bind_tools_called: bool = False
+        bind_tools_schemas: list = Field(default_factory=list)
+
+        def bind_tools(self, tools: Any, **kwargs: Any) -> "TestBindToolsDirect.BindToolsRecordingLLM":
+            self.bind_tools_called = True
+            self.bind_tools_schemas = list(tools)
+            return self  # return self so the planner loop can still invoke it
+
+    def test_planner_calls_bind_tools_directly_on_llm(self, tmp_path):
+        """_run_planner_core calls llm.bind_tools() without unwrapping first."""
+        cluster = _make_cluster(cluster_id=1)
+        skeleton = _make_skeleton([cluster])
+        pack = _make_pack(cluster_id=1)
+        response = _json_response(1)
+
+        llm = self.BindToolsRecordingLLM(responses=[response], record_calls=[])
+        run_planner_with_report(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
+
+        assert llm.bind_tools_called, (
+            "planner did not call bind_tools on the LLM — tool-less fallback path active"
+        )
+
+    def test_planner_binds_expected_tool_schemas(self, tmp_path):
+        """bind_tools is called with the three planner tool schemas."""
+        cluster = _make_cluster(cluster_id=1)
+        skeleton = _make_skeleton([cluster])
+        pack = _make_pack(cluster_id=1)
+
+        llm = self.BindToolsRecordingLLM(responses=[_json_response(1)], record_calls=[])
+        run_planner_with_report(skeleton, {1: pack}, llm=llm, repo_root=str(tmp_path))
+
+        tool_names = {s["function"]["name"] for s in llm.bind_tools_schemas}
+        assert tool_names == {"read_file", "get_signature", "grep"}
+
+    def test_planner_handles_retry_wrapped_llm(self, tmp_path):
+        """Regression for #295 Copilot follow-up: planner works when the LLM
+        is wrapped in RunnableRetry (as wiki_runner.py:86 produces when tools=
+        is not passed to create_llm).  safe_bind_tools must unwrap and bind."""
+        from langchain_core.runnables.retry import RunnableRetry
+
+        cluster = _make_cluster(cluster_id=1)
+        skeleton = _make_skeleton([cluster])
+        pack = _make_pack(cluster_id=1)
+
+        inner_llm = self.BindToolsRecordingLLM(responses=[_json_response(1)], record_calls=[])
+
+        # Simulate wiki_runner.py:86 — LLM is wrapped by .with_retry() before
+        # being handed to the planner/writer, so the outer object is RunnableRetry.
+        retry_wrapped = inner_llm.with_retry(
+            retry_if_exception_type=(Exception,),
+            stop_after_attempt=2,
+        )
+        assert isinstance(retry_wrapped, RunnableRetry), (
+            "with_retry() must return RunnableRetry for this test to be meaningful"
+        )
+        assert not hasattr(retry_wrapped, "bind_tools"), (
+            "RunnableRetry must not expose bind_tools — test premise broken"
+        )
+
+        # The planner must NOT raise — safe_bind_tools finds bind_tools on the
+        # inner_llm via .bound and the planning loop runs to completion.
+        run_planner_with_report(skeleton, {1: pack}, llm=retry_wrapped, repo_root=str(tmp_path))
+
+        assert inner_llm.bind_tools_called, (
+            "safe_bind_tools did not reach bind_tools on the inner LLM "
+            "through the RunnableRetry wrapper"
+        )

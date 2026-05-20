@@ -73,6 +73,9 @@ class RoleAwareFakeLLM(BaseChatModel):
     def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
         raise NotImplementedError
 
+    def bind_tools(self, tools: Any, **kwargs: Any) -> "RoleAwareFakeLLM":  # type: ignore[override]
+        return self
+
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -274,6 +277,9 @@ class TestWriterProducesNonEmptyPages:
 
             def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
                 raise NotImplementedError
+
+            def bind_tools(self, tools: Any, **kwargs: Any) -> "CyclingFakeLLM":  # type: ignore[override]
+                return self
 
         llm = CyclingFakeLLM()
         result = run_unified_pipeline(

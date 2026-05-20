@@ -31,12 +31,24 @@ def _bedrock_credentials(settings: Settings) -> dict[str, str]:
     return creds
 
 
-def create_llm(settings: Settings, tier: str = "high", **overrides: Any) -> BaseChatModel:
+def create_llm(
+    settings: Settings,
+    tier: str = "high",
+    tools: list | None = None,
+    **overrides: Any,
+) -> BaseChatModel:
     """Create an LLM instance from settings.
 
     Supports providers: openai, anthropic, custom, ollama, gemini, bedrock, copilot, github.
     Tier: "high" (default, page generation) or "low" (quality check, enhancement).
     Overrides: model, temperature, max_tokens, streaming.
+
+    Parameters
+    ----------
+    tools:
+        Optional list of tool schemas (OpenAI function format).  When provided,
+        ``bind_tools`` is called on the *base* LLM before any retry/fallback
+        wrappers are applied so tool-call routing is preserved through them.
     """
     from langchain_openai import ChatOpenAI
 
@@ -167,6 +179,11 @@ def create_llm(settings: Settings, tier: str = "high", **overrides: Any) -> Base
         effective_base_url = settings.github_models_base_url
     logger.info(f"Created LLM: provider={provider}, model={model}, base_url={effective_base_url}")
 
+    # Bind tools on the base LLM BEFORE wrapping with retry/fallbacks.
+    # RunnableRetry does not proxy bind_tools, so binding after wrapping silently drops tools.
+    if tools:
+        llm = llm.bind_tools(tools)
+
     # Add retry with exponential backoff for transient errors
     # Skip for ask/research engines — RunnableRetry breaks _llm_type access
     max_retries = settings.llm_max_retries
@@ -205,6 +222,97 @@ def create_llm(settings: Settings, tier: str = "high", **overrides: Any) -> Base
             logger.info(f"Fallback chain: {len(fallbacks)} models")
 
     return llm
+
+
+def safe_bind_tools(llm: Any, tools: list) -> Any:
+    """Bind tools through retry/fallback wrappers if needed.
+
+    LangChain's ``with_retry()`` returns a ``RunnableRetry`` and
+    ``with_fallbacks()`` returns a ``RunnableWithFallbacks``.  Neither proxies
+    ``bind_tools``.  This helper walks the ``.bound`` / ``.runnable`` chain to
+    find the inner ``BaseChatModel`` (or any object exposing ``bind_tools``) and
+    binds there.  The outer retry/fallback wrappers continue to work because
+    LangChain's ``Runnable`` composition delegates ``invoke()`` to the inner.
+
+    If ``llm`` already exposes ``bind_tools`` directly (e.g. it is a plain
+    ``BaseChatModel`` or ``_ChatModelBinding``), the call is delegated
+    immediately without unwrapping.
+
+    Parameters
+    ----------
+    llm:
+        An LLM or wrapped LLM (``RunnableRetry``, ``RunnableWithFallbacks``,
+        or bare ``BaseChatModel``).
+    tools:
+        Tool schemas or ``@tool``-decorated callables.
+
+    Returns
+    -------
+    Any
+        The result of ``bind_tools(tools)`` called on the innermost LLM that
+        supports it.  The returned object is placed where ``llm`` was; outer
+        wrappers (retry/fallback) are NOT re-applied because binding replaces
+        the inner runnable, not the outer shell.
+
+    Raises
+    ------
+    TypeError
+        When no inner LLM with ``bind_tools`` can be found.
+    """
+    # Idempotency check: if the LLM is already a binding whose existing tools
+    # cover the requested schemas, return as-is. Re-calling ``bind_tools()`` on
+    # a ``_ChatModelBinding`` walks down to the BASE LLM and binds there,
+    # stripping any intermediate ``RunnableRetry`` wrapper. The wiki_runner
+    # pre-binds with the union of planner + writer schemas precisely so each
+    # agent's narrower rebind can be skipped here — preserving retry semantics
+    # on the production path.
+    existing_tools = getattr(llm, "kwargs", {}).get("tools") if hasattr(llm, "kwargs") else None
+    if existing_tools:
+        existing_names = _tool_names(existing_tools)
+        desired_names = _tool_names(tools)
+        if desired_names and desired_names.issubset(existing_names):
+            return llm
+
+    if hasattr(llm, "bind_tools"):
+        return llm.bind_tools(tools)
+
+    # Walk retry (.bound) and fallback (.runnable) chains.
+    inner = llm
+    while inner is not None:
+        bound = getattr(inner, "bound", None)
+        candidate = bound if bound is not None else getattr(inner, "runnable", None)
+        if candidate is None:
+            break
+        if hasattr(candidate, "bind_tools"):
+            return candidate.bind_tools(tools)
+        inner = candidate
+
+    raise TypeError(
+        f"Cannot bind_tools through {type(llm).__name__}: "
+        "no inner LLM with bind_tools found in the .bound/.runnable chain"
+    )
+
+
+def _tool_names(tools: list) -> set[str]:
+    """Extract tool names from a heterogeneous list of tool descriptors.
+
+    Handles three observed shapes: OpenAI ``{type, function: {name, ...}}``,
+    Bedrock flattened ``{name, description, input_schema}`` (what bind_tools
+    converts OpenAI schemas into on Bedrock), and ``@tool``-decorated callables.
+    """
+    names: set[str] = set()
+    for t in tools:
+        if isinstance(t, dict):
+            fn = t.get("function")
+            if isinstance(fn, dict) and fn.get("name"):
+                names.add(fn["name"])
+            elif t.get("name"):
+                names.add(t["name"])
+        else:
+            name = getattr(t, "name", None)
+            if name:
+                names.add(name)
+    return names
 
 
 def create_embeddings(settings: Settings, **overrides: Any) -> Embeddings:

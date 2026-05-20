@@ -83,7 +83,19 @@ def main(argv: list[str] | None = None) -> int:
         llm_overrides = {"model": payload["llm_model"]} if payload.get("llm_model") else {}
         emb_overrides = {"model": payload["embedding_model"]} if payload.get("embedding_model") else {}
 
-        llm = create_llm(settings, tier="high", **llm_overrides)
+        # Pre-bind union of planner + writer schemas so the retry/fallback
+        # wrappers sit OUTSIDE bind_tools. Each agent's safe_bind_tools call
+        # later narrows to its own schemas; the outer retry wrapper survives
+        # the rebind because the outer binding shell is replaced, not the
+        # retry wrapper underneath.
+        from app.core.wiki_content_writer.writer_agent import _WRITER_TOOL_SCHEMAS
+        from app.core.wiki_structure_planner.planner_agent import _TOOL_SCHEMAS as _PLANNER_TOOL_SCHEMAS
+        llm = create_llm(
+            settings,
+            tier="high",
+            tools=_PLANNER_TOOL_SCHEMAS + _WRITER_TOOL_SCHEMAS,
+            **llm_overrides,
+        )
         llm_low = create_llm(settings, tier="low")
         embeddings = create_embeddings(settings, **emb_overrides)
 

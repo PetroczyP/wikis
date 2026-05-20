@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
+from app.services.llm_factory import safe_bind_tools
+
 from .prompts import CITATION_FORMAT_DESCRIPTION, CITATION_PROMPT_RULES
 from .source_gate import ToolCall
 from .writer_tools import WriterTools
@@ -373,15 +375,11 @@ class WikiContentWriter:
             docs=", ".join(str(d) for d in target_docs) or "none",
         )
 
-        # Bind tools; fall back to bare LLM if provider does not support bind_tools.
-        # Catches AttributeError (Runnable wrappers like .with_retry/.with_fallbacks
-        # that don't expose bind_tools), NotImplementedError (providers that declare
-        # but don't implement it), and TypeError (sig-mismatched wrappers).
-        try:
-            llm_with_tools = effective_llm.bind_tools(_WRITER_TOOL_SCHEMAS)
-        except (AttributeError, NotImplementedError, TypeError) as exc:
-            logger.warning("[WRITER] bind_tools not available (%s); tool calls disabled", exc)
-            llm_with_tools = effective_llm
+        # Use safe_bind_tools to unwrap any retry/fallback wrappers before binding.
+        # wiki_runner passes the LLM without tools=, so the factory's with_retry()
+        # wrap sits outermost; RunnableRetry has no bind_tools — calling it directly
+        # raises AttributeError and silently disables tools (#295).
+        llm_with_tools = safe_bind_tools(effective_llm, _WRITER_TOOL_SCHEMAS)
 
         messages: list[Any] = [
             SystemMessage(content=system_prompt),

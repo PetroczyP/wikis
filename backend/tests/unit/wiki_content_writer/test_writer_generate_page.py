@@ -29,7 +29,14 @@ from app.core.wiki_content_writer.writer_tools import WriterTools
 # ── FakeLLM helpers ──────────────────────────────────────────────────────────
 
 
-class DirectWriterFakeLLM(BaseChatModel):
+class _BindToolsNoop:
+    """Mixin: bind_tools returns self so writer_agent's direct call succeeds."""
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+        return self
+
+
+class DirectWriterFakeLLM(_BindToolsNoop, BaseChatModel):
     """FakeLLM that returns a canned markdown string on the first call (no tools)."""
 
     response: str = ""
@@ -54,7 +61,7 @@ class DirectWriterFakeLLM(BaseChatModel):
         raise NotImplementedError
 
 
-class ToolThenWriteFakeLLM(BaseChatModel):
+class ToolThenWriteFakeLLM(_BindToolsNoop, BaseChatModel):
     """FakeLLM: first call returns a tool-call request; second returns markdown."""
 
     tool_name: str = "read_file"
@@ -262,7 +269,7 @@ class TestGeneratePageEdgeCases:
 # ── JSON-string args coercion (Rio Blocking fix) ──────────────────────────────
 
 
-class JsonStringArgsFakeLLM(BaseChatModel):
+class JsonStringArgsFakeLLM(_BindToolsNoop, BaseChatModel):
     """FakeLLM that emits a tool_call with args as a JSON *string* (not a dict).
 
     Some LangChain providers / versions return tool_call.args as a serialised
@@ -359,7 +366,7 @@ class TestJsonStringArgsCoercion:
 # ── Multi-tool-call budget capping ────────────────────────────────────────────
 
 
-class MultiToolCallFakeLLM(BaseChatModel):
+class MultiToolCallFakeLLM(_BindToolsNoop, BaseChatModel):
     """FakeLLM that emits N tool calls in a single response, then writes.
 
     Used to verify that the budget is counted per tool invocation, not per
@@ -475,3 +482,69 @@ class TestCitationFormatRoundtrip:
         claims = extract_citations(md)
         assert len(claims) == 1
         assert claims[0].citations == []
+
+
+# ── Regression: bind_tools called directly (no try/except fallback) ──────────
+
+
+class TestWriterBindToolsDirect:
+    """Regression for #295: writer must call bind_tools without a fallback path.
+
+    Before the fix, generate_page had a try/except that silently disabled tools
+    when bind_tools raised AttributeError (RunnableRetry wrapper).  The fix
+    removes that fallback; the LLM from create_llm() always exposes bind_tools.
+    """
+
+    class BindToolsRecordingLLM(_BindToolsNoop, BaseChatModel):
+        """FakeLLM that records whether bind_tools was called and with which schemas."""
+
+        bind_tools_called: bool = False
+        bind_tools_schemas: list = []
+        response: str = "Done writing. [src/app.py:1]"
+        model_name: str = "bind-tools-recording"
+
+        @property
+        def _llm_type(self) -> str:
+            return "bind-tools-recording"
+
+        def bind_tools(self, tools: Any, **kwargs: Any) -> "TestWriterBindToolsDirect.BindToolsRecordingLLM":
+            self.bind_tools_called = True
+            self.bind_tools_schemas = list(tools)
+            return self
+
+        def _generate(
+            self,
+            messages: list[BaseMessage],
+            stop: list[str] | None = None,
+            run_manager: Any = None,
+            **kwargs: Any,
+        ) -> ChatResult:
+            msg = AIMessage(content=self.response)
+            msg.tool_calls = []  # type: ignore[attr-defined]
+            return ChatResult(generations=[ChatGeneration(message=msg)])
+
+        def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
+            raise NotImplementedError
+
+    def test_writer_calls_bind_tools_on_llm(self, tmp_path):
+        """generate_page calls effective_llm.bind_tools() unconditionally."""
+        llm = self.BindToolsRecordingLLM()
+        tools = WriterTools(repo_root=str(tmp_path))
+        writer = WikiContentWriter(tools=tools, llm_client=llm)
+        writer.generate_page({"title": "T", "description": "D"})
+        assert llm.bind_tools_called, (
+            "writer did not call bind_tools — silent tool-less fallback path may be active"
+        )
+
+    def test_writer_binds_expected_tool_schemas(self, tmp_path):
+        """bind_tools is called with the six writer tool schemas."""
+        llm = self.BindToolsRecordingLLM()
+        tools = WriterTools(repo_root=str(tmp_path))
+        writer = WikiContentWriter(tools=tools, llm_client=llm)
+        writer.generate_page({"title": "T", "description": "D"})
+
+        tool_names = {s["function"]["name"] for s in llm.bind_tools_schemas}
+        assert tool_names == {
+            "read_file", "get_signature", "grep",
+            "get_callers", "get_callees", "list_doc_chunks",
+        }

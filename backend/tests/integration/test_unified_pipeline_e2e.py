@@ -115,6 +115,9 @@ class RoleAwareFakeLLM(BaseChatModel):
     def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
         raise NotImplementedError
 
+    def bind_tools(self, tools: Any, **kwargs: Any) -> "RoleAwareFakeLLM":  # type: ignore[override]
+        return self
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 

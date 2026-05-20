@@ -82,6 +82,10 @@ class FakeLLM(BaseChatModel):
     def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
         raise NotImplementedError("FakeLLM does not support streaming")
 
+    def bind_tools(self, tools: Any, **kwargs: Any) -> "FakeLLM":  # type: ignore[override]
+        """Return self — tools are ignored in the fake."""
+        return self
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 

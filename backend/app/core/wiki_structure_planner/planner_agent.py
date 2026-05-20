@@ -38,6 +38,7 @@ from app.core.wiki_structure_planner.structure_skeleton import (
     Cluster,
     StructureSkeleton,
 )
+from app.services.llm_factory import safe_bind_tools
 
 logger = logging.getLogger(__name__)
 
@@ -577,13 +578,12 @@ def _run_planner_core(
         budget_total,
     )
 
-    # ── Bind tools to LLM (unwrap wrappers first) ────────────────────────
-    base_llm = _unwrap_llm(llm)
-    try:
-        llm_with_tools = base_llm.bind_tools(_TOOL_SCHEMAS)
-    except Exception:  # noqa: BLE001
-        # Some models don't support bind_tools; fall through to no-tool mode
-        llm_with_tools = base_llm
+    # ── Bind tools to LLM ────────────────────────────────────────────────
+    # Use safe_bind_tools to unwrap any retry/fallback wrappers before binding.
+    # wiki_runner passes the LLM without tools=, so the factory's with_retry()
+    # wrap sits outermost; RunnableRetry has no bind_tools — calling it directly
+    # raises AttributeError and silently disables tools (#295).
+    llm_with_tools = safe_bind_tools(llm, _TOOL_SCHEMAS)
 
     # ── Per-cluster planning ──────────────────────────────────────────────
     specs_by_id: dict[int, PageSpec] = {}
@@ -712,22 +712,3 @@ def run_planner_with_report(
     )
 
 
-# ── LLM unwrapping helper ─────────────────────────────────────────────────────
-
-
-def _unwrap_llm(llm: Any) -> BaseChatModel:
-    """Unwrap RunnableRetry / RunnableBinding wrappers around a chat model.
-
-    Mirrors ``WikiStructurePlannerEngine._unwrap_chat_model`` to avoid the same
-    ``unhashable type: 'RunnableRetry'`` crash that hit the old engine.
-    """
-    current = llm
-    for _ in range(8):
-        if isinstance(current, BaseChatModel):
-            return current
-        inner = getattr(current, "bound", None)
-        if inner is None or inner is current:
-            break
-        current = inner
-    # Return as-is; deepagents or bind_tools will surface a clear error
-    return current  # type: ignore[return-value]
