@@ -2111,6 +2111,7 @@ class OptimizedWikiGenerationAgent:
                 repo_root=repo_root,
                 name_index=name_index or None,
                 stream_callback=_stream_callback,
+                storage=getattr(self, "_cluster_db", None),
             )
         except Exception as exc:
             logger.error("[UNIFIED] pipeline failed: %s", exc, exc_info=True)

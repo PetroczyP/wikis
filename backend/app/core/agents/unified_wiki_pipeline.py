@@ -130,6 +130,7 @@ def _run_page(
     name_index: set[str] | None,
     gate_mode: dict[str, str],
     stream_callback: Callable[[dict], None] | None,
+    storage: Any = None,
 ) -> tuple[GeneratedPage, GateReport, VerifyReport]:
     """Run the writer → gate → verifier pipeline for one ``PageSpec``.
 
@@ -280,6 +281,14 @@ def _run_page(
     # ── 6. Reconstruct final markdown from kept paragraphs ────────────
     final_markdown = _claims_to_markdown(kept_after_verify)
 
+    # ── 6b. Prepend architecture diagram ──────────────────────────────
+    if storage is not None:
+        from app.core.wiki_content_writer.diagram_generator import DiagramGenerator  # noqa: PLC0415
+        dg = DiagramGenerator(storage)
+        diagram = dg.generate_cluster_diagram(page_id, spec)
+        if diagram:
+            final_markdown = diagram + "\n\n" + final_markdown
+
     page = GeneratedPage(
         page_id=page_id,
         title=spec.title,
@@ -349,6 +358,7 @@ def run_unified_pipeline(
     name_index: set[str] | None = None,
     gate_mode: dict[str, str] | None = None,
     stream_callback: Callable[[dict], None] | None = None,
+    storage: Any = None,
 ) -> UnifiedPipelineResult:
     """Run the unified planner → writer → gate → verifier pipeline.
 
@@ -477,6 +487,7 @@ def run_unified_pipeline(
                 name_index=name_index,
                 gate_mode=effective_gate_mode,
                 stream_callback=stream_callback,
+                storage=storage,
             )
             pages.append(page)
             gate_reports[spec.cluster_id] = gate_report
