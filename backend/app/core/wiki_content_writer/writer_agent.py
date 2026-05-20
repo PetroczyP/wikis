@@ -353,12 +353,27 @@ class WikiContentWriter:
                 break
 
         if not content:
-            # Budget exhausted without a final write — ask for the page now.
+            # Budget exhausted without a final write — explicitly instruct the
+            # LLM to write the page and cite every claim using the file paths
+            # and line numbers already in the message history (#313).
+            messages.append(HumanMessage(content=(
+                "You have used all available tool calls. Based on the evidence "
+                "you gathered, write the complete wiki page in Markdown now.\n\n"
+                "IMPORTANT: cite every claim using the file path and line numbers "
+                "from your tool results. Format: [path/to/file.py:N] or "
+                "[path/to/file.py:lo-hi]. A paragraph without a citation will be "
+                "discarded. Do NOT call any more tools."
+            )))
             try:
                 response = effective_llm.invoke(messages)
-                content = response.content if isinstance(response.content, str) else str(response.content)
+                final_content = response.content if isinstance(response.content, str) else str(response.content)
+                # If LLM still returned tool_calls (stubborn), ignore and fall back.
+                final_tool_calls = getattr(response, "tool_calls", None) or []
+                if final_content and not final_tool_calls:
+                    content = final_content
             except Exception as exc:
                 logger.error("[WRITER] final write call failed: %s", exc)
+            if not content:
                 content = f"# {title}\n\n{description}\n"
 
         logger.info("[WRITER] generate_page done: title=%r chars=%d tool_calls=%d", title, len(content), len(tool_trace))

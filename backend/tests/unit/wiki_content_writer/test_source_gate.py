@@ -5,8 +5,11 @@ Pre-filter rules:
 2. SQL claim without .sql read → "sql_claim_without_read"
 3. Identifier not in graph or tool trace → "identifier_not_grounded"
 
-Covers per-rule detection, mode toggles (flag/strip/verifier),
+Covers per-rule detection, mode toggles (flag/strip),
 the happy path, and interaction between multiple rules.
+
+Note: "verifier" mode removed in #318 (citation verifier deleted).
+Valid modes are now "flag" and "strip" only.
 """
 
 from __future__ import annotations
@@ -166,19 +169,6 @@ class TestReadmeRule:
         assert len(kept) == 0
         assert report.stripped_paragraphs == [0]
 
-    def test_readme_verifier_mode_flags_as_verifier(self):
-        claims = [_claim("README describes the API endpoints.")]
-        kept, report = apply_gate(
-            claims,
-            [],
-            mode={"readme": "verifier"},
-        )
-
-        readme_flags = [f for f in report.flags if f.rule == "readme_claim_without_read"]
-        assert readme_flags[0].action == "verifier"
-        # Paragraph kept in output — verifier decides
-        assert len(kept) == 1
-
     def test_no_readme_in_paragraph_no_flag(self):
         claims = [_claim("The service handles authentication via JWT tokens.")]
         kept, report = apply_gate(claims, [])
@@ -252,18 +242,6 @@ class TestSqlRule:
 
         assert len(kept) == 0
         assert report.stripped_paragraphs == [0]
-
-    def test_sql_verifier_mode_keeps_paragraph(self):
-        claims = [_claim("The schema uses SELECT id FROM users.")]
-        kept, report = apply_gate(
-            claims,
-            [],
-            mode={"sql": "verifier"},
-        )
-
-        assert len(kept) == 1
-        sql_flags = [f for f in report.flags if f.rule == "sql_claim_without_read"]
-        assert sql_flags[0].action == "verifier"
 
     def test_no_sql_keyword_no_flag(self):
         claims = [_claim("The service handles HTTP requests and returns JSON responses.")]
@@ -359,19 +337,6 @@ class TestIdentifierRule:
 
         assert len(kept) == 0
         assert report.stripped_paragraphs == [0]
-
-    def test_identifier_verifier_mode_keeps_paragraph(self):
-        claims = [_claim("The UnknownComponent processes input.")]
-        kept, report = apply_gate(
-            claims,
-            [],
-            known_symbols=set(),
-            mode={"identifier": "verifier"},
-        )
-
-        assert len(kept) == 1
-        grounded_flags = [f for f in report.flags if f.rule == "identifier_not_grounded"]
-        assert all(f.action == "verifier" for f in grounded_flags)
 
     def test_known_symbols_none_skips_identifier_check(self):
         """When known_symbols is None (not passed), identifier rule still runs
