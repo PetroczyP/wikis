@@ -17,6 +17,7 @@ import {
   Typography,
 } from '@mui/material';
 import {
+  ArchiveBrandIcon,
   AzureDevOpsBrandIcon,
   ConfluenceBrandIcon,
   GitBrandIcon,
@@ -46,6 +47,7 @@ type ConnectorKey =
   | 'jira'
   | 'ado'
   | 'local_fs'
+  | 'archive'
   | 'notion';
 
 type ConnectorOption =
@@ -128,6 +130,21 @@ const CONNECTORS: ConnectorOption[] = [
     testId: 'connector-local-fs',
   },
   {
+    // Archive — uploads a .zip/.tar.gz and routes through the Local FS
+    // pipeline once the backend extracts it.  Shares ``id: 'git'`` with
+    // the Git and Local FS cards because the on-wire ``source_type`` is
+    // the same; the per-card ``key`` keeps active-state highlighting
+    // honest when Git/Local FS/Archive coexist on the picker.
+    key: 'archive',
+    disabled: false,
+    id: 'git',
+    label: 'Archive',
+    description: 'Upload a zip or tar.gz of the source',
+    icon: <ArchiveBrandIcon />,
+    iconColor: '#A78BFA',
+    testId: 'connector-archive',
+  },
+  {
     key: 'notion',
     disabled: true,
     id: 'notion',
@@ -153,14 +170,21 @@ interface StepConnectorProps {
    * and forwards it here for the active-state computation.
    */
   selectedLocalFs: boolean;
-  onSelect: (source: WikiSourceType, localFs: boolean) => void;
+  /**
+   * ``selectedArchive`` mirrors ``selectedLocalFs`` for the Archive card
+   * (#archive). Archive, Local FS, and Git all wire to ``id: 'git'`` on
+   * the backend; the wizard distinguishes them on the picker via these
+   * flags so the active-state border ends up on the right card.
+   */
+  selectedArchive: boolean;
+  onSelect: (source: WikiSourceType, opts: { localFs: boolean; archive: boolean }) => void;
 }
 
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
-export function StepConnector({ selected, selectedLocalFs, onSelect }: StepConnectorProps) {
+export function StepConnector({ selected, selectedLocalFs, selectedArchive, onSelect }: StepConnectorProps) {
   return (
     <Stack spacing={2} sx={{ mt: 0.5 }}>
       <Typography variant="body2" color="text.secondary">
@@ -175,14 +199,22 @@ export function StepConnector({ selected, selectedLocalFs, onSelect }: StepConne
         }}
       >
         {CONNECTORS.map((c) => {
-          // ``id`` can be shared (Local FS reuses ``id: 'git'``).  Use the
-          // per-card ``key`` together with ``selectedLocalFs`` so only the
-          // card the user actually clicked highlights on revisit.
+          // ``id`` can be shared (Local FS and Archive both reuse
+          // ``id: 'git'``).  Use the per-card ``key`` together with the
+          // mode flags so only the card the user actually clicked
+          // highlights on revisit.
           const isLocalFsCard = c.key === 'local_fs';
-          const active =
-            !c.disabled &&
-            c.id === selected &&
-            (isLocalFsCard ? selectedLocalFs : !selectedLocalFs);
+          const isArchiveCard = c.key === 'archive';
+          let activeForVariant: boolean;
+          if (isLocalFsCard) {
+            activeForVariant = selectedLocalFs;
+          } else if (isArchiveCard) {
+            activeForVariant = selectedArchive;
+          } else {
+            // Plain Git card — active only when neither alt-mode flag is set.
+            activeForVariant = !selectedLocalFs && !selectedArchive;
+          }
+          const active = !c.disabled && c.id === selected && activeForVariant;
           const card = (
             <Card
               variant="outlined"
@@ -203,7 +235,11 @@ export function StepConnector({ selected, selectedLocalFs, onSelect }: StepConne
             >
               <CardActionArea
                 onClick={() => {
-                  if (!c.disabled) onSelect(c.id, c.key === 'local_fs');
+                  if (!c.disabled)
+                    onSelect(c.id, {
+                      localFs: c.key === 'local_fs',
+                      archive: c.key === 'archive',
+                    });
                 }}
                 disabled={c.disabled}
                 data-testid={c.testId}

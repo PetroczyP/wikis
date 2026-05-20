@@ -107,13 +107,13 @@ export function AddSourceWizard({
   // ---------------------------------------------------------------------
 
   const urlError = useMemo<string | null>(() => {
-    if (formData.source_type !== 'git' || formData.localFsMode) return null;
+    if (formData.source_type !== 'git' || formData.localFsMode || formData.archiveMode) return null;
     const url = formData.git.repo_url.trim();
     if (!url) return 'Repository URL is required';
     if (!isUrlish(url))
       return 'Must be a valid URL (https://, git@, file://, or local /path)';
     return null;
-  }, [formData.source_type, formData.localFsMode, formData.git.repo_url]);
+  }, [formData.source_type, formData.localFsMode, formData.archiveMode, formData.git.repo_url]);
 
   const pathError = useMemo<string | null>(() => {
     if (formData.source_type !== 'git' || !formData.localFsMode) return null;
@@ -155,6 +155,12 @@ export function AddSourceWizard({
   const configureValid = useMemo(() => {
     if (atlassianRequired && !atlassianReady) return false;
     if (formData.source_type === 'git') {
+      if (formData.archiveMode) {
+        // Archive flow gates on the upload_id being present —
+        // ArchiveConfigure POSTs the upload synchronously and writes
+        // ``uploadId`` on success.
+        return formData.archive.uploadId !== null;
+      }
       if (formData.localFsMode) return !pathError;
       if (urlError) return false;
       if (formData.git.patSource === 'paste' && !formData.git.pastedPat.trim()) {
@@ -170,6 +176,8 @@ export function AddSourceWizard({
     atlassianReady,
     formData.source_type,
     formData.localFsMode,
+    formData.archiveMode,
+    formData.archive.uploadId,
     formData.git.patSource,
     formData.git.pastedPat,
     urlError,
@@ -192,6 +200,20 @@ export function AddSourceWizard({
   const buildScanRequest = useCallback((): ScanRequest | null => {
     if (!configureValid) return null;
     if (formData.source_type === 'git') {
+      // Archive flow: the backend extracted the upload and returned an
+      // opaque ``upload_id``. We echo it back here as
+      // ``scope.archive_upload_id``; the backend resolves it to the
+      // extracted directory server-side. ``source_type='git'`` with no
+      // auth and no branch.
+      if (formData.archiveMode) {
+        const uploadId = formData.archive.uploadId;
+        if (!uploadId) return null;
+        return {
+          source_type: 'git',
+          scope: { archive_upload_id: uploadId },
+          auth: { pat: null },
+        };
+      }
       // Local FS path: no auth, no branch — backend's GitToolkit accepts
       // bare filesystem paths through the same code path as remote git
       // URLs, so we still submit ``source_type='git'`` on the wire.
@@ -249,6 +271,8 @@ export function AddSourceWizard({
     formData.source_type,
     formData.localFsMode,
     formData.localFs,
+    formData.archiveMode,
+    formData.archive.uploadId,
     formData.git,
     formData.confluence.space_keys,
     formData.jira.jql,
@@ -294,6 +318,9 @@ export function AddSourceWizard({
     // step === 1 — compare against the initial form data for the picked
     // connector. Avoids prompting on a connector pick alone.
     if (formData.source_type === 'git') {
+      if (formData.archiveMode) {
+        return formData.archive.uploadId !== null;
+      }
       if (formData.localFsMode) {
         return formData.localFs.path.trim().length > 0;
       }
@@ -339,7 +366,24 @@ export function AddSourceWizard({
     try {
       let body: GenerateWikiMultiSourceRequest;
       if (formData.source_type === 'git') {
-        if (formData.localFsMode) {
+        if (formData.archiveMode) {
+          // Archive: backend resolves the opaque upload_id to the
+          // extracted directory server-side. ``uploadId`` is guaranteed
+          // non-null by ``configureValid`` but we narrow it explicitly so
+          // TS doesn't have to follow the flow.
+          const uploadId = formData.archive.uploadId;
+          if (!uploadId) {
+            setSubmitError('Archive upload did not complete. Please re-upload.');
+            setSubmitting(false);
+            return;
+          }
+          body = {
+            source_type: 'git',
+            scope: { archive_upload_id: uploadId },
+            auth: { pat: null },
+            ...(formData.wiki_title ? { wiki_title: formData.wiki_title } : {}),
+          };
+        } else if (formData.localFsMode) {
           // Local FS: same wire shape as Git but with the path in
           // ``repo_url`` and no auth.  ``branch`` is omitted entirely
           // — a filesystem directory has no branch concept, and an
@@ -464,8 +508,14 @@ export function AddSourceWizard({
         <StepConnector
           selected={formData.source_type}
           selectedLocalFs={formData.localFsMode}
-          onSelect={(source_type, localFs) => {
-            setFormData((d) => ({ ...d, source_type, localFsMode: localFs }));
+          selectedArchive={formData.archiveMode}
+          onSelect={(source_type, { localFs, archive }) => {
+            setFormData((d) => ({
+              ...d,
+              source_type,
+              localFsMode: localFs,
+              archiveMode: archive,
+            }));
             // Auto-advance on pick (cartograph behavior).
             setStep(1);
           }}

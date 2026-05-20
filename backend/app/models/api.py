@@ -63,10 +63,29 @@ from pydantic import BaseModel, ConfigDict, Discriminator, Field, model_validato
 
 
 class GitScope(BaseModel):
-    """Scope for a git source."""
+    """Scope for a git source.
 
-    repo_url: str
+    For archive uploads, send ``archive_upload_id`` instead of ``repo_url``;
+    the backend resolves it to the extracted directory server-side via
+    :func:`app.services.archive_upload_service.resolve_archive_upload_id`.
+    Exactly one of ``repo_url`` / ``archive_upload_id`` must be supplied.
+    """
+
+    repo_url: str | None = None
     branch: str = "main"
+    archive_upload_id: str | None = None
+
+    @model_validator(mode="after")
+    def _require_repo_url_or_upload_id(self) -> "GitScope":
+        if not self.repo_url and not self.archive_upload_id:
+            raise ValueError(
+                "GitScope: provide either repo_url or archive_upload_id"
+            )
+        if self.repo_url and self.archive_upload_id:
+            raise ValueError(
+                "GitScope: provide repo_url OR archive_upload_id, not both"
+            )
+        return self
 
 
 class ConfluenceScope(BaseModel):
@@ -285,7 +304,23 @@ class GenerateWikiRequest(BaseModel):
     def _validate_and_backfill(self) -> "GenerateWikiRequest":
         """Back-fill legacy fields from scope so downstream code still works."""
         if self.source_type == "git":
-            # Ensure repo_url and branch are set (legacy pipeline reads them directly).
+            # Archive uploads: scope carries an opaque ``archive_upload_id``.
+            # Resolve it server-side and substitute the extracted directory
+            # into ``repo_url`` so the downstream Local-FS pipeline sees the
+            # same shape as a direct path submission.
+            upload_id = self.scope.get("archive_upload_id")
+            if upload_id:
+                from app.services.archive_upload_service import (
+                    resolve_archive_upload_id,
+                )
+
+                resolved = str(resolve_archive_upload_id(upload_id))
+                self.scope["repo_url"] = resolved
+                self.repo_url = resolved
+                self.provider = "local"
+                # ALLOWED_LOCAL_PATHS bypass is implicit: the path came out
+                # of resolve_archive_upload_id, which guarantees containment
+                # under ``archive_root``.
             if not self.repo_url:
                 self.repo_url = self.scope.get("repo_url", "")
             if not self.branch:
@@ -296,16 +331,16 @@ class GenerateWikiRequest(BaseModel):
             # Local path validation (unchanged from original).
             from app.core.local_repo_provider import is_local_path, validate_local_path
 
-            if self.repo_url and is_local_path(self.repo_url):
+            if not upload_id and self.repo_url and is_local_path(self.repo_url):
                 if self.provider == "github":
                     self.provider = "local"
                 from app.config import get_settings
 
+                path = self.repo_url.removeprefix("file://")
                 settings = get_settings()
                 allowed: list[str] = []
                 if settings.allowed_local_paths:
                     allowed = [p.strip() for p in settings.allowed_local_paths.split(",") if p.strip()]
-                path = self.repo_url.removeprefix("file://")
                 validate_local_path(path, allowed or None)
         else:
             # For non-git sources, set stubs so invocation serialisation
@@ -390,6 +425,26 @@ class ScanResponse(BaseModel):
     reachable: bool
     preview: GitScanPreview | ConfluenceScanPreview | JiraScanPreview | None = None
     warnings: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Archive upload (#archive)
+# ---------------------------------------------------------------------------
+
+
+class ArchiveUploadResponse(BaseModel):
+    """Response shape from ``POST /api/v1/uploads/archive``.
+
+    ``upload_id`` is an opaque token (UUID) the wizard echoes back on
+    subsequent ``/sources/scan`` and ``/wikis`` calls as
+    ``scope.archive_upload_id``. The backend resolves it to the
+    extracted directory server-side; absolute host paths never cross
+    the wire.
+    """
+
+    upload_id: str
+    file_count: int
+    size_bytes: int
 
 
 # ---------------------------------------------------------------------------

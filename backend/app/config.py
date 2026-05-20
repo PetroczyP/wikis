@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     # Local repo support
     allowed_local_paths: str | None = None  # comma-separated base paths
 
+    # Archive upload (#archive — wizard "Archive" connector). Uploaded
+    # zip/tar.gz files are extracted under ``archive_root`` and the
+    # resulting directory is fed to the standard Local FS path through
+    # ``GitToolkit``. Paths under this root bypass the
+    # ``ALLOWED_LOCAL_PATHS`` check because the backend itself produced
+    # them — a user can only reach them by completing a multipart upload
+    # this process authorised and extracted.
+    archive_root: str = "./data/archives"
+    archive_max_size_mb: int = 200  # request-body cap (per upload)
+
     # Health
     health_check_on_startup: bool = True
 

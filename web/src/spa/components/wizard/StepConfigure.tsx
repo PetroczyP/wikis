@@ -11,6 +11,7 @@
  */
 
 import { Box } from '@mui/material';
+import { ArchiveConfigure } from './connectors/ArchiveConfigure';
 import { GitConfigure } from './connectors/GitConfigure';
 import { LocalFsConfigure } from './connectors/LocalFsConfigure';
 import { ConfluenceConfigure } from './connectors/ConfluenceConfigure';
@@ -38,6 +39,13 @@ export function StepConfigure({
 }: StepConfigureProps) {
   return (
     <Box sx={{ mt: 0.5 }}>
+      {data.source_type === 'git' && data.archiveMode && (
+        <ArchiveConfigure
+          data={data.archive}
+          onChange={(archive) => onChange({ ...data, archive })}
+          disabled={disabled}
+        />
+      )}
       {data.source_type === 'git' && data.localFsMode && (
         <LocalFsConfigure
           data={data.localFs}
@@ -46,7 +54,7 @@ export function StepConfigure({
           disabled={disabled}
         />
       )}
-      {data.source_type === 'git' && !data.localFsMode && (
+      {data.source_type === 'git' && !data.localFsMode && !data.archiveMode && (
         <GitConfigure
           data={data.git}
           onChange={(git) => onChange({ ...data, git })}

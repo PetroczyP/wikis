@@ -109,6 +109,19 @@ export function LocalFsBrandIcon(props: BrandIconProps) {
   );
 }
 
+// Archive — an outlined box/inventory mark. Renders with currentColor so
+// the connector card's ``iconColor`` controls the tint (mirrors the
+// Local FS treatment — Archive isn't a brand, it's a content type).
+export function ArchiveBrandIcon(props: BrandIconProps) {
+  return (
+    <svg {...svgAttrs(props)} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="18" height="4" rx="1" />
+      <path d="M5 7v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7" />
+      <path d="M10 12h4" />
+    </svg>
+  );
+}
+
 // Notion — black "N" logo on transparent background.
 export function NotionBrandIcon(props: BrandIconProps) {
   return (

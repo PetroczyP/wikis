@@ -102,6 +102,37 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/uploads/archive": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Upload Archive
+         * @description Accept a ``.zip`` / ``.tar.gz`` / ``.tgz`` / ``.tar`` upload, extract it.
+         *
+         *     The wizard's "Archive" connector posts a single file here, receives
+         *     an opaque ``upload_id``, and submits that id as
+         *     ``scope.archive_upload_id`` on subsequent scan + generate calls.
+         *     The backend resolves the id to the extracted directory server-side;
+         *     host paths never cross the wire.
+         *
+         *     Security: extraction rejects path-traversal entries, symlinks, and
+         *     archives that expand more than 10× their compressed size. Bodies
+         *     larger than ``settings.archive_max_size_mb`` MB are rejected with
+         *     413 before the extractor runs.
+         */
+        post: operations["upload_archive_api_v1_uploads_archive_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/invocations/{invocation_id}": {
         parameters: {
             query?: never;
@@ -680,6 +711,24 @@ export interface components {
             changes?: components["schemas"]["NodeChangeResponse"][];
         };
         /**
+         * ArchiveUploadResponse
+         * @description Response shape from ``POST /api/v1/uploads/archive``.
+         *
+         *     ``upload_id`` is an opaque token (UUID) the wizard echoes back on
+         *     subsequent ``/sources/scan`` and ``/wikis`` calls as
+         *     ``scope.archive_upload_id``. The backend resolves it to the
+         *     extracted directory server-side; absolute host paths never cross
+         *     the wire.
+         */
+        ArchiveUploadResponse: {
+            /** Upload Id */
+            upload_id: string;
+            /** File Count */
+            file_count: number;
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /**
          * AskRequest
          * @description Request to ask a question about a wiki.
          */
@@ -764,6 +813,11 @@ export interface components {
         Body_import_wiki_api_v1_wikis_import_post: {
             /** Bundle */
             bundle: string;
+        };
+        /** Body_upload_archive_api_v1_uploads_archive_post */
+        Body_upload_archive_api_v1_uploads_archive_post: {
+            /** Archive */
+            archive: string;
         };
         /**
          * CallStack
@@ -1152,15 +1206,22 @@ export interface components {
         /**
          * GitScope
          * @description Scope for a git source.
+         *
+         *     For archive uploads, send ``archive_upload_id`` instead of ``repo_url``;
+         *     the backend resolves it to the extracted directory server-side via
+         *     :func:`app.services.archive_upload_service.resolve_archive_upload_id`.
+         *     Exactly one of ``repo_url`` / ``archive_upload_id`` must be supplied.
          */
         GitScope: {
             /** Repo Url */
-            repo_url: string;
+            repo_url?: string | null;
             /**
              * Branch
              * @default main
              */
             branch: string;
+            /** Archive Upload Id */
+            archive_upload_id?: string | null;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -2134,6 +2195,55 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ScanResponse"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    upload_archive_api_v1_uploads_archive_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_upload_archive_api_v1_uploads_archive_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArchiveUploadResponse"];
+                };
+            };
+            /** @description Unsupported archive type or malformed contents */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Archive exceeds the configured size limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

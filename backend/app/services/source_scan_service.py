@@ -89,12 +89,30 @@ class SourceScanService:
             ) from exc
 
     async def _scan_git(self, request: GitScanRequest) -> ScanResponse:
-        # Pydantic enforces `repo_url: str` is present and the right type, but
-        # an *empty* string is still a valid `str` — the guard below is the
-        # actual enforcement layer for non-emptiness (Rio #224 review).
-        repo_url = request.scope.repo_url
-        if not repo_url:
-            raise ScanError("scope.repo_url must be a non-empty string for git scans")
+        # Archive upload: resolve the opaque upload_id to the extracted
+        # directory server-side. Containment under ``archive_root`` is
+        # guaranteed by ``resolve_archive_upload_id`` — no separate
+        # ALLOWED_LOCAL_PATHS allowlist entry needed.
+        if request.scope.archive_upload_id:
+            from app.services.archive_upload_service import (
+                ArchiveUploadError,
+                resolve_archive_upload_id,
+            )
+
+            try:
+                resolved = resolve_archive_upload_id(request.scope.archive_upload_id)
+            except ArchiveUploadError as exc:
+                raise ScanError(str(exc), reachable=False) from exc
+            repo_url = str(resolved)
+        else:
+            # Pydantic enforces `repo_url: str` is present and the right type, but
+            # an *empty* string is still a valid `str` — the guard below is the
+            # actual enforcement layer for non-emptiness (Rio #224 review).
+            repo_url = request.scope.repo_url
+            if not repo_url:
+                raise ScanError(
+                    "scope.repo_url or scope.archive_upload_id is required for git scans"
+                )
         branch = request.scope.branch or "main"
         token = request.auth.pat
 
@@ -104,7 +122,12 @@ class SourceScanService:
         # ``file:///etc`` or bare ``/etc`` payload would scan host
         # directories. ``is_local_path`` covers both ``/`` and
         # ``file://`` prefixes.
-        if is_local_path(repo_url):
+        #
+        # Archive uploads bypass this check: the path was just produced
+        # by ``resolve_archive_upload_id`` and is guaranteed to live
+        # under the configured archive root.
+        if not request.scope.archive_upload_id and is_local_path(repo_url):
+            cleaned = repo_url.removeprefix("file://")
             settings = get_settings()
             allowed: list[str] = []
             if settings.allowed_local_paths:
@@ -114,7 +137,7 @@ class SourceScanService:
                     if p.strip()
                 ]
             try:
-                validate_local_path(repo_url.removeprefix("file://"), allowed or None)
+                validate_local_path(cleaned, allowed or None)
             except ValueError as exc:
                 raise ScanError(str(exc), reachable=False) from exc
 

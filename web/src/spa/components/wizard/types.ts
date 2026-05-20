@@ -27,6 +27,28 @@ export interface JiraFormState {
 }
 
 /**
+ * Archive form state — the result of an upload to
+ * ``POST /api/v1/uploads/archive``.
+ *
+ * The Archive connector is "Local FS with a one-time extraction step":
+ * the user uploads a ``.zip``/``.tar.gz`` and the backend returns an
+ * opaque ``upload_id``. The wizard echoes that id back as
+ * ``scope.archive_upload_id`` with ``source_type='git'``; the backend
+ * resolves it to the extracted directory server-side so host paths
+ * never cross the wire.
+ *
+ * Slots are nullable so the wizard can detect "no upload yet" without
+ * a parallel boolean. ``uploadId`` is the only field ``configureValid``
+ * cares about; the others are display-only.
+ */
+export interface ArchiveFormState {
+  uploadId: string | null;
+  fileName: string | null;
+  fileCount: number | null;
+  sizeBytes: number | null;
+}
+
+/**
  * Local-FS form state — a backend-accessible filesystem path.
  *
  * Submitted with ``source_type='git'`` (the backend's ``GitToolkit``
@@ -68,8 +90,18 @@ export interface WizardFormData {
    * both git URLs and bare filesystem paths through the same code path.
    */
   localFsMode: boolean;
+  /**
+   * Distinguishes Archive from regular Git when ``source_type='git'``.
+   * Mutually exclusive with ``localFsMode`` — picking either of the
+   * non-URL Git surfaces clears the other.  The upload token is tracked
+   * on ``archive.uploadId`` and submitted as
+   * ``scope.archive_upload_id``; the backend resolves it to the
+   * extracted directory server-side.
+   */
+  archiveMode: boolean;
   git: GitFormState;
   localFs: LocalFsFormState;
+  archive: ArchiveFormState;
   confluence: ConfluenceFormState;
   jira: JiraFormState;
   atlassianAuthMode: AtlassianAuthMode;
@@ -80,6 +112,7 @@ export interface WizardFormData {
 export const INITIAL_FORM_DATA: WizardFormData = {
   source_type: 'git',
   localFsMode: false,
+  archiveMode: false,
   git: {
     repo_url: '',
     branch: 'main',
@@ -87,6 +120,12 @@ export const INITIAL_FORM_DATA: WizardFormData = {
     pastedPat: '',
   },
   localFs: { path: '' },
+  archive: {
+    uploadId: null,
+    fileName: null,
+    fileCount: null,
+    sizeBytes: null,
+  },
   confluence: { space_keys: [] },
   jira: { jql: 'ORDER BY created DESC' },
   atlassianAuthMode: 'oauth',

@@ -21,6 +21,7 @@ jest.mock('../../../api/wiki', () => {
     ...actual,
     scanSource: jest.fn(),
     generateWikiMultiSource: jest.fn(),
+    uploadArchive: jest.fn(),
   };
 });
 
@@ -32,13 +33,14 @@ jest.mock('../../../hooks/useConnections', () => ({
 }));
 
 import { AddSourceWizard } from '../AddSourceWizard';
-import { scanSource, generateWikiMultiSource } from '../../../api/wiki';
+import { scanSource, generateWikiMultiSource, uploadArchive } from '../../../api/wiki';
 import { ApiError } from '../../../api/client';
 
 const mockScanSource = scanSource as jest.MockedFunction<typeof scanSource>;
 const mockGenerate = generateWikiMultiSource as jest.MockedFunction<
   typeof generateWikiMultiSource
 >;
+const mockUploadArchive = uploadArchive as jest.MockedFunction<typeof uploadArchive>;
 
 function noConnections() {
   mockUseConnections.mockReturnValue({
@@ -68,6 +70,7 @@ beforeEach(() => {
   noConnections();
   mockScanSource.mockReset();
   mockGenerate.mockReset();
+  mockUploadArchive.mockReset();
 });
 
 describe('AddSourceWizard', () => {
@@ -770,5 +773,92 @@ describe('AddSourceWizard', () => {
     expect(body.scope).toEqual({ repo_url: '/srv/docs/my-project' });
     expect(body.scope).not.toHaveProperty('branch');
     expect(body.auth).toEqual({ pat: null });
+  });
+
+  // -------------------------------------------------------------------
+  // #archive — Archive connector (zip/tar.gz upload + extract)
+  // -------------------------------------------------------------------
+
+  it('Archive card appears on the connector step', () => {
+    renderWizard();
+    expect(screen.getByTestId('connector-archive')).toBeInTheDocument();
+  });
+
+  it('Clicking Archive lands on the Archive Configure step (file picker, no auth)', async () => {
+    const user = userEvent.setup();
+    renderWizard();
+    await user.click(screen.getByTestId('connector-archive'));
+    // The Archive form's file-picker button is present.
+    expect(await screen.findByTestId('archive-pick-file')).toBeInTheDocument();
+    // No auth dropdown, no URL, no path field — Archive is upload-only.
+    expect(screen.queryByTestId('pat-source-select')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('git-repo-url')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('local-fs-path')).not.toBeInTheDocument();
+  });
+
+  it('Archive submit: source_type=git, scope.archive_upload_id=<uploadId>, no auth, no branch', async () => {
+    const user = userEvent.setup();
+    // Backend returns an opaque upload_id only — no host path.
+    mockUploadArchive.mockResolvedValue({
+      upload_id: 'u-1',
+      file_count: 12,
+      size_bytes: 4096,
+    });
+    mockScanSource.mockResolvedValue({
+      source_type: 'git',
+      reachable: true,
+      preview: {
+        default_branch: null,
+        resolved_branch: '',
+        commit_hash: null,
+        file_count: 12,
+        top_paths: ['README.md'],
+        size_bytes: 4096,
+      },
+      warnings: [],
+    });
+    mockGenerate.mockResolvedValue({
+      wiki_id: 'archive--u-1--none',
+      invocation_id: 'inv-archive-1',
+      status: 'generating',
+      message: 'ok',
+    });
+
+    renderWizard();
+    await user.click(screen.getByTestId('connector-archive'));
+    // Drive the hidden file input directly — clicking the visible
+    // "Choose archive" button only opens the OS file picker, which
+    // jsdom can't simulate.
+    const input = (await screen.findByTestId(
+      'archive-file-input',
+    )) as HTMLInputElement;
+    const file = new File([new Uint8Array([0x50, 0x4b, 0x03, 0x04])], 'repo.zip', {
+      type: 'application/zip',
+    });
+    await user.upload(input, file);
+
+    // Summary panel appears after the upload resolves.
+    expect(await screen.findByTestId('archive-summary')).toBeInTheDocument();
+    expect(mockUploadArchive).toHaveBeenCalledTimes(1);
+
+    // Advance through Scan → Confirm → Submit.
+    await user.click(screen.getByTestId('wizard-next'));
+    await screen.findByTestId('scan-success');
+    await user.click(screen.getByTestId('wizard-next'));
+    await user.click(screen.getByTestId('wizard-submit'));
+
+    await waitFor(() => expect(mockGenerate).toHaveBeenCalledTimes(1));
+    const body = mockGenerate.mock.calls[0][0];
+    expect(body.source_type).toBe('git');
+    expect(body.scope).toEqual({ archive_upload_id: 'u-1' });
+    expect(body.scope).not.toHaveProperty('branch');
+    expect(body.scope).not.toHaveProperty('repo_url');
+    expect(body.auth).toEqual({ pat: null });
+
+    // And the scan step submitted the same shape.
+    const scanBody = mockScanSource.mock.calls[0][0];
+    expect(scanBody.source_type).toBe('git');
+    expect(scanBody.scope).toEqual({ archive_upload_id: 'u-1' });
+    expect(scanBody.auth).toEqual({ pat: null });
   });
 });

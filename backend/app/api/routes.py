@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import logging
 import re
@@ -42,6 +43,7 @@ from app.models import (
 )
 from app.models.api import (
     AffectedPageResponse,
+    ArchiveUploadResponse,
     ChangeSetResponse,
     DiffWikiRequest,
     DiffWikiResponse,
@@ -201,6 +203,61 @@ async def scan_source(
     except NotImplementedError as exc:
         # Unknown source_type with no scanner implementation.
         raise HTTPException(status_code=501, detail=str(exc))  # noqa: B904
+
+
+# ---------------------------------------------------------------------------
+# Archive upload (#archive — wizard "Archive" connector)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/uploads/archive",
+    response_model=ArchiveUploadResponse,
+    responses={
+        400: {"description": "Unsupported archive type or malformed contents"},
+        413: {"description": "Archive exceeds the configured size limit"},
+    },
+)
+async def upload_archive(
+    archive: UploadFile,
+    user: CurrentUser = Depends(get_current_user),
+) -> ArchiveUploadResponse:
+    """Accept a ``.zip`` / ``.tar.gz`` / ``.tgz`` / ``.tar`` upload, extract it.
+
+    The wizard's "Archive" connector posts a single file here, receives
+    an opaque ``upload_id``, and submits that id as
+    ``scope.archive_upload_id`` on subsequent scan + generate calls.
+    The backend resolves the id to the extracted directory server-side;
+    host paths never cross the wire.
+
+    Security: extraction rejects path-traversal entries, symlinks, and
+    archives that expand more than 10× their compressed size. Bodies
+    larger than ``settings.archive_max_size_mb`` MB are rejected with
+    413 before the extractor runs.
+    """
+    from app.services.archive_upload_service import (
+        ArchiveUploadError,
+        extract_archive,
+    )
+
+    try:
+        # extract_archive is synchronous blocking I/O (disk spool + decompression).
+        # Run it in a thread so the event loop stays free for other requests.
+        result = await asyncio.to_thread(
+            extract_archive,
+            filename=archive.filename,
+            stream=archive.file,
+            declared_size=archive.size,
+        )
+    except ArchiveUploadError as exc:
+        raise HTTPException(  # noqa: B904
+            status_code=exc.status_code, detail=str(exc)
+        )
+    return ArchiveUploadResponse(
+        upload_id=result.upload_id,
+        file_count=result.file_count,
+        size_bytes=result.size_bytes,
+    )
 
 
 @router.get("/invocations/{invocation_id}", response_model=Invocation)

@@ -212,6 +212,21 @@ def test_git_scope_requires_repo_url() -> None:
         GitScope(branch="main")  # type: ignore[call-arg]  # missing required repo_url
 
 
+def test_git_scope_rejects_both_repo_url_and_archive_upload_id() -> None:
+    """GitScope enforces exactly-one-of: providing both is a config error.
+
+    Without this, the two service callsites (``_scan_git`` and
+    ``GenerateWikiRequest._validate_and_backfill``) silently prefer
+    ``archive_upload_id`` — deterministic but surprising. Fail loudly
+    at the model boundary instead.
+    """
+    with pytest.raises(ValidationError):
+        GitScope(
+            repo_url="https://github.com/org/repo",
+            archive_upload_id="0123456789abcdef0123456789abcdef",
+        )
+
+
 def test_atlassian_auth_requires_access_token() -> None:
     """AtlassianAuth rejects construction without access_token."""
     with pytest.raises(ValidationError):

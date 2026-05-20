@@ -278,6 +278,69 @@
         }
       }
     },
+    "/api/v1/uploads/archive": {
+      "post": {
+        "summary": "Upload Archive",
+        "description": "Accept a ``.zip`` / ``.tar.gz`` / ``.tgz`` / ``.tar`` upload, extract it.\n\nThe wizard's \"Archive\" connector posts a single file here, receives\nan opaque ``upload_id``, and submits that id as\n``scope.archive_upload_id`` on subsequent scan + generate calls.\nThe backend resolves the id to the extracted directory server-side;\nhost paths never cross the wire.\n\nSecurity: extraction rejects path-traversal entries, symlinks, and\narchives that expand more than 10\u00d7 their compressed size. Bodies\nlarger than ``settings.archive_max_size_mb`` MB are rejected with\n413 before the extractor runs.",
+        "operationId": "upload_archive_api_v1_uploads_archive_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_archive_api_v1_uploads_archive_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchiveUploadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unsupported archive type or malformed contents"
+          },
+          "413": {
+            "description": "Archive exceeds the configured size limit"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/invocations/{invocation_id}": {
       "get": {
         "summary": "Get Invocation",
@@ -2491,6 +2554,30 @@
         "title": "AffectedPageResponse",
         "description": "One wiki page touched by the change set."
       },
+      "ArchiveUploadResponse": {
+        "properties": {
+          "upload_id": {
+            "type": "string",
+            "title": "Upload Id"
+          },
+          "file_count": {
+            "type": "integer",
+            "title": "File Count"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "title": "Size Bytes"
+          }
+        },
+        "type": "object",
+        "required": [
+          "upload_id",
+          "file_count",
+          "size_bytes"
+        ],
+        "title": "ArchiveUploadResponse",
+        "description": "Response shape from ``POST /api/v1/uploads/archive``.\n\n``upload_id`` is an opaque token (UUID) the wizard echoes back on\nsubsequent ``/sources/scan`` and ``/wikis`` calls as\n``scope.archive_upload_id``. The backend resolves it to the\nextracted directory server-side; absolute host paths never cross\nthe wire."
+      },
       "AskRequest": {
         "description": "Request to ask a question about a wiki.",
         "properties": {
@@ -2660,6 +2747,20 @@
           "bundle"
         ],
         "title": "Body_import_wiki_api_v1_wikis_import_post"
+      },
+      "Body_upload_archive_api_v1_uploads_archive_post": {
+        "properties": {
+          "archive": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "Archive"
+          }
+        },
+        "type": "object",
+        "required": [
+          "archive"
+        ],
+        "title": "Body_upload_archive_api_v1_uploads_archive_post"
       },
       "CallStack": {
         "description": "A named call-flow chain, e.g. 'Frontend Auth' or 'MCP Auth'.",
@@ -3381,21 +3482,36 @@
       "GitScope": {
         "properties": {
           "repo_url": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Repo Url"
           },
           "branch": {
             "type": "string",
             "title": "Branch",
             "default": "main"
+          },
+          "archive_upload_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archive Upload Id"
           }
         },
         "type": "object",
-        "required": [
-          "repo_url"
-        ],
         "title": "GitScope",
-        "description": "Scope for a git source."
+        "description": "Scope for a git source.\n\nFor archive uploads, send ``archive_upload_id`` instead of ``repo_url``;\nthe backend resolves it to the extracted directory server-side via\n:func:`app.services.archive_upload_service.resolve_archive_upload_id`.\nExactly one of ``repo_url`` / ``archive_upload_id`` must be supplied."
       },
       "HTTPValidationError": {
         "properties": {

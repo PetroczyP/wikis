@@ -11,13 +11,21 @@ export type GenerateWikiResponse = components['schemas']['GenerateWikiResponse']
 export type WikiSourceType = 'git' | 'confluence' | 'jira';
 
 export interface GitScope {
-  repo_url: string;
+  repo_url?: string;
   /**
    * Branch name. Optional — when omitted the backend defaults to
    * ``"main"``.  Local FS submissions omit it entirely since branches
    * have no meaning for a bare filesystem directory.
    */
   branch?: string;
+  /**
+   * Opaque token returned by ``POST /api/v1/uploads/archive``. Used in
+   * place of ``repo_url`` for archive uploads — the backend resolves it
+   * to the extracted directory server-side so host paths never cross
+   * the wire. Exactly one of ``repo_url`` / ``archive_upload_id`` must
+   * be supplied.
+   */
+  archive_upload_id?: string;
 }
 
 export interface ConfluenceScope {
@@ -133,6 +141,55 @@ export const scanSource = (req: ScanRequest) =>
     method: 'POST',
     body: JSON.stringify(req),
   });
+
+// ---------------------------------------------------------------------------
+// Archive upload (#archive — wizard "Archive" connector)
+// ---------------------------------------------------------------------------
+
+export interface ArchiveUploadResponse {
+  upload_id: string;
+  file_count: number;
+  size_bytes: number;
+}
+
+/**
+ * Upload a ``.zip``/``.tar.gz``/``.tgz``/``.tar`` archive to the backend's
+ * extraction endpoint. Returns an opaque ``upload_id`` the wizard echoes
+ * back as ``scope.archive_upload_id`` on subsequent scan + generate
+ * calls; the backend resolves it to the extracted directory server-side.
+ *
+ * Uses a hand-rolled fetch (rather than ``apiRequest``) so the body is a
+ * ``FormData`` multipart envelope rather than JSON. Authentication
+ * piggybacks on the same Better-Auth bearer token ``apiRequest`` uses.
+ */
+export async function uploadArchive(file: File): Promise<ArchiveUploadResponse> {
+  const token = await getAuthToken();
+  const form = new FormData();
+  form.append('archive', file);
+  const res = await fetch('/api/v1/uploads/archive', {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: form,
+  });
+  if (!res.ok) {
+    if (res.status === 401) {
+      clearTokenCache();
+      const returnPath = window.location.pathname + window.location.search;
+      window.location.href = `/login?callbackUrl=${encodeURIComponent(returnPath)}`;
+      return new Promise<never>(() => {});
+    }
+    const text = await res.text();
+    let message = `Archive upload failed (${res.status})`;
+    try {
+      const json = JSON.parse(text);
+      if (json.detail) message = typeof json.detail === 'string' ? json.detail : message;
+    } catch (_e) {
+      /* fall back to HTTP status message */
+    }
+    throw new Error(message);
+  }
+  return res.json() as Promise<ArchiveUploadResponse>;
+}
 type AskRequest = components['schemas']['AskRequest'];
 type AskResponse = components['schemas']['AskResponse'];
 type ResearchRequest = components['schemas']['ResearchRequest'];
