@@ -4081,8 +4081,13 @@ class OptimizedWikiGenerationAgent:
 
         logger.info("Invoking LLM for repository analysis...")
 
+        # Use the un-tool-bound LLM for analysis. self.llm has WIKI_TOOL_SCHEMAS
+        # bound so it calls read_file/grep instead of writing the analysis text.
+        # self.llm_low is created without tools and produces the full Markdown.
+        _analysis_llm = self.llm_low if self.llm_low is not self.llm else self.llm
+
         try:
-            response = self.llm.invoke(
+            response = _analysis_llm.invoke(
                 [
                     make_cached_system_message(_sys_text, cache=_use_cache),
                     HumanMessage(content=_user_text),
