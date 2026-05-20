@@ -700,6 +700,25 @@ class FilesystemRepositoryIndexer:
             except Exception as exc:
                 logger.warning("compute_god_nodes failed (non-fatal): %s", exc)
 
+            # #309 — LLM node summaries (opt-in via WIKI_SUMMARISE_NODES=1)
+            try:
+                from app.config import get_settings as _get_settings
+
+                _settings = _get_settings()
+                if _settings.wiki_summarise_nodes:
+                    self._emit_progress(0.245, "Generating LLM node summaries...")
+                    _llm = getattr(self, "_llm", None) or getattr(self, "llm", None)
+                    n_summarised = self.populate_summaries(llm=_llm, _db=udb)
+                    logger.info(
+                        "Unified DB: %d node summaries generated (#309)", n_summarised
+                    )
+                else:
+                    logger.debug(
+                        "Node summaries skipped (WIKI_SUMMARISE_NODES not set)"
+                    )
+            except Exception as exc:
+                logger.warning("Node summary population failed (non-fatal): %s", exc)
+
             # Store build metadata
             udb.set_meta("repo_identifier", repo_identifier)
             udb.set_meta("commit_hash", self._last_commit_hash)
@@ -725,6 +744,77 @@ class FilesystemRepositoryIndexer:
 
         # Register in cache_index.json so toolkit_bridge can find it
         self._register_unified_db_cache(repo_identifier, cache_key, cache_dir)
+
+    def populate_summaries(self, llm: Any = None, batch_size: int = 20, *, _db: Any = None) -> int:
+        """Summarise architectural nodes using the provided LLM.
+
+        Parameters
+        ----------
+        llm :
+            A LangChain-compatible chat model with an ``invoke(prompt)`` method.
+            When None or the indexer has no DB path, returns 0.
+        batch_size : int
+            Nodes per LLM batch call (default 20).
+        _db :
+            Optional already-open storage instance (used internally by
+            ``_write_unified_db`` to avoid a double-open).  When None the
+            method opens a new connection to ``_unified_db_path``.
+        """
+        if llm is None:
+            return 0
+
+        # When called externally (without _db), we need a DB path.
+        if _db is None:
+            if not getattr(self, "_unified_db_path", None):
+                return 0
+            from .storage import open_storage, repo_id_from_path
+
+            _db_path = self._unified_db_path
+            _repo_id = repo_id_from_path(_db_path)
+            _owned_db = open_storage(repo_id=_repo_id, db_path=_db_path)
+        else:
+            _owned_db = None
+
+        db = _db if _db is not None else _owned_db
+
+        try:
+            model_name = (
+                getattr(llm, "model_id", None)
+                or getattr(llm, "model_name", None)
+                or "unknown"
+            )
+
+            def _summary_fn(texts: list[str]) -> list[str]:
+                results: list[str] = []
+                for text in texts:
+                    prompt = (
+                        "Summarise what this code symbol does in 2-3 sentences. "
+                        "Focus on its role in the system, key behaviour, and what callers need to know. "
+                        "Be specific to the code shown — do not generalise.\n\n"
+                        f"{text[:2000]}"
+                    )
+                    try:
+                        response = llm.invoke(prompt)
+                        raw = (
+                            response.content
+                            if hasattr(response, "content")
+                            else str(response)
+                        )
+                        results.append(raw[:400])
+                    except Exception as exc:
+                        logger.warning("Summary LLM call failed: %s", exc)
+                        # Return None (not "") so the node stays eligible for
+                        # future populate_summaries runs — "" satisfies
+                        # "llm_summary IS NOT NULL" and would lock it out.
+                        results.append(None)
+                return results
+
+            return db.populate_summaries(
+                _summary_fn, model_name=model_name, batch_size=batch_size
+            )
+        finally:
+            if _owned_db is not None:
+                _owned_db.close()
 
     def _register_unified_db_cache(self, repo_identifier: str, cache_key: str, cache_dir: str) -> None:
         """Register the unified DB in cache_index.json for Ask-path lookup."""

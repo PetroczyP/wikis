@@ -184,6 +184,14 @@ CREATE TABLE IF NOT EXISTS repo_nodes (
     -- the cross-language linker (L1) and federated query expansion.
     api_surface     TEXT DEFAULT NULL,
 
+    -- #309 LLM node summaries — populated on-demand via populate_summaries().
+    -- llm_summary: 2-3 sentence description of the symbol's role.
+    -- summary_model: model ID used to generate the summary.
+    -- summary_at: ISO-8601 timestamp when the summary was generated.
+    llm_summary     TEXT DEFAULT NULL,
+    summary_model   TEXT DEFAULT NULL,
+    summary_at      TEXT DEFAULT NULL,
+
     -- Timestamps
     indexed_at      TEXT DEFAULT (datetime('now'))
 );
@@ -624,6 +632,28 @@ class UnifiedWikiDB:
                 )
                 self.conn.commit()
 
+        # #309 LLM node summaries — add columns to existing repo_nodes tables.
+        if "repo_nodes" in tables:
+            cols = {row[1] for row in cur.execute("PRAGMA table_info(repo_nodes)")}
+            if "llm_summary" not in cols:
+                logger.info(
+                    "Migrating schema: adding llm_summary, summary_model, summary_at "
+                    "columns to repo_nodes (#309)"
+                )
+                try:
+                    cur.execute(
+                        "ALTER TABLE repo_nodes ADD COLUMN llm_summary TEXT DEFAULT NULL"
+                    )
+                    cur.execute(
+                        "ALTER TABLE repo_nodes ADD COLUMN summary_model TEXT DEFAULT NULL"
+                    )
+                    cur.execute(
+                        "ALTER TABLE repo_nodes ADD COLUMN summary_at TEXT DEFAULT NULL"
+                    )
+                    self.conn.commit()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Summary column migration failed (non-fatal): %s", exc)
+
     def _backfill_is_test(self) -> None:
         """Set is_test=1 for existing rows whose rel_path matches test patterns."""
         rows = self.conn.execute(
@@ -670,12 +700,21 @@ class UnifiedWikiDB:
         self._upsert_nodes_batch(nodes)
 
     def _upsert_nodes_batch(self, nodes: list[dict[str, Any]]) -> None:
-        """Internal bulk upsert using INSERT OR REPLACE."""
+        """Internal bulk upsert preserving existing llm_summary / summary_model / summary_at.
+
+        Uses INSERT … ON CONFLICT(node_id) DO UPDATE so that llm_summary and
+        related columns written by ``populate_summaries()`` are never clobbered
+        by a re-index of the same node.  New nodes get NULL (the schema default).
+        """
         if not nodes:
             return
 
+        # #309: Use INSERT … ON CONFLICT(node_id) DO UPDATE instead of
+        # INSERT OR REPLACE so that existing llm_summary / summary_model /
+        # summary_at are preserved.  INSERT OR REPLACE deletes the old row
+        # before inserting, which would wipe those columns.
         sql = """
-        INSERT OR REPLACE INTO repo_nodes (
+        INSERT INTO repo_nodes (
             node_id, rel_path, file_name, language,
             start_line, end_line,
             symbol_name, symbol_type, parent_symbol, analysis_level,
@@ -694,6 +733,33 @@ class UnifiedWikiDB:
             :macro_cluster, :micro_cluster, :is_hub, :hub_assignment,
             :api_surface
         )
+        ON CONFLICT(node_id) DO UPDATE SET
+            rel_path = excluded.rel_path,
+            file_name = excluded.file_name,
+            language = excluded.language,
+            start_line = excluded.start_line,
+            end_line = excluded.end_line,
+            symbol_name = excluded.symbol_name,
+            symbol_type = excluded.symbol_type,
+            parent_symbol = excluded.parent_symbol,
+            analysis_level = excluded.analysis_level,
+            source_text = excluded.source_text,
+            docstring = excluded.docstring,
+            signature = excluded.signature,
+            parameters = excluded.parameters,
+            return_type = excluded.return_type,
+            content_hash = excluded.content_hash,
+            is_architectural = excluded.is_architectural,
+            is_doc = excluded.is_doc,
+            is_test = excluded.is_test,
+            chunk_type = excluded.chunk_type,
+            macro_cluster = excluded.macro_cluster,
+            micro_cluster = excluded.micro_cluster,
+            is_hub = excluded.is_hub,
+            hub_assignment = excluded.hub_assignment,
+            api_surface = excluded.api_surface
+        -- llm_summary, summary_model, summary_at are intentionally excluded:
+        -- they are managed by populate_summaries() and must survive re-indexing.
         """
 
         rows = []
@@ -1287,6 +1353,88 @@ class UnifiedWikiDB:
             "populate_embeddings: %d/%d nodes embedded "
             "(arch_only=%s, workers=%d)",
             total, len(rows), architectural_only, max_workers,
+        )
+        return total
+
+    def populate_summaries(
+        self,
+        summary_fn: Callable[[list[str]], list[str]],
+        model_name: str = "",
+        batch_size: int = 20,
+        architectural_only: bool = True,
+    ) -> int:
+        """Generate LLM summaries for architectural nodes that lack one.
+
+        Skips nodes where ``llm_summary IS NOT NULL`` (already summarised).
+        Returns the count of summaries written.
+
+        Parameters
+        ----------
+        summary_fn : callable
+            ``(list[str]) -> list[str]`` — receives a batch of ``source_text``
+            strings and returns the same number of summary strings.
+        model_name : str
+            Model identifier stored in ``summary_model`` for provenance.
+        batch_size : int
+            Number of nodes per LLM call (default 20).
+        architectural_only : bool
+            When True (default), restrict to ``is_architectural = 1`` nodes.
+        """
+        _ws = " ' ' || char(9) || char(10) || char(13) "
+        arch_filter = " AND is_architectural = 1" if architectural_only else ""
+        rows = self.conn.execute(
+            "SELECT node_id, source_text FROM repo_nodes "  # noqa: S608
+            f"WHERE llm_summary IS NULL"
+            f" AND source_text IS NOT NULL"
+            f" AND length(trim(source_text, {_ws})) > 0"
+            f"{arch_filter}"
+        ).fetchall()
+
+        if not rows:
+            logger.info("populate_summaries: no nodes to summarise")
+            return 0
+
+        total = 0
+        t_start = time.time()
+        logger.info(
+            "populate_summaries: starting — %d nodes in %d batches "
+            "(batch_size=%d, arch_only=%s)",
+            len(rows), (len(rows) + batch_size - 1) // batch_size,
+            batch_size, architectural_only,
+        )
+
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i : i + batch_size]
+            node_ids = [r[0] for r in batch]
+            texts = [r[1] for r in batch]
+            try:
+                summaries = summary_fn(texts)
+            except Exception as exc:
+                logger.warning(
+                    "populate_summaries: batch %d–%d failed: %s",
+                    i, i + len(batch), exc,
+                )
+                continue
+
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            # Write None (NULL) for failed summaries so the node stays
+            # eligible for future runs — empty string satisfies IS NOT NULL
+            # and would permanently lock the node out of retries.
+            self.conn.executemany(
+                "UPDATE repo_nodes SET llm_summary = ?, summary_model = ?, summary_at = ? "
+                "WHERE node_id = ?",
+                [
+                    (summary or None, model_name, now, nid)
+                    for nid, summary in zip(node_ids, summaries, strict=True)
+                ],
+            )
+            total += sum(1 for s in summaries if s)
+
+        self.conn.commit()
+        elapsed = time.time() - t_start
+        logger.info(
+            "populate_summaries: %d/%d nodes summarised in %.1fs",
+            total, len(rows), elapsed,
         )
         return total
 

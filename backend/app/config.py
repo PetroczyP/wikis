@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -119,6 +119,16 @@ class Settings(BaseSettings):
     graph_enrichment_enabled: bool = True
     hub_z_threshold: float = 3.0
     vec_distance_threshold: float = 0.15
+
+    # #309 LLM node summaries
+    wiki_summarise_nodes: bool = Field(
+        default=False,
+        description=(
+            "Generate LLM summaries for architectural nodes during indexing. "
+            "Set WIKI_SUMMARISE_NODES=1 to enable. Off by default so existing "
+            "deployments are unaffected."
+        ),
+    )
 
     # App
     log_level: str = "INFO"

@@ -43,6 +43,12 @@ README excerpts, and SQL schema blocks.
 3. **Never invent symbols or paths.** If the evidence is insufficient and \
    the budget is exhausted, produce a reasonable name from the directory names.
 
+## Symbol summaries
+
+Each symbol in the evidence pack may include a `summary` field — a 2-3 sentence \
+description of its role. Use these summaries to choose accurate page titles and \
+descriptions. Do not invent functionality not reflected in the summaries.
+
 ## Output format
 
 For each cluster, respond with a **single JSON object** on its own line:

@@ -154,6 +154,10 @@ def _define_tables(
         # (REST/gRPC/GraphQL/FFI/BDD/CLI) extracted from the symbol's
         # source_text. NULL when nothing detected.
         Column("api_surface", JSONB),
+        # #309 LLM node summaries — populated on-demand via populate_summaries().
+        Column("llm_summary", Text),
+        Column("summary_model", Text),
+        Column("summary_at", Text),
         # tsvector column for FTS
         Column("fts_vector", Text),  # Will be cast to tsvector in DDL
         schema=schema,
@@ -424,6 +428,19 @@ class PostgresWikiStorage:
                     ) THEN
                         ALTER TABLE {schema}.repo_nodes
                             ADD COLUMN api_surface JSONB DEFAULT NULL;
+                    END IF;
+                    -- #309 LLM node summaries: llm_summary / summary_model / summary_at.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'repo_nodes'
+                          AND column_name = 'llm_summary'
+                    ) THEN
+                        ALTER TABLE {schema}.repo_nodes
+                            ADD COLUMN llm_summary TEXT DEFAULT NULL;
+                        ALTER TABLE {schema}.repo_nodes
+                            ADD COLUMN summary_model TEXT DEFAULT NULL;
+                        ALTER TABLE {schema}.repo_nodes
+                            ADD COLUMN summary_at TEXT DEFAULT NULL;
                     END IF;
                 END $$;
             """))
@@ -768,8 +785,15 @@ class PostgresWikiStorage:
             f"CAST(:{c} AS JSONB)" if c == "api_surface" else f":{c}"
             for c in cols
         )
+        # Exclude llm_summary / summary_model / summary_at from the UPDATE
+        # clause — those columns are never emitted by _normalize_node, so they
+        # won't appear in `cols` and are therefore naturally preserved on
+        # re-index. Leaving this comment ensures future developers don't
+        # accidentally add those fields to _normalize_node without understanding
+        # the implication: adding them would overwrite existing summaries.
+        _summary_cols = {"llm_summary", "summary_model", "summary_at"}
         update_set = ", ".join(
-            f"{c} = EXCLUDED.{c}" for c in cols if c != "node_id"
+            f"{c} = EXCLUDED.{c}" for c in cols if c != "node_id" and c not in _summary_cols
         )
 
         sql = text(
@@ -1330,6 +1354,91 @@ class PostgresWikiStorage:
             "populate_embeddings: %d/%d nodes embedded "
             "(arch_only=%s, workers=%d)",
             total, len(rows), architectural_only, max_workers,
+        )
+        return total
+
+    def populate_summaries(
+        self,
+        summary_fn: "Callable[[list[str]], list[str]]",
+        model_name: str = "",
+        batch_size: int = 20,
+        architectural_only: bool = True,
+    ) -> int:
+        """Generate LLM summaries for architectural nodes that lack one.
+
+        Skips nodes where ``llm_summary IS NOT NULL`` (already summarised).
+        Returns the count of summaries written.
+
+        Parameters
+        ----------
+        summary_fn : callable
+            ``(list[str]) -> list[str]`` — receives a batch of ``source_text``
+            strings and returns the same number of summary strings.
+        model_name : str
+            Model identifier stored in ``summary_model`` for provenance.
+        batch_size : int
+            Number of nodes per LLM call (default 20).
+        architectural_only : bool
+            When True (default), restrict to ``is_architectural = 1`` nodes.
+        """
+        import time as _time
+
+        arch_filter = " AND is_architectural = 1" if architectural_only else ""
+        query = text(
+            f"SELECT node_id, source_text FROM {self._schema}.repo_nodes "
+            f"WHERE llm_summary IS NULL"
+            f" AND source_text IS NOT NULL"
+            f" AND trim(source_text) != ''"
+            f"{arch_filter}"
+        )
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(query).fetchall()
+
+        if not rows:
+            logger.info("populate_summaries: no nodes to summarise")
+            return 0
+
+        total = 0
+        t_start = _time.time()
+        logger.info(
+            "populate_summaries: starting — %d nodes in %d batches (batch_size=%d)",
+            len(rows), (len(rows) + batch_size - 1) // batch_size, batch_size,
+        )
+
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i : i + batch_size]
+            node_ids = [r[0] for r in batch]
+            texts = [r[1] for r in batch]
+            try:
+                summaries = summary_fn(texts)
+            except Exception as exc:
+                logger.warning(
+                    "populate_summaries: batch %d–%d failed: %s",
+                    i, i + len(batch), exc,
+                )
+                continue
+
+            now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+            with self._engine.begin() as conn:
+                for nid, summary in zip(node_ids, summaries, strict=True):
+                    # Write None (NULL) for failed summaries — empty string
+                    # satisfies IS NOT NULL and would lock the node out of
+                    # future populate_summaries retries.
+                    conn.execute(
+                        text(
+                            f"UPDATE {self._schema}.repo_nodes "
+                            "SET llm_summary = :summary, summary_model = :model, summary_at = :at "
+                            "WHERE node_id = :nid"
+                        ),
+                        {"summary": summary or None, "model": model_name, "at": now, "nid": nid},
+                    )
+            total += sum(1 for s in summaries if s)
+
+        elapsed = _time.time() - t_start
+        logger.info(
+            "populate_summaries: %d/%d nodes summarised in %.1fs",
+            total, len(rows), elapsed,
         )
         return total
 
