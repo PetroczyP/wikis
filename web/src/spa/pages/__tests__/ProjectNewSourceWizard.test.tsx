@@ -1,13 +1,20 @@
 /**
  * @jest-environment jsdom
  *
- * #210 — Project Ingestion tab tests.
+ * Project-page "+ New source" wizard tests.
+ *
+ * The Ingestion tab was removed; new-wiki generation from the project page
+ * now opens the AddSourceWizard as a modal triggered by the "+ New source"
+ * dashed card on the Overview grid.
  *
  * Covers:
- *  1. Ingestion tab renders the AddSourceWizard inline when URL is /project/:id/ingestion
- *  2. Successful ingestion links the wiki to the project then navigates to the wiki
- *  3. addWikiToProject failure surfaces a warning snack but still navigates
- *  4. 409 already-exists routes to the existing wiki without calling addWikiToProject
+ *  1. Owner: the "+ New source" card opens the wizard modal.
+ *  2. Successful generation links the new wiki to the project and navigates
+ *     to /wiki/:id with the generating-indicator query params.
+ *  3. Link failure surfaces a warning but still navigates.
+ *  4. 409 already-exists routes to the existing wiki without calling addWikiToProject.
+ *  5. Legacy ``/project/:id/ingestion`` URLs redirect to ``/project/:id`` (no tab).
+ *  6. Non-owner: neither dashed card is rendered.
  */
 import '@testing-library/jest-dom';
 import React from 'react';
@@ -71,36 +78,13 @@ jest.mock('rehype-highlight', () => ({ __esModule: true, default: () => {} }));
 // ---------------------------------------------------------------------------
 // Mock mermaid-dependent components (mermaid ships ESM only)
 // ---------------------------------------------------------------------------
-jest.mock('../../components/MermaidDiagram', () => ({
-  MermaidDiagram: () => null,
-}));
-jest.mock('../../components/AnswerView', () => ({
-  AnswerView: () => null,
-}));
-jest.mock('../../components/AnswerHeader', () => ({
-  AnswerHeader: () => null,
-}));
-jest.mock('../../components/ToolCallPanel', () => ({
-  ToolCallPanel: () => null,
-}));
-jest.mock('../../components/CodeMapTree', () => ({
-  __esModule: true,
-  default: () => null,
-}));
-
-// ---------------------------------------------------------------------------
-// Mock RecomputeWidget — not relevant to these tests
-// ---------------------------------------------------------------------------
-jest.mock('../../components/RecomputeWidget', () => ({
-  RecomputeWidget: () => null,
-}));
-
-// ---------------------------------------------------------------------------
-// Mock AskBar — only present on the Overview tab, irrelevant here
-// ---------------------------------------------------------------------------
-jest.mock('../../components/AskBar', () => ({
-  AskBar: () => null,
-}));
+jest.mock('../../components/MermaidDiagram', () => ({ MermaidDiagram: () => null }));
+jest.mock('../../components/AnswerView', () => ({ AnswerView: () => null }));
+jest.mock('../../components/AnswerHeader', () => ({ AnswerHeader: () => null }));
+jest.mock('../../components/ToolCallPanel', () => ({ ToolCallPanel: () => null }));
+jest.mock('../../components/CodeMapTree', () => ({ __esModule: true, default: () => null }));
+jest.mock('../../components/RecomputeWidget', () => ({ RecomputeWidget: () => null }));
+jest.mock('../../components/AskBar', () => ({ AskBar: () => null }));
 
 // ---------------------------------------------------------------------------
 // Capture navigation calls
@@ -114,15 +98,8 @@ jest.mock('react-router-dom', () => {
   };
 });
 
-// ---------------------------------------------------------------------------
-// ProjectContext provider (used by ProjectPage)
-// ---------------------------------------------------------------------------
 import { ProjectProvider } from '../../context/ProjectContext';
 import { ProjectPage } from '../ProjectPage';
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 const PROJECT_ID = 'proj-123';
 
@@ -142,10 +119,7 @@ const mockProjectNonOwner = {
   is_owner: false,
 };
 
-function setup(
-  initialPath = `/project/${PROJECT_ID}/ingestion`,
-  project = mockProjectOwner,
-) {
+function setup(initialPath = `/project/${PROJECT_ID}`, project = mockProjectOwner) {
   mockGetProject.mockResolvedValue(project);
   mockListProjectWikis.mockResolvedValue({ wikis: [] });
 
@@ -168,7 +142,6 @@ function setup(
             </ProjectProvider>
           }
         />
-        {/* Catch-all so navigate() calls don't throw */}
         <Route path="*" element={<div data-testid="navigated-page" />} />
       </Routes>
     </MemoryRouter>,
@@ -192,21 +165,24 @@ beforeEach(() => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-describe('Project Ingestion tab (#210)', () => {
-  it('renders the AddSourceWizard inline when navigating to /ingestion', async () => {
+describe('Project page — "+ New source" wizard', () => {
+  it('owner: clicking "+ New source" opens the AddSourceWizard modal', async () => {
+    const user = userEvent.setup();
     setup();
-    // Wizard renders inline (no Dialog overlay) — the data-testid is on the root Box
+    // Wait for the project page to load and the dashed cards to render.
+    await screen.findByTestId('project-new-source');
+
+    // Wizard is NOT rendered initially.
+    expect(screen.queryByTestId('add-source-wizard')).not.toBeInTheDocument();
+
+    await user.click(screen.getByTestId('project-new-source'));
+
+    // Wizard now mounted.
     expect(await screen.findByTestId('add-source-wizard')).toBeInTheDocument();
-    // The wizard's stepper is visible
     expect(screen.getByText('Connector')).toBeInTheDocument();
-    expect(screen.getByText('Configure')).toBeInTheDocument();
   });
 
-  it('success: links wiki to project then navigates to new wiki with generating params', async () => {
+  it('success: links the new wiki to this project and navigates with generating params', async () => {
     const user = userEvent.setup();
     mockGenerateWikiMultiSource.mockResolvedValue({
       wiki_id: 'owner--repo--main',
@@ -217,9 +193,9 @@ describe('Project Ingestion tab (#210)', () => {
     mockAddWikiToProject.mockResolvedValue({ ...mockProjectOwner, wiki_count: 1 });
 
     setup();
+    await user.click(await screen.findByTestId('project-new-source'));
     await screen.findByTestId('add-source-wizard');
 
-    // Walk through the wizard steps
     await user.click(screen.getByTestId('connector-git'));
     await user.type(screen.getByTestId('git-repo-url'), 'https://github.com/owner/repo');
     await user.click(screen.getByTestId('wizard-next'));
@@ -227,20 +203,14 @@ describe('Project Ingestion tab (#210)', () => {
     await user.click(screen.getByTestId('wizard-next'));
     await user.click(screen.getByTestId('wizard-submit'));
 
-    // addWikiToProject must be called with the project id and new wiki id
     await waitFor(() =>
       expect(mockAddWikiToProject).toHaveBeenCalledWith(PROJECT_ID, 'owner--repo--main'),
     );
 
-    // navigate to the wiki with generating + invocation query params
-    await waitFor(() =>
-      expect(mockNavigate).toHaveBeenCalledWith(
-        expect.stringContaining('/wiki/owner--repo--main'),
-      ),
-    );
     const navCall = mockNavigate.mock.calls.find((args: string[]) =>
       (args[0] as string).includes('/wiki/owner--repo--main'),
     );
+    expect(navCall).toBeTruthy();
     expect(navCall?.[0]).toContain('generating=true');
     expect(navCall?.[0]).toContain('invocation=inv-42');
   });
@@ -253,10 +223,10 @@ describe('Project Ingestion tab (#210)', () => {
       status: 'generating',
       message: 'ok',
     });
-    // Simulate a link failure
     mockAddWikiToProject.mockRejectedValue(new Error('Server error'));
 
     setup();
+    await user.click(await screen.findByTestId('project-new-source'));
     await screen.findByTestId('add-source-wizard');
 
     await user.click(screen.getByTestId('connector-git'));
@@ -266,14 +236,12 @@ describe('Project Ingestion tab (#210)', () => {
     await user.click(screen.getByTestId('wizard-next'));
     await user.click(screen.getByTestId('wizard-submit'));
 
-    // Should still navigate despite link error
     await waitFor(() =>
       expect(mockNavigate).toHaveBeenCalledWith(
         expect.stringContaining('/wiki/owner--repo--main'),
       ),
     );
 
-    // Warning message appears on the ingestion tab
     expect(
       await screen.findByText(/could not be automatically linked/i),
     ).toBeInTheDocument();
@@ -288,6 +256,7 @@ describe('Project Ingestion tab (#210)', () => {
     mockGenerateWikiMultiSource.mockRejectedValue(conflictErr);
 
     setup();
+    await user.click(await screen.findByTestId('project-new-source'));
     await screen.findByTestId('add-source-wizard');
 
     await user.click(screen.getByTestId('connector-git'));
@@ -300,29 +269,84 @@ describe('Project Ingestion tab (#210)', () => {
     await waitFor(() =>
       expect(mockNavigate).toHaveBeenCalledWith('/wiki/existing-wiki-id'),
     );
-    // Must NOT attempt to link — wiki already exists
     expect(mockAddWikiToProject).not.toHaveBeenCalled();
   });
 
-  it('non-owner: direct link to /ingestion falls back to overview, no wizard rendered', async () => {
-    // A non-owner following a direct link to /project/:id/ingestion must
-    // land on the overview tab. The ingestion wizard must not render, and
-    // the Ingestion tab must not appear in the tab bar.
-    setup(`/project/${PROJECT_ID}/ingestion`, mockProjectNonOwner);
+  it('legacy /project/:id/ingestion URL redirects to /project/:id (no tab anymore)', async () => {
+    setup(`/project/${PROJECT_ID}/ingestion`, mockProjectOwner);
 
-    // Wait for load to complete — the project name is a reliable marker
+    await waitFor(() =>
+      expect(mockNavigate).toHaveBeenCalledWith(`/project/${PROJECT_ID}`, { replace: true }),
+    );
+  });
+
+  it('non-owner: neither dashed card is rendered', async () => {
+    setup(`/project/${PROJECT_ID}`, mockProjectNonOwner);
+
     expect(await screen.findByText('Test Project')).toBeInTheDocument();
 
-    // Overview tab is active (tab label present)
-    expect(screen.getByRole('tab', { name: 'Overview' })).toBeInTheDocument();
+    // Neither owner-only card is shown.
+    expect(screen.queryByTestId('project-new-source')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('project-add-repository')).not.toBeInTheDocument();
 
-    // Ingestion tab is NOT shown for non-owners
-    expect(screen.queryByTestId('tab-ingestion')).not.toBeInTheDocument();
-
-    // The inline wizard must not render
-    expect(screen.queryByTestId('add-source-wizard')).not.toBeInTheDocument();
-
-    // Overview content IS visible — the empty-wikis alert is shown for non-owners
+    // The empty-state alert is visible since this project has no wikis.
     expect(screen.getByText(/no wikis in this project yet/i)).toBeInTheDocument();
+  });
+
+  it('closing the wizard fully unmounts it and discards form state on next open', async () => {
+    // Regression for Copilot on #280: the wizard used to be rendered with
+    // ``open={false}`` while closed, which retained its component-local
+    // form state — including a pasted PAT.  Now the component is mounted
+    // ONLY while open, so closing fully unmounts and the next open starts
+    // fresh.
+    const user = userEvent.setup();
+    setup();
+    await user.click(await screen.findByTestId('project-new-source'));
+    await screen.findByTestId('add-source-wizard');
+
+    // Walk a couple of steps into the wizard with a pasted PAT.
+    await user.click(screen.getByTestId('connector-git'));
+    await user.type(screen.getByTestId('git-repo-url'), 'https://github.com/owner/repo');
+    await user.click(screen.getByRole('combobox', { name: /authentication/i }));
+    await user.click(await screen.findByText(/Paste token once/i));
+    await user.type(screen.getByTestId('pasted-pat-input'), 'ghp_secret_value');
+
+    // Cancel the wizard. The wizard is dirty (PAT was typed) so a
+    // "Discard changes?" confirm dialog pops up — confirm it.
+    await user.click(screen.getByRole('button', { name: /cancel/i }));
+    await user.click(await screen.findByTestId('wizard-discard-confirm-button'));
+
+    // Wizard must be fully gone from the DOM (not just hidden).
+    expect(screen.queryByTestId('add-source-wizard')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('pasted-pat-input')).not.toBeInTheDocument();
+
+    // Reopen — the wizard should mount fresh.  Walk back into the PAT
+    // field and verify the previously-pasted value is GONE.
+    await user.click(screen.getByTestId('project-new-source'));
+    await screen.findByTestId('add-source-wizard');
+    await user.click(screen.getByTestId('connector-git'));
+    await user.type(screen.getByTestId('git-repo-url'), 'https://github.com/owner/repo');
+    await user.click(screen.getByRole('combobox', { name: /authentication/i }));
+    await user.click(await screen.findByText(/Paste token once/i));
+
+    const patField = screen.getByTestId('pasted-pat-input') as HTMLInputElement;
+    expect(patField.value).toBe('');
+  });
+
+  it('DashboardPage also unmounts the wizard on close (source-level guard)', () => {
+    // DashboardPage has no jest test harness of its own. Rather than
+    // build one just for this guard, assert the unmount pattern exists
+    // in the source — Rio 2nd-pass on #280 noted the dashboard could
+    // silently regress to ``open={showGenerateModal}`` (always mounted)
+    // without this check.
+    const fs = require('fs') as typeof import('fs');
+    const path = require('path') as typeof import('path');
+    const dashboardSrc = fs.readFileSync(
+      path.resolve(__dirname, '../DashboardPage.tsx'),
+      'utf-8',
+    );
+    expect(dashboardSrc).toMatch(/\{showGenerateModal\s*&&\s*\(/);
+    // And NOT the always-mounted form that would retain form state.
+    expect(dashboardSrc).not.toMatch(/<AddSourceWizard[^>]*open=\{showGenerateModal\}/);
   });
 });

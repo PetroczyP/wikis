@@ -705,33 +705,34 @@ export function DashboardPage() {
       </Grid>}
 
       {/*
-        ``key={searchUrl.trim()}`` carries over from the legacy GenerateForm
-        flow: when the user pastes a URL into the search box and opens the
-        wizard, the wizard remounts so ``initialUrl`` re-seeds the Git form.
-        In practice the search box is rarely typed in while the wizard is
-        open, so the remount blast radius is small. Follow-up to refactor
-        as a controlled prop without remount is tracked alongside the
-        discriminated-union work (#215).
+        Mount the wizard only while it's open so closing fully unmounts the
+        component tree. Any pasted PAT or Atlassian API token in the
+        wizard's component-local state is discarded on close, and the next
+        open starts from ``INITIAL_FORM_DATA``. ``key={searchUrl.trim()}``
+        also ensures the wizard remounts when the user pastes a URL into
+        the search box and reopens — ``initialUrl`` re-seeds the Git form.
       */}
-      <AddSourceWizard
-        key={searchUrl.trim()}
-        open={showGenerateModal}
-        onClose={() => setShowGenerateModal(false)}
-        initialUrl={searchUrl.trim()}
-        onSuccess={(response) => {
-          setShowGenerateModal(false);
-          navigate(
-            `/wiki/${response.wiki_id}?generating=true&invocation=${response.invocation_id}`,
-          );
-        }}
-        onAlreadyExists={(existingWikiId) => {
-          // 409 — wiki already exists. Navigate to the existing wiki if
-          // the backend told us which one; otherwise just close (the
-          // dashboard card list will reflect reality on the next refetch).
-          setShowGenerateModal(false);
-          if (existingWikiId) navigate(`/wiki/${existingWikiId}`);
-        }}
-      />
+      {showGenerateModal && (
+        <AddSourceWizard
+          key={searchUrl.trim()}
+          open
+          onClose={() => setShowGenerateModal(false)}
+          initialUrl={searchUrl.trim()}
+          onSuccess={(response) => {
+            setShowGenerateModal(false);
+            navigate(
+              `/wiki/${response.wiki_id}?generating=true&invocation=${response.invocation_id}`,
+            );
+          }}
+          onAlreadyExists={(existingWikiId) => {
+            // 409 — wiki already exists. Navigate to the existing wiki if
+            // the backend told us which one; otherwise just close (the
+            // dashboard card list will reflect reality on the next refetch).
+            setShowGenerateModal(false);
+            if (existingWikiId) navigate(`/wiki/${existingWikiId}`);
+          }}
+        />
+      )}
 
       <ImportWikiDialog
         open={importDialogOpen}

@@ -23,7 +23,6 @@
 
 import { useCallback, useMemo, useState } from 'react';
 import {
-  Box,
   Button,
   Dialog,
   DialogActions,
@@ -34,7 +33,6 @@ import {
   Step,
   StepLabel,
   Stepper,
-  Typography,
 } from '@mui/material';
 import {
   generateWikiMultiSource,
@@ -70,21 +68,6 @@ interface AddSourceWizardProps {
    * conflict as an inline error message and stays open.
    */
   onAlreadyExists?: (existingWikiId: string | null) => void;
-  /**
-   * When true the wizard renders as a plain Box instead of an MUI Dialog.
-   * Use this when mounting the wizard inline on a page (e.g. the Project
-   * Ingestion tab) rather than as a modal overlay.
-   *
-   * The ``open`` prop is still respected — when ``inline=true`` and
-   * ``open=false`` the component renders nothing, keeping the same
-   * contract as the dialog variant for callers that gate on open.
-   *
-   * Note: the discard guard (``isDirty`` confirm prompt) is not triggered
-   * by navigation away from inline mode — there is no Cancel button or
-   * Dialog backdrop to intercept. Callers using ``inline`` mode are
-   * responsible for any "leaving page" confirmations if needed.
-   */
-  inline?: boolean;
 }
 
 const URL_PATTERN = /^(https?:\/\/|git@|file:\/\/|\/)/;
@@ -99,7 +82,6 @@ export function AddSourceWizard({
   initialUrl,
   onSuccess,
   onAlreadyExists,
-  inline = false,
 }: AddSourceWizardProps) {
   const [step, setStep] = useState<WizardStepIndex>(0);
   const [formData, setFormData] = useState<WizardFormData>(() => ({
@@ -417,9 +399,8 @@ export function AddSourceWizard({
     (step === 3); // Confirm uses Submit button, not Next
 
   // ---------------------------------------------------------------------
-  // Shared step content — rendered inside either the Dialog or the
-  // inline Box wrapper. Kept as a fragment so neither parent adds extra
-  // DOM layers.
+  // Shared step content — kept as a fragment so the parent Dialog
+  // doesn't add an extra DOM layer.
   // ---------------------------------------------------------------------
 
   const stepContent = (
@@ -500,11 +481,9 @@ export function AddSourceWizard({
           </Button>
         )}
       </Stack>
-      {!inline && (
-        <Button onClick={requestClose} disabled={submitting}>
-          Cancel
-        </Button>
-      )}
+      <Button onClick={requestClose} disabled={submitting}>
+        Cancel
+      </Button>
       {step < 3 && step > 0 && (
         <Button
           variant="contained"
@@ -528,7 +507,7 @@ export function AddSourceWizard({
     </>
   );
 
-  // Confirm-discard dialog — used by both inline and dialog variants.
+  // Confirm-discard dialog — fires when the wizard is dirty (Rio C5).
   const discardDialog = (
     <Dialog
       open={confirmDiscardOpen}
@@ -561,28 +540,7 @@ export function AddSourceWizard({
     </Dialog>
   );
 
-  // ------------------------------------------------------------------
-  // Inline variant — renders as a plain Box, no modal overlay.
-  // ------------------------------------------------------------------
-  if (inline) {
-    if (!open) return null;
-    return (
-      <Box data-testid="add-source-wizard">
-        <Typography variant="h6" sx={{ mb: 2 }}>
-          Add a source
-        </Typography>
-        <Box sx={{ mb: 2 }}>{stepContent}</Box>
-        <Stack direction="row" spacing={1} sx={{ mt: 2 }}>
-          {actionButtons}
-        </Stack>
-        {discardDialog}
-      </Box>
-    );
-  }
-
-  // ------------------------------------------------------------------
-  // Dialog variant (default) — original MUI Dialog wrapper.
-  // ------------------------------------------------------------------
+  // Dialog wrapper — the wizard always renders as a modal overlay.
   return (
     <Dialog
       open={open}

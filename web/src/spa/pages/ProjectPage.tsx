@@ -16,8 +16,6 @@ import {
   Grid,
   IconButton,
   Snackbar,
-  Tab,
-  Tabs,
   TextField,
   Tooltip,
   Typography,
@@ -115,12 +113,18 @@ function extractOwnerRepo(url: string): string {
   return url;
 }
 
-/** Tab identifiers for the project page. */
-type ProjectTab = 'overview' | 'ingestion';
-
 export function ProjectPage() {
   const { projectId, tab: tabParam } = useParams<{ projectId: string; tab?: string }>();
   const navigate = useNavigate();
+
+  // Legacy ``/project/:id/ingestion`` deep-links — the Ingestion tab is
+  // gone; the wizard now lives behind the "+ New source" card. Redirect
+  // any old links to the bare project page so they don't 404.
+  useEffect(() => {
+    if (tabParam === 'ingestion' && projectId) {
+      navigate(`/project/${projectId}`, { replace: true });
+    }
+  }, [tabParam, projectId, navigate]);
 
   const [project, setProject] = useState<ProjectResponse | null>(null);
   const [wikis, setWikis] = useState<WikiSummary[]>([]);
@@ -149,8 +153,12 @@ export function ProjectPage() {
   const [snackMessage, setSnackMessage] = useState<string | null>(null);
   const [snackSeverity, setSnackSeverity] = useState<'success' | 'error'>('error');
 
-  // Ingestion tab — snack for link errors (non-fatal; user still navigates).
-  const [ingestionLinkError, setIngestionLinkError] = useState<string | null>(null);
+  // "+ New source" wizard modal — opens the AddSourceWizard so owners can
+  // kick off a brand-new wiki generation without leaving the project page.
+  // ``wizardLinkError`` surfaces a non-fatal warning when the post-
+  // generation auto-link to this project fails.
+  const [newSourceWizardOpen, setNewSourceWizardOpen] = useState(false);
+  const [wizardLinkError, setWizardLinkError] = useState<string | null>(null);
 
   // Q&A state — mirrors WikiViewerPage pattern exactly
   const [chatTurns, setChatTurns] = useState<QATurn[]>([]);
@@ -224,14 +232,6 @@ export function ProjectPage() {
   }, [load]);
 
   const isOwner = project?.is_owner ?? false;
-
-  // Derive active tab from URL param, gated on ownership.
-  // A non-owner following a direct link to /project/:id/ingestion is silently
-  // redirected to 'overview'. isOwner is false until the project loads, but the
-  // loading spinner prevents any content from rendering during that window, so
-  // owners hitting /project/:id/ingestion directly see no flash.
-  const activeTab: ProjectTab =
-    tabParam === 'ingestion' && isOwner ? 'ingestion' : 'overview';
 
   // Wikis not yet in this project
   const memberIds = new Set(wikis.map((w) => w.wiki_id));
@@ -342,21 +342,22 @@ export function ProjectPage() {
     [project, showSnack],
   );
 
-  // Ingestion tab handlers
+  // New-source wizard handlers
   // -----------------------------------------------------------------------
-  // handleIngestionSuccess — called by the inline wizard after generation
-  // starts. Links the new wiki to the project, then navigates to the wiki
-  // with the generating indicator query params (same shape as the dashboard).
-  // If the link call fails we still navigate — the wiki was created, the
-  // user can add it to the project manually from the dashboard.
-  const handleIngestionSuccess = useCallback(
+  // handleNewSourceSuccess — called after the wizard kicks off generation.
+  // Links the new wiki to this project, then navigates to the wiki with
+  // generating-indicator query params (mirrors the dashboard flow). If the
+  // link call fails we still navigate — the wiki exists; the user can
+  // manually link it later via "+ Add repository".
+  const handleNewSourceSuccess = useCallback(
     async (response: GenerateWikiResponse) => {
+      setNewSourceWizardOpen(false);
       if (projectId) {
         try {
           await addWikiToProject(projectId, response.wiki_id);
         } catch {
-          setIngestionLinkError(
-            'Wiki generation started but it could not be automatically linked to this project. You can add it manually from the Wikis tab.',
+          setWizardLinkError(
+            'Wiki generation started but it could not be automatically linked to this project. You can add it manually via "+ Add repository".',
           );
         }
       }
@@ -367,12 +368,10 @@ export function ProjectPage() {
     [projectId, navigate],
   );
 
-  // handleIngestionAlreadyExists — 409: navigate to the existing wiki.
-  // We don't try to link because the wiki might already be in the project
-  // or the user may have just submitted a duplicate. Either way, navigating
-  // there is the correct UX.
-  const handleIngestionAlreadyExists = useCallback(
+  // handleNewSourceAlreadyExists — 409: navigate to the existing wiki.
+  const handleNewSourceAlreadyExists = useCallback(
     (existingWikiId: string | null) => {
+      setNewSourceWizardOpen(false);
       if (existingWikiId) {
         navigate(`/wiki/${existingWikiId}`);
       }
@@ -783,43 +782,16 @@ export function ProjectPage() {
 
       {projectId && <RecomputeWidget projectId={projectId} isOwner={isOwner} />}
 
-      {/* Tab bar */}
-      <Tabs
-        value={activeTab}
-        onChange={(_e, val: ProjectTab) => {
-          if (val === 'ingestion') {
-            navigate(`/project/${projectId}/ingestion`);
-          } else {
-            navigate(`/project/${projectId}`);
-          }
-        }}
-        sx={{ mb: 3, borderBottom: 1, borderColor: 'divider' }}
-      >
-        <Tab label="Overview" value="overview" />
-        {isOwner && <Tab label="Ingestion" value="ingestion" data-testid="tab-ingestion" />}
-      </Tabs>
-
-      {/* Ingestion tab content */}
-      {activeTab === 'ingestion' && isOwner && (
-        <Box sx={{ maxWidth: 600 }}>
-          {ingestionLinkError && (
-            <Alert severity="warning" sx={{ mb: 2 }} onClose={() => setIngestionLinkError(null)}>
-              {ingestionLinkError}
-            </Alert>
-          )}
-          <AddSourceWizard
-            open
-            inline
-            onClose={() => navigate(`/project/${projectId}`)}
-            onSuccess={(response) => void handleIngestionSuccess(response)}
-            onAlreadyExists={handleIngestionAlreadyExists}
-          />
-        </Box>
+      {wizardLinkError && (
+        <Alert
+          severity="warning"
+          sx={{ mb: 2 }}
+          onClose={() => setWizardLinkError(null)}
+        >
+          {wizardLinkError}
+        </Alert>
       )}
 
-      {/* Overview tab — wiki grid + AskBar */}
-      {activeTab === 'overview' && (
-        <>
       {wikis.length === 0 && !isOwner ? (
         <Alert severity="info">
           No wikis in this project yet.
@@ -827,33 +799,82 @@ export function ProjectPage() {
       ) : (
         <Grid container spacing={2.5} sx={{ mb: 4 }}>
           {isOwner && (
-            <Grid item xs={12} sm={6} md={4}>
-              <Card
-                variant="outlined"
-                sx={{
-                  height: 140,
-                  borderRadius: 3,
-                  border: '2px dashed',
-                  borderColor: 'divider',
-                  '&:hover': { borderColor: 'primary.main' },
-                }}
-              >
-                <CardActionArea
-                  onClick={() => setAddWikiModalOpen(true)}
+            <>
+              {/* "+ New source" — opens the AddSourceWizard to generate a
+                  brand-new wiki from Git / Confluence / Jira. */}
+              <Grid item xs={12} sm={6} md={4}>
+                <Card
+                  variant="outlined"
                   sx={{
-                    height: '100%',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    justifyContent: 'center',
+                    height: 140,
+                    borderRadius: 3,
+                    border: '2px dashed',
+                    borderColor: 'divider',
+                    '&:hover': { borderColor: 'primary.main' },
                   }}
                 >
-                  <AddIcon sx={{ fontSize: 32, color: 'text.secondary', mb: 1 }} />
-                  <Typography variant="body2" color="text.secondary">
-                    Add a source
-                  </Typography>
-                </CardActionArea>
-              </Card>
-            </Grid>
+                  <CardActionArea
+                    data-testid="project-new-source"
+                    onClick={() => setNewSourceWizardOpen(true)}
+                    sx={{
+                      height: '100%',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      justifyContent: 'center',
+                    }}
+                  >
+                    <AddIcon sx={{ fontSize: 32, color: 'text.secondary', mb: 1 }} />
+                    <Typography variant="body2" color="text.secondary" sx={{ fontWeight: 600 }}>
+                      New source
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      sx={{ mt: 0.25, opacity: 0.75 }}
+                    >
+                      Generate from Git / Confluence / Jira
+                    </Typography>
+                  </CardActionArea>
+                </Card>
+              </Grid>
+
+              {/* "+ Add repository" — link an existing wiki to this project. */}
+              <Grid item xs={12} sm={6} md={4}>
+                <Card
+                  variant="outlined"
+                  sx={{
+                    height: 140,
+                    borderRadius: 3,
+                    border: '2px dashed',
+                    borderColor: 'divider',
+                    '&:hover': { borderColor: 'primary.main' },
+                  }}
+                >
+                  <CardActionArea
+                    data-testid="project-add-repository"
+                    onClick={() => setAddWikiModalOpen(true)}
+                    sx={{
+                      height: '100%',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      justifyContent: 'center',
+                    }}
+                  >
+                    <AddIcon sx={{ fontSize: 32, color: 'text.secondary', mb: 1 }} />
+                    <Typography variant="body2" color="text.secondary" sx={{ fontWeight: 600 }}>
+                      Add repository
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      sx={{ mt: 0.25, opacity: 0.75 }}
+                    >
+                      Link an existing wiki
+                    </Typography>
+                  </CardActionArea>
+                </Card>
+              </Grid>
+            </>
           )}
           {wikis.map((wiki) => {
             const gradient = cardGradient(wiki.wiki_id);
@@ -987,7 +1008,23 @@ export function ProjectPage() {
           placeholder="Ask a question across all project wikis…"
         />
       )}
-        </>
+
+      {/* "+ New source" wizard — modal so it doesn't take over the page. */}
+      {/*
+        Conditionally mount the wizard so closing it FULLY unmounts the
+        component tree. The wizard holds form state (including any pasted
+        PAT or Atlassian API token) in component-local state — leaving it
+        mounted with ``open={false}`` would retain those credentials and
+        resume mid-step on reopen. Unmount-on-close is the simplest way
+        to guarantee a clean reset (Copilot review on #280).
+      */}
+      {isOwner && newSourceWizardOpen && (
+        <AddSourceWizard
+          open
+          onClose={() => setNewSourceWizardOpen(false)}
+          onSuccess={(response) => void handleNewSourceSuccess(response)}
+          onAlreadyExists={handleNewSourceAlreadyExists}
+        />
       )}
 
       {/* Edit Description Modal */}
