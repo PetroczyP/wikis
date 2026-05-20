@@ -37,6 +37,8 @@ from langchain_core.language_models import BaseChatModel
 from app.core.wiki_content_writer.citation_extractor import CitedClaim, extract_citations
 from app.core.wiki_content_writer.citation_verifier import VerifyReport, verify_citations
 from app.core.wiki_content_writer.source_gate import GateReport, ToolCall, apply_gate
+from app.core.wiki_content_writer.writer_agent import WikiContentWriter
+from app.core.wiki_content_writer.writer_tools import WriterTools
 from app.core.wiki_structure_planner.evidence import EvidencePack
 from app.core.wiki_structure_planner.planner_agent import (
     PageSpec,
@@ -113,55 +115,7 @@ class UnifiedPipelineResult:
     verify_reports: dict[int, VerifyReport] = field(default_factory=dict)
 
 
-# ── Writer stub ───────────────────────────────────────────────────────────────
-# The full WikiContentWriter.generate_page is implemented in #243's follow-up.
-# For now we call the LLM directly with a minimal prompt so the pipeline
-# end-to-end contract is exercisable.
-
-
-def _generate_page_markdown(
-    spec: PageSpec,
-    llm: BaseChatModel,
-) -> tuple[str, list[ToolCall]]:
-    """Generate markdown for *spec* via a direct LLM call.
-
-    Returns
-    -------
-    (markdown, tool_trace)
-        ``markdown`` – generated page content (may contain citation tokens).
-        ``tool_trace`` – list of ``ToolCall`` objects from the writer agent.
-        In this stub the tool trace is always empty because no tools are
-        actually invoked; the gate falls back to flag-only mode for the
-        identifier rule and can still strip README / SQL claims.
-    """
-    from langchain_core.messages import HumanMessage, SystemMessage  # noqa: PLC0415
-
-    system = (
-        "You are a technical documentation writer. "
-        "Write a detailed wiki page in Markdown based on the specification below. "
-        "Be accurate and concise. Do NOT invent symbol names or file paths. "
-        "Inline citation tokens like [path/to/file.py:1-10] after each claim."
-    )
-    user = (
-        f"## Page Title\n{spec.title}\n\n"
-        f"## Description\n{spec.description}\n\n"
-        f"## Retrieval Query\n{spec.retrieval_query}\n\n"
-        f"## Target Symbols\n{', '.join(spec.target_symbols) or 'none'}\n\n"
-        f"## Target Folders\n{', '.join(spec.target_folders) or 'none'}\n\n"
-        f"## Target Docs\n{', '.join(spec.target_docs) or 'none'}\n\n"
-        "Write the wiki page now."
-    )
-
-    try:
-        response = llm.invoke(
-            [SystemMessage(content=system), HumanMessage(content=user)]
-        )
-        content = response.content if isinstance(response.content, str) else str(response.content)
-    except Exception as exc:
-        logger.error("Writer LLM call failed for page %r: %s", spec.title, exc)
-        content = f"# {spec.title}\n\n{spec.description}\n"
-
-    return content, []
+# (stub removed in #285 — real writer agent is WikiContentWriter.generate_page)
 
 
 # ── Per-page pipeline ─────────────────────────────────────────────────────────
@@ -170,7 +124,7 @@ def _generate_page_markdown(
 def _run_page(
     spec: PageSpec,
     *,
-    llm: BaseChatModel,
+    writer: WikiContentWriter,
     verifier_llm: BaseChatModel,
     repo_root: str,
     name_index: set[str] | None,
@@ -181,8 +135,8 @@ def _run_page(
 
     Args:
         spec: Planner output for this page.
-        llm: Primary LLM used for content generation.
-        verifier_llm: LLM used for citation verification (may equal ``llm``).
+        writer: Pre-constructed WikiContentWriter (shared across pages).
+        verifier_llm: LLM used for citation verification.
         repo_root: Absolute path to the checked-out repository root.
         name_index: Set of known symbol names for identifier grounding.
         gate_mode: Per-rule gate actions (passed through to ``apply_gate``).
@@ -206,10 +160,12 @@ def _run_page(
 
     # ── 2. Generate content ───────────────────────────────────────────
     logger.info("[UNIFIED] writer: page_id=%d title=%r", page_id, spec.title)
-    raw_markdown, tool_trace = _generate_page_markdown(spec, llm)
+    raw_markdown, tool_trace = writer.generate_page(spec, stream_callback=stream_callback)
 
-    # ── 3. Emit writer.page_done ──────────────────────────────────────
+    # ── 3. Emit writer.page_done, then writer.zero_citations if applicable ────
     cited_claims_raw = extract_citations(raw_markdown)
+
+    # page_done fires first — SPA/SSE consumers treat it as the completion signal.
     if stream_callback:
         try:
             stream_callback({
@@ -219,6 +175,19 @@ def _run_page(
             })
         except Exception as cb_exc:
             logger.debug("stream_callback error (writer.page_done): %s", cb_exc)
+
+    # Zero-citation alarm fires after page_done as a follow-up operator signal.
+    if not cited_claims_raw or not any(c.citations for c in cited_claims_raw):
+        logger.warning(
+            "[UNIFIED] writer produced zero citations for page_id=%d title=%r",
+            page_id,
+            spec.title,
+        )
+        if stream_callback:
+            try:
+                stream_callback({"event": "writer.zero_citations", "page_id": page_id, "title": spec.title})
+            except Exception:
+                pass
 
     # ── 4. Source-kind gate ───────────────────────────────────────────
     logger.info(
@@ -492,11 +461,17 @@ def run_unified_pipeline(
     gate_reports: dict[int, GateReport] = {}
     verify_reports: dict[int, VerifyReport] = {}
 
+    # Build writer once — shared tools and LLM across all pages.
+    writer = WikiContentWriter(
+        tools=WriterTools(repo_root=repo_root),
+        llm_client=llm,
+    )
+
     for spec in page_specs:
         try:
             page, gate_report, verify_report = _run_page(
                 spec,
-                llm=llm,
+                writer=writer,
                 verifier_llm=effective_verifier_llm,
                 repo_root=repo_root,
                 name_index=name_index,

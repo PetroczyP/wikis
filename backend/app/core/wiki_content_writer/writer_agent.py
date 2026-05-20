@@ -1,4 +1,4 @@
-"""Wiki Content Writer — per-page deepagent shell (#237).
+"""Wiki Content Writer — per-page writer agent (#285).
 
 This module provides:
 
@@ -7,9 +7,8 @@ This module provides:
     spec.  Used by ``WikiContentWriter.compute_budget``.
 
 ``WikiContentWriter``
-    Class shell wired to a ``WriterTools`` instance.  Manages the per-page
-    deepagent lifecycle: budget calculation, agent construction, and (future)
-    page generation.
+    Class wired to a ``WriterTools`` instance.  Runs the per-page agentic
+    write loop: budget calculation → tool-augmented LLM call → markdown.
 
 Budget formula
 --------------
@@ -20,22 +19,22 @@ budget = base
        + 1 * count(target_docs)
 
 Soft target: 15-30 calls.  Hard cap: 80 calls.
-
-Out of scope in this PR (#237)
-------------------------------
-- Prompt text and citation contract (#11)
-- LLM verifier pass (#12)
-- Source-kind gating (#13)
-- Link resolver (#14)
-- Wiring into wiki_service / wiki_management (#243)
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable
 
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+
+from .prompts import CITATION_FORMAT_DESCRIPTION, CITATION_PROMPT_RULES
+from .source_gate import ToolCall
 from .writer_tools import WriterTools
+
+if TYPE_CHECKING:
+    from langchain_core.language_models import BaseChatModel
 
 logger = logging.getLogger(__name__)
 
@@ -91,28 +90,165 @@ def compute_page_budget(
 # ── WikiContentWriter ─────────────────────────────────────────────────────────
 
 
-class WikiContentWriter:
-    """Per-page deepagent shell for wiki content generation.
+# ── Writer tool schemas ───────────────────────────────────────────────────────
 
-    This class owns the lifecycle of a single page-generation run:
-    budget calculation → (future) agent construction → (future) page output.
+_WRITER_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read lines from a repo-relative file. "
+                "Use to find the exact line spans you will cite."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Repo-relative file path."},
+                    "start_line": {"type": "integer", "description": "1-indexed first line (optional)."},
+                    "end_line": {"type": "integer", "description": "1-indexed last line (optional)."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_signature",
+            "description": "Look up a symbol's signature, file path, and layer.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Symbol name to look up."},
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search for a text pattern across repository source files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Text pattern to search for."},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_callers",
+            "description": "List symbols that call the given symbol.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Symbol name."},
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_callees",
+            "description": "List symbols that the given symbol calls.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Symbol name."},
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_doc_chunks",
+            "description": "Return documentation chunks for a doc file path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doc_path": {"type": "string", "description": "Documentation file path."},
+                },
+                "required": ["doc_path"],
+            },
+        },
+    },
+]
+
+# System prompt prefix — matches the role-detection prefix in integration tests.
+_SYSTEM_PROMPT_PREFIX = "You are a technical documentation writer."
+
+_SYSTEM_PROMPT_TEMPLATE = """{prefix}
+
+Your job is to write a detailed, accurate wiki page in Markdown based on the
+page specification and your tool results.
+
+## Citation contract
+
+{format_description}
+
+Rules:
+{rules}
+
+## Worked examples
+
+A claim ending with a single-line citation:
+  "The token is validated in `verify_token` [api/auth.py:42]."
+
+A claim ending with a range citation:
+  "Session expiry logic lives in the middleware [middleware/session.py:10-30]."
+
+A paragraph citing two files:
+  "Config is loaded from environment [config.py:5-12] and merged with defaults
+  [config.py:40-48]."
+
+IMPORTANT: every substantive paragraph MUST end with at least one citation in
+the format shown above. A paragraph with no citation will be stripped by the
+verifier.  Start by calling tools to read the relevant files, then write the
+page with inline citations after every claim.
+"""
+
+_USER_PROMPT_TEMPLATE = """\
+## Page to write
+
+**Title:** {title}
+**Description:** {description}
+**Retrieval query:** {retrieval_query}
+
+**Target symbols:** {symbols}
+**Target folders:** {folders}
+**Target docs:** {docs}
+
+First, read the most relevant files from target symbols / folders using the
+available tools.  Then write the complete wiki page in Markdown with inline
+`[path:N]` or `[path:lo-hi]` citations after every claim.
+"""
+
+
+class WikiContentWriter:
+    """Per-page writer agent for wiki content generation.
+
+    Runs a manual tool-augmented LLM loop: the LLM may call ``read_file``,
+    ``get_signature``, ``grep``, etc. to explore the repository, then writes
+    the final page with inline citation tokens.
 
     Parameters
     ----------
     tools : WriterTools
         Tool surface the agent uses to explore the repository.
     llm_client : BaseChatModel | None
-        Pre-configured LangChain chat model.  If ``None``, the agent will
-        need to be provided one before ``generate_page`` can be called.
-        # TODO #243: make required once wired into wiki_service
+        Pre-configured LangChain chat model.
     max_iterations : int
-        Hard iteration ceiling passed to the deepagent.  Defaults to
-        ``BUDGET_HARD_CAP`` (the formula ensures the agent never needs more).
-
-    Notes
-    -----
-    Actual page generation (prompts, citation contract, verifier) is
-    implemented in subsequent issues (#11, #12, #13, #14) and wired in #243.
+        Hard iteration ceiling.  Defaults to ``BUDGET_HARD_CAP``.
     """
 
     def __init__(
@@ -162,10 +298,231 @@ class WikiContentWriter:
             base=int(page_spec.get("base", 5)),
         )
 
-    # ── Future: generate_page ─────────────────────────────────────────────
+    # ── generate_page ─────────────────────────────────────────────────────
 
-    # TODO #243: implement generate_page(page_spec, wiki_id) -> WikiPage
-    #   - compute budget from page_spec
-    #   - build deepagent with tools.read_file / get_signature / etc.
-    #   - run agent with max_iterations = compute_budget(page_spec)
-    #   - apply citation contract (#11) + verifier (#12)
+    def generate_page(
+        self,
+        page_spec: Any,  # PageSpec dataclass or dict — both supported
+        *,
+        llm: Any | None = None,
+        stream_callback: Callable[[dict], None] | None = None,
+    ) -> tuple[str, list[ToolCall]]:
+        """Generate markdown for one wiki page with tool-augmented LLM calls.
+
+        Runs a bounded tool-call loop: the LLM may invoke ``read_file``,
+        ``get_signature``, ``grep``, etc. to ground its claims, then writes
+        the page with inline ``[path:N]`` citations.
+
+        Parameters
+        ----------
+        page_spec:
+            Either a ``PageSpec`` dataclass (from the planner) or a plain dict
+            with the same fields.  Required keys: ``title``, ``description``,
+            ``retrieval_query``, ``target_symbols``, ``target_folders``,
+            ``target_docs``.
+        llm:
+            Override LLM for this call.  Falls back to ``self.llm_client``.
+        stream_callback:
+            Optional event emitter.  Receives a dict per tool call.
+
+        Returns
+        -------
+        (markdown, tool_trace)
+            ``markdown`` — final page content (may contain citation tokens).
+            ``tool_trace`` — list of ``ToolCall`` objects from the agent loop.
+        """
+        effective_llm = llm if llm is not None else self.llm_client
+        if effective_llm is None:
+            raise ValueError("generate_page: no LLM configured (pass llm= or set llm_client)")
+
+        # Normalise spec to dict-like access
+        if isinstance(page_spec, dict):
+            spec = page_spec
+        else:
+            # PageSpec dataclass
+            spec = {
+                "title": getattr(page_spec, "title", ""),
+                "description": getattr(page_spec, "description", ""),
+                "retrieval_query": getattr(page_spec, "retrieval_query", ""),
+                "target_symbols": getattr(page_spec, "target_symbols", []),
+                "target_folders": getattr(page_spec, "target_folders", []),
+                "target_docs": getattr(page_spec, "target_docs", []),
+            }
+
+        title = spec.get("title", "")
+        description = spec.get("description", "")
+        retrieval_query = spec.get("retrieval_query", "")
+        target_symbols = spec.get("target_symbols", [])
+        target_folders = spec.get("target_folders", [])
+        target_docs = spec.get("target_docs", [])
+
+        budget = self.compute_budget(spec)
+        logger.info("[WRITER] generate_page: title=%r budget=%d", title, budget)
+
+        system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+            prefix=_SYSTEM_PROMPT_PREFIX,
+            format_description=CITATION_FORMAT_DESCRIPTION,
+            rules="\n".join(f"{i + 1}. {r}" for i, r in enumerate(CITATION_PROMPT_RULES)),
+        )
+        user_prompt = _USER_PROMPT_TEMPLATE.format(
+            title=title,
+            description=description,
+            retrieval_query=retrieval_query,
+            symbols=", ".join(str(s) for s in target_symbols) or "none",
+            folders=", ".join(str(f) for f in target_folders) or "none",
+            docs=", ".join(str(d) for d in target_docs) or "none",
+        )
+
+        # Bind tools; fall back to bare LLM if provider does not support bind_tools.
+        # Catches AttributeError (Runnable wrappers like .with_retry/.with_fallbacks
+        # that don't expose bind_tools), NotImplementedError (providers that declare
+        # but don't implement it), and TypeError (sig-mismatched wrappers).
+        try:
+            llm_with_tools = effective_llm.bind_tools(_WRITER_TOOL_SCHEMAS)
+        except (AttributeError, NotImplementedError, TypeError) as exc:
+            logger.warning("[WRITER] bind_tools not available (%s); tool calls disabled", exc)
+            llm_with_tools = effective_llm
+
+        messages: list[Any] = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ]
+
+        tool_trace: list[ToolCall] = []
+        # Cap is expressed in total tool invocations, matching the docstring's
+        # "tool-call budget" language.  A single LLM response may contain N
+        # tool calls, so we track the cumulative count — not the round count —
+        # to ensure we never exceed BUDGET_HARD_CAP.
+        tool_call_budget = min(budget, self.max_iterations)
+        tool_calls_made = 0
+        content = ""
+
+        for _round in range(tool_call_budget):
+            response = llm_with_tools.invoke(messages)
+            tool_calls = getattr(response, "tool_calls", None) or []
+
+            if not tool_calls:
+                # LLM wrote the page — done.
+                content = response.content if isinstance(response.content, str) else str(response.content)
+                break
+
+            # Execute each tool call and append results to the message thread.
+            messages.append(response)
+            for tc in tool_calls:
+                # Guard: stop immediately if we've hit the tool-call budget.
+                if tool_calls_made >= tool_call_budget:
+                    logger.warning(
+                        "[WRITER] tool-call budget (%d) reached mid-response; skipping remaining calls",
+                        tool_call_budget,
+                    )
+                    break
+
+                tc_name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+                tc_args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+                tc_id = tc.get("id", str(_round)) if isinstance(tc, dict) else getattr(tc, "id", str(_round))
+
+                # Coerce tc_args to dict — some providers/versions return a
+                # JSON string instead of a pre-parsed dict.  Without this,
+                # str.get(...) returns None, _dispatch_tool is called with
+                # path="", read_file returns "[empty file]", the LLM produces
+                # uncited prose, and the verifier strips it (the empty-page
+                # regression this PR is fixing).
+                if isinstance(tc_args, str):
+                    try:
+                        tc_args = json.loads(tc_args)
+                    except json.JSONDecodeError:
+                        tc_args = {}
+                if not isinstance(tc_args, dict):
+                    tc_args = {}
+
+                result_text = self._dispatch_tool(tc_name, tc_args)
+                tool_calls_made += 1
+
+                tool_trace.append(ToolCall(tool=tc_name, args=tc_args, result_text=result_text))
+
+                if stream_callback:
+                    try:
+                        stream_callback({"event": "writer.tool_call", "tool": tc_name, "args": tc_args})
+                    except Exception:
+                        pass
+
+                messages.append(
+                    ToolMessage(content=result_text, tool_call_id=tc_id, name=tc_name)
+                )
+
+            logger.debug(
+                "[WRITER] tool round %d/%d: %d calls this round, %d total",
+                _round + 1,
+                tool_call_budget,
+                len(tool_calls),
+                tool_calls_made,
+            )
+
+            # Break after appending results if the budget was hit during this round.
+            if tool_calls_made >= tool_call_budget:
+                break
+
+        if not content:
+            # Budget exhausted without a final write — ask for the page now.
+            try:
+                response = effective_llm.invoke(messages)
+                content = response.content if isinstance(response.content, str) else str(response.content)
+            except Exception as exc:
+                logger.error("[WRITER] final write call failed: %s", exc)
+                content = f"# {title}\n\n{description}\n"
+
+        logger.info("[WRITER] generate_page done: title=%r chars=%d tool_calls=%d", title, len(content), len(tool_trace))
+        return content, tool_trace
+
+    # ── Tool dispatch ─────────────────────────────────────────────────────
+
+    def _dispatch_tool(self, name: str, args: dict[str, Any]) -> str:
+        """Route a tool call to the appropriate WriterTools method."""
+        try:
+            if name == "read_file":
+                path = args.get("path", "")
+                start = args.get("start_line")
+                end = args.get("end_line")
+                line_range = (int(start), int(end)) if start is not None and end is not None else None
+                result = self.tools.read_file(path, line_range=line_range)
+                if result.error:
+                    return f"[error] {result.error}"
+                lines = result.lines
+                numbered = "\n".join(f"{i + (line_range[0] if line_range else 1)}: {ln}" for i, ln in enumerate(lines))
+                return numbered or "[empty file]"
+
+            if name == "get_signature":
+                sig = self.tools.get_signature(args.get("symbol", ""))
+                if not sig.found:
+                    return f"[not found] {sig.symbol}"
+                return f"{sig.file_path}: {sig.signature} ({sig.layer})\n{sig.docstring}"
+
+            if name == "grep":
+                matches = self.tools.grep(args.get("pattern", ""))
+                if not matches:
+                    return "[no matches]"
+                return "\n".join(f"{m.file_path}:{m.line_number}: {m.line_text}" for m in matches[:20])
+
+            if name == "get_callers":
+                result = self.tools.get_callers(args.get("symbol", ""))
+                if not result.callers:
+                    return "[no callers]" if result.found else "[not found]"
+                return "\n".join(f"{c.file_path}: {c.symbol}" for c in result.callers)
+
+            if name == "get_callees":
+                result = self.tools.get_callees(args.get("symbol", ""))
+                if not result.callees:
+                    return "[no callees]" if result.found else "[not found]"
+                return "\n".join(f"{c.file_path}: {c.symbol}" for c in result.callees)
+
+            if name == "list_doc_chunks":
+                chunks = self.tools.list_doc_chunks(args.get("doc_path", ""))
+                if not chunks:
+                    return "[no chunks]"
+                return "\n".join(f"[{c.chunk_index}] {c.heading}\n{c.text}" for c in chunks)
+
+        except Exception as exc:
+            logger.warning("[WRITER] tool %r failed: %s", name, exc)
+            return f"[error] {exc}"
+
+        return f"[error] unknown tool: {name!r}"
