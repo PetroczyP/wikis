@@ -23,6 +23,7 @@ Soft target: 15-30 calls.  Hard cap: 80 calls.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import TYPE_CHECKING, Any, Callable
@@ -38,6 +39,8 @@ from .writer_tools import WriterTools
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
+    from app.core.wiki_structure_planner.evidence import EvidenceSlice
+    from app.core.wiki_structure_planner.planner_agent import ChapterSpec, SubPageSpec
 
 logger = logging.getLogger(__name__)
 
@@ -469,6 +472,139 @@ class WikiContentWriter:
 
         logger.info("[WRITER] generate_page done: title=%r chars=%d tool_calls=%d", title, len(content), len(tool_trace))
         return content, tool_trace
+
+    # ── generate_chapter ──────────────────────────────────────────────────
+
+    async def generate_chapter(
+        self,
+        chapter_spec: "ChapterSpec",
+        evidence_slices: "list[EvidenceSlice]",
+        *,
+        stream_callback: Callable[[dict], None] | None = None,
+    ) -> tuple[str, list[str]]:
+        """Generate a chapter: N sub-pages in parallel + one chapter index.
+
+        For each ``(subpage, evidence_slice)`` pair in
+        ``zip(chapter_spec.subpages, evidence_slices)``, builds a
+        page-spec dict and calls ``self.generate_page`` in parallel via
+        ``asyncio.gather``.  After all sub-pages are done, generates the
+        chapter index: a short LLM-written overview paragraph followed by a
+        ``[[wikilink]]`` TOC.
+
+        Parameters
+        ----------
+        chapter_spec :
+            Chapter produced by ``run_planner_chaptered``.
+        evidence_slices :
+            One ``EvidenceSlice`` per subpage (zipped by position).
+        stream_callback :
+            Optional SSE event emitter.  Receives ``writer.tool_call`` and
+            ``writer.subpage_oversized`` events in addition to all per-page
+            events from ``generate_page``.
+
+        Returns
+        -------
+        (chapter_index_markdown, list_of_subpage_markdowns)
+            ``chapter_index_markdown`` — short overview + ``[[wikilink]]`` TOC.
+            ``list_of_subpage_markdowns`` — one entry per sub-page (never empty
+            when subpages exist; fallback applied on per-subpage error).
+        """
+        loop = asyncio.get_running_loop()
+
+        subpages = chapter_spec.subpages
+
+        async def _generate_one(sp: "SubPageSpec", sl: "EvidenceSlice") -> str:
+            """Generate one sub-page; return fallback markdown on any error."""
+            page_spec_dict = {
+                "title": sp.title,
+                "description": sp.description,
+                "retrieval_query": sp.retrieval_query,
+                "target_symbols": sl.symbols,
+                "target_folders": sl.file_paths,
+                "target_docs": sl.doc_paths,
+                "cluster_id": chapter_spec.cluster_id,
+            }
+            try:
+                md, _ = await loop.run_in_executor(
+                    None,
+                    lambda: self.generate_page(page_spec_dict, stream_callback=stream_callback),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[WRITER] generate_chapter sub-page failed: title=%r error=%s",
+                    sp.title,
+                    exc,
+                )
+                md = f"# {sp.title}\n\n{sp.description}\n"
+
+            n_lines = md.count("\n")
+            if n_lines > 250:
+                logger.info(
+                    "[WRITER] sub-page oversized: title=%r lines=%d",
+                    sp.title,
+                    n_lines,
+                )
+                if stream_callback:
+                    try:
+                        stream_callback({
+                            "event": "writer.subpage_oversized",
+                            "title": sp.title,
+                            "lines": n_lines,
+                            "cluster_id": chapter_spec.cluster_id,
+                        })
+                    except Exception:
+                        pass
+
+            return md
+
+        # ── 1. Generate all sub-pages in parallel ─────────────────────
+        tasks = [
+            _generate_one(sp, sl)
+            for sp, sl in zip(subpages, evidence_slices)
+        ]
+        subpage_mds: list[str] = list(await asyncio.gather(*tasks))
+
+        # ── 2. Build chapter index via a direct LLM call ──────────────
+        # LLM writes ONLY the 2-3 sentence overview — no TOC in the prompt.
+        # The static [[wikilink]] TOC is appended deterministically after,
+        # so we never ask the LLM to reproduce it (which would double it).
+        index_prompt = (
+            f'Write a brief 2-3 sentence overview of the chapter '
+            f'"{chapter_spec.chapter_title}": {chapter_spec.chapter_description}. '
+            f"Focus on what the reader will learn and the key components covered. "
+            f"Output only the overview paragraph — do not list sub-pages."
+        )
+
+        effective_llm = self.llm_client
+        index_overview = ""
+        if effective_llm is not None:
+            try:
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: effective_llm.invoke([HumanMessage(content=index_prompt)]),
+                )
+                index_overview = (
+                    response.content
+                    if isinstance(response.content, str)
+                    else str(response.content)
+                )
+            except Exception as exc:
+                logger.warning("[WRITER] chapter index LLM call failed: %s", exc)
+
+        # ── 3. Append the [[wikilink]] TOC deterministically ─────────
+        toc_wikilinks = "\n".join(
+            f"- [[{sp.title}]]: {sp.description}"
+            for sp in subpages
+        )
+        chapter_index_md = f"{index_overview}\n\n{toc_wikilinks}".strip()
+
+        logger.info(
+            "[WRITER] generate_chapter done: title=%r subpages=%d index_chars=%d",
+            chapter_spec.chapter_title,
+            len(subpage_mds),
+            len(chapter_index_md),
+        )
+        return chapter_index_md, subpage_mds
 
     # ── Tool dispatch ─────────────────────────────────────────────────────
 

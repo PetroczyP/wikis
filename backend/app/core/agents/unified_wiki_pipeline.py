@@ -27,6 +27,7 @@ Public API
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -375,40 +376,133 @@ def run_unified_pipeline(
 
     flags = get_feature_flags()
     if flags.chaptered_pages:
-        # Chaptered path (#287): run_planner_chaptered now returns a tuple
-        # (list[ChapterSpec], dict[cluster_id, list[EvidenceSlice]]) (#289).
-        # The chapter_evidence dict is threaded through for the writer (#290);
-        # for now we flatten to PageSpec to keep the existing writer path.
+        # Chaptered path (#290): generate_chapter runs N sub-pages in parallel
+        # + synthesises a chapter index with [[wikilink]] TOC.
         chapters: list[ChapterSpec]
         chapter_evidence: dict[int, list[EvidenceSlice]]
         chapters, chapter_evidence = run_planner_chaptered(
             skeleton, evidence_packs, llm=llm, repo_root=repo_root, storage=storage,
         )
-        page_specs = []
-        for ch in chapters:
-            if not ch.subpages:
-                continue
-            first_sp = ch.subpages[0]
-            page_specs.append(PageSpec(
-                cluster_id=ch.cluster_id,
-                title=ch.chapter_title,
-                description=ch.chapter_description,
-                retrieval_query=first_sp.retrieval_query,
-                target_symbols=first_sp.target_symbols,
-                target_folders=first_sp.target_folders,
-                target_docs=first_sp.target_docs,
-            ))
+
+        # Build the plan_report before entering the writer phase.
+        n_subpages_total = sum(len(ch.subpages) for ch in chapters)
         plan_report = PlanReport(
             tool_budget_total=3 * len(chapters),
             tool_budget_used=0,
             tool_budget_exceeded=False,
-            pages_emitted=len(page_specs),
+            # Each chapter emits 1 index page + N sub-pages.
+            pages_emitted=len(chapters) + n_subpages_total,
             notes=[],
         )
         logger.info(
             "[UNIFIED] chaptered: %d chapters, %d clusters with evidence slices",
             len(chapters),
             len(chapter_evidence),
+        )
+
+        if stream_callback:
+            try:
+                stream_callback({
+                    "event": "planner.done",
+                    "pages_emitted": plan_report.pages_emitted,
+                    "tool_budget_used": plan_report.tool_budget_used,
+                    "tool_budget_total": plan_report.tool_budget_total,
+                    "tool_budget_exceeded": plan_report.tool_budget_exceeded,
+                    "notes": plan_report.notes,
+                })
+            except Exception as cb_exc:
+                logger.debug("stream_callback error (planner.done chaptered): %s", cb_exc)
+
+        # Build writer once — shared across all chapters.
+        chapter_writer = WikiContentWriter(
+            tools=WriterTools(repo_root=repo_root, storage=storage),
+            llm_client=llm,
+        )
+
+        chapter_pages: list[GeneratedPage] = []
+        chapter_gate_reports: dict[int, GateReport] = {}
+
+        for ch in chapters:
+            slices = chapter_evidence.get(ch.cluster_id, [])
+            if len(slices) < len(ch.subpages):
+                logger.warning(
+                    "[UNIFIED] chapter cluster_id=%d has %d subpages but only %d slices; "
+                    "trailing subpages will use empty evidence",
+                    ch.cluster_id, len(ch.subpages), len(slices),
+                )
+            try:
+                # Use new_event_loop / run_until_complete / close instead of
+                # asyncio.run() — safe both inside and outside a running loop.
+                _loop = asyncio.new_event_loop()
+                try:
+                    index_md, subpage_mds = _loop.run_until_complete(
+                        chapter_writer.generate_chapter(
+                            ch, slices, stream_callback=stream_callback,
+                        )
+                    )
+                finally:
+                    _loop.close()
+            except Exception as exc:
+                logger.error(
+                    "[UNIFIED] generate_chapter failed for cluster_id=%d title=%r: %s",
+                    ch.cluster_id,
+                    ch.chapter_title,
+                    exc,
+                    exc_info=True,
+                )
+                index_md = f"# {ch.chapter_title}\n\n{ch.chapter_description}\n"
+                subpage_mds = [
+                    f"# {sp.title}\n\n{sp.description}\n"
+                    for sp in ch.subpages
+                ]
+
+            # Chapter index page
+            chapter_pages.append(GeneratedPage(
+                page_id=ch.cluster_id,
+                title=ch.chapter_title,
+                description=ch.chapter_description,
+                markdown=index_md,
+                metadata={"is_chapter_index": True},
+            ))
+            chapter_gate_reports[ch.cluster_id] = GateReport()
+
+            # Sub-pages — zip_longest so length mismatch produces a fallback
+            # markdown rather than silently dropping trailing sub-pages.
+            import itertools  # noqa: PLC0415
+            _fallback_md = lambda sp: f"# {sp.title}\n\n{sp.description}\n"  # noqa: E731
+            for i, (sp, md) in enumerate(itertools.zip_longest(
+                ch.subpages,
+                subpage_mds,
+                fillvalue=None,
+            )):
+                if sp is None:
+                    continue  # extra markdown with no subpage spec — skip
+                if md is None:
+                    logger.warning(
+                        "[UNIFIED] no markdown for subpage %r cluster_id=%d — using fallback",
+                        sp.title, ch.cluster_id,
+                    )
+                    md = _fallback_md(sp)
+                sub_page_id = ch.cluster_id * 1000 + i
+                chapter_pages.append(GeneratedPage(
+                    page_id=sub_page_id,
+                    title=sp.title,
+                    description=sp.description,
+                    markdown=md,
+                    metadata={"chapter_cluster_id": ch.cluster_id, "subpage_index": i},
+                ))
+                chapter_gate_reports[sub_page_id] = GateReport()
+
+        logger.info(
+            "[UNIFIED] chaptered pipeline complete: chapters=%d pages=%d",
+            len(chapters),
+            len(chapter_pages),
+        )
+
+        return UnifiedPipelineResult(
+            pages=chapter_pages,
+            plan_report=plan_report,
+            gate_reports=chapter_gate_reports,
         )
     else:
         page_specs, plan_report = run_planner_with_report(

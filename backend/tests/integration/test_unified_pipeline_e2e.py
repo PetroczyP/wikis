@@ -554,3 +554,211 @@ class TestTinyJiraAdversarial:
         assert "AUTH-1" in page.markdown, (
             "The legitimate AUTH-1 paragraph should survive after SQL stripping"
         )
+
+
+# ── Chaptered pipeline (#290) ─────────────────────────────────────────────────
+
+
+def _chaptered_planner_json(
+    chapter_title: str,
+    chapter_description: str,
+    subpage_titles: list[str],
+) -> str:
+    """Return a JSON string matching the chaptered planner's expected format."""
+    subpages = [
+        {
+            "title": t,
+            "description": f"Description for {t}.",
+            "page_order": i + 1,
+            "retrieval_query": t.lower().replace(" ", " "),
+            "target_symbols": [],
+            "target_folders": [],
+            "target_docs": [],
+        }
+        for i, t in enumerate(subpage_titles)
+    ]
+    return json.dumps({
+        "chapter_title": chapter_title,
+        "chapter_description": chapter_description,
+        "subpages": subpages,
+    })
+
+
+class ChapteredFakeLLM(BaseChatModel):
+    """FakeLLM for the chaptered pipeline.
+
+    The chaptered planner receives a system prompt that does NOT start with
+    "You are a technical documentation writer", so we detect roles by checking
+    whether the system prompt contains "writer".
+
+    - Planner call → returns ``planner_response`` (chaptered JSON).
+    - Writer call → returns ``writer_response`` (sub-page markdown).
+    - Chapter index call → returns ``index_response`` (index markdown).
+    """
+
+    planner_response: str = ""
+    writer_response: str = ""
+    index_response: str = ""
+    record_calls: list[dict] = []
+    model_name: str = "chaptered-fake"
+
+    @property
+    def _llm_type(self) -> str:
+        return "chaptered-fake"
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self.record_calls.append({"messages": messages})
+
+        system_content = ""
+        for msg in messages:
+            if hasattr(msg, "type") and msg.type == "system":
+                system_content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                break
+            if msg.__class__.__name__ == "SystemMessage":
+                system_content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                break
+
+        # Writer role detection (system prompt starts with the writer prefix).
+        if system_content.startswith("You are a technical documentation writer"):
+            text = self.writer_response
+        # Chapter index: no system prompt (direct HumanMessage to LLM).
+        elif not system_content:
+            text = self.index_response
+        else:
+            text = self.planner_response
+
+        msg = AIMessage(content=text)
+        msg.tool_calls = []  # type: ignore[attr-defined]
+        return ChatResult(generations=[ChatGeneration(message=msg)])
+
+    def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        raise NotImplementedError
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> "ChapteredFakeLLM":
+        return self
+
+
+class TestChapteredPipeline:
+    """Integration: WIKIS_CHAPTERED_PAGES=1 → 1 index page + N sub-pages per chapter."""
+
+    _REPO = str(_FIXTURES_DIR / "tiny_code_repo")
+
+    def _skeleton(self) -> StructureSkeleton:
+        cluster = _make_cluster(
+            cluster_id=1, kind="code",
+            dirs=["src/auth"],
+            artifact_name="AuthService",
+            artifact_path="src/auth/service.py",
+            artifact_kind="symbol",
+        )
+        return _make_skeleton([cluster])
+
+    def _llm(self, subpage_titles: list[str] | None = None) -> ChapteredFakeLLM:
+        titles = subpage_titles or ["Session Management", "Token Validation"]
+        return ChapteredFakeLLM(
+            planner_response=_chaptered_planner_json(
+                chapter_title="Auth Chapter",
+                chapter_description="Authentication and authorization.",
+                subpage_titles=titles,
+            ),
+            writer_response="AuthService manages login. [src/auth/service.py:1-5]",
+            index_response="Auth Chapter overview text. Brief summary of the chapter.",
+        )
+
+    def _run_chaptered(self, skeleton=None, packs=None, llm=None) -> UnifiedPipelineResult:
+        sk = skeleton or self._skeleton()
+        pk = packs or {1: _make_pack(1)}
+        lm = llm or self._llm()
+        env_patch = {"WIKIS_CHAPTERED_PAGES": "1"}
+        old_env = {k: os.environ.get(k) for k in env_patch}
+        try:
+            os.environ.update(env_patch)
+            return run_unified_pipeline(sk, pk, llm=lm, repo_root=self._REPO)
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_chaptered_pipeline_produces_pages(self):
+        """WIKIS_CHAPTERED_PAGES=1 path produces at least one page."""
+        result = self._run_chaptered()
+        assert len(result.pages) > 0
+
+    def test_chaptered_pipeline_produces_index_plus_subpages(self):
+        """Each chapter produces 1 index page + N sub-pages.
+
+        The tiny cluster fixture has 1 artifact, so the chaptered planner caps
+        it at 1 sub-page (tiny cluster rule: <=5 total_artifacts → max 1 subpage).
+        Total: 1 index + 1 sub-page = 2 pages.
+        """
+        result = self._run_chaptered()
+        # One cluster → one chapter → 1 index + (1..2) sub-pages.
+        # Tiny cluster (1 artifact) → 1 sub-page → 2 total.
+        assert len(result.pages) >= 2
+
+    def test_chaptered_pipeline_has_index_and_at_least_one_subpage(self):
+        """First page is the index, remaining pages are sub-pages."""
+        result = self._run_chaptered()
+        assert len(result.pages) >= 2
+        index_page = result.pages[0]
+        assert index_page.metadata.get("is_chapter_index") is True
+        subpages = result.pages[1:]
+        assert len(subpages) >= 1
+
+    def test_chaptered_index_page_has_chapter_title(self):
+        """The chapter index page uses the chapter title."""
+        result = self._run_chaptered()
+        index_page = result.pages[0]
+        assert index_page.title == "Auth Chapter"
+
+    def test_chaptered_subpages_have_non_empty_titles(self):
+        """Sub-pages have non-empty titles."""
+        result = self._run_chaptered()
+        for page in result.pages[1:]:
+            assert page.title.strip(), f"Sub-page has empty title"
+
+    def test_chaptered_index_contains_wikilinks(self):
+        """Chapter index markdown contains [[wikilink]] TOC entries."""
+        result = self._run_chaptered()
+        index_md = result.pages[0].markdown
+        # The index must contain at least one [[wikilink]]
+        assert "[[" in index_md, f"No wikilinks in chapter index: {index_md!r}"
+
+    def test_chaptered_subpages_have_non_empty_markdown(self):
+        """All sub-pages have non-empty markdown content."""
+        result = self._run_chaptered()
+        for page in result.pages[1:]:
+            assert page.markdown.strip(), f"Sub-page {page.title!r} has empty markdown"
+
+    def test_flat_pipeline_unaffected_when_flag_off(self):
+        """When WIKIS_CHAPTERED_PAGES=0, the flat pipeline runs as before."""
+        lm = RoleAwareFakeLLM(
+            planner_response=_planner_json(title="Auth Module", description="Auth logic."),
+            writer_response=_writer_md("AuthService manages login.", "src/auth/service.py"),
+        )
+        # Ensure flag is off
+        env_patch = {"WIKIS_CHAPTERED_PAGES": "0"}
+        old_env = {k: os.environ.get(k) for k in env_patch}
+        try:
+            os.environ.update(env_patch)
+            result = run_unified_pipeline(
+                self._skeleton(), {1: _make_pack(1)}, llm=lm, repo_root=self._REPO,
+            )
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        # Flat pipeline: exactly 1 page per cluster
+        assert len(result.pages) == 1
+        assert result.pages[0].title == "Auth Module"
