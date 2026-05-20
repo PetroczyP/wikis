@@ -21,6 +21,8 @@ from typing import Any
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.services.llm_factory import is_bedrock_llm, make_cached_system_message
+
 from .repository_analysis_store import (
     get_query_optimized_context,
     is_structured_analysis,
@@ -281,7 +283,10 @@ class AskTool:
             # Bind max_tokens to the LLM for this specific call
             llm_for_query = self.llm.bind(max_tokens=self.query_output_tokens)
             response = llm_for_query.invoke(
-                [SystemMessage(content=QUERY_OPTIMIZATION_SYSTEM_PROMPT), HumanMessage(content=user_prompt)]
+                [
+                    make_cached_system_message(QUERY_OPTIMIZATION_SYSTEM_PROMPT, cache=is_bedrock_llm(self.llm)),
+                    HumanMessage(content=user_prompt),
+                ]
             )
 
             optimized = response.content.strip()
@@ -472,7 +477,12 @@ class AskTool:
             # Use limited output tokens for answer generation
             # Bind max_tokens to the LLM for this specific call
             llm_for_answer = self.llm.bind(max_tokens=self.answer_output_tokens)
-            response = llm_for_answer.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+            response = llm_for_answer.invoke(
+                [
+                    make_cached_system_message(system_prompt, cache=is_bedrock_llm(self.llm)),
+                    HumanMessage(content=user_prompt),
+                ]
+            )
             return response.content
         except Exception as e:
             logger.error(f"Answer generation failed: {e}")

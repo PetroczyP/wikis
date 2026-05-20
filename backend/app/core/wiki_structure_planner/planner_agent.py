@@ -40,7 +40,7 @@ from app.core.wiki_structure_planner.structure_skeleton import (
     Cluster,
     StructureSkeleton,
 )
-from app.services.llm_factory import safe_bind_tools
+from app.services.llm_factory import is_bedrock_llm, make_cached_system_message, safe_bind_tools
 
 logger = logging.getLogger(__name__)
 
@@ -386,7 +386,7 @@ def _plan_cluster(
     )
 
     messages: list[Any] = [
-        SystemMessage(content=PLANNER_SYSTEM_PROMPT),
+        make_cached_system_message(PLANNER_SYSTEM_PROMPT, cache=is_bedrock_llm(llm_with_tools)),
         HumanMessage(content=user_msg),
     ]
 
@@ -774,7 +774,7 @@ def _plan_cluster_chaptered(
         tool_budget_total=budget_tracker[1],
     )
     messages: list[Any] = [
-        SystemMessage(content=CHAPTERED_PLANNER_SYSTEM_PROMPT),
+        make_cached_system_message(CHAPTERED_PLANNER_SYSTEM_PROMPT, cache=is_bedrock_llm(llm_with_tools)),
         HumanMessage(content=user_msg),
     ]
     max_tool_rounds = min(3, max(0, tool_budget_remaining))

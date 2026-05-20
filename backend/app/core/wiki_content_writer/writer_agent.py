@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from app.core.agent_tools import WIKI_TOOL_SCHEMAS as _WRITER_TOOL_SCHEMAS
-from app.services.llm_factory import safe_bind_tools
+from app.services.llm_factory import is_bedrock_llm, make_cached_system_message, safe_bind_tools
 
 from .prompts import CITATION_FORMAT_DESCRIPTION, CITATION_PROMPT_RULES
 from .source_gate import ToolCall
@@ -294,7 +294,7 @@ class WikiContentWriter:
         llm_with_tools = safe_bind_tools(effective_llm, _WRITER_TOOL_SCHEMAS)
 
         messages: list[Any] = [
-            SystemMessage(content=system_prompt),
+            make_cached_system_message(system_prompt, cache=is_bedrock_llm(effective_llm)),
             HumanMessage(content=user_prompt),
         ]
 

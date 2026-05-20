@@ -21,6 +21,7 @@ from typing import Any
 
 from langchain_core.documents import Document
 from langchain_core.language_models import BaseLanguageModel
+from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
@@ -65,6 +66,7 @@ from ..storage.incremental import (
     compute_page_id,
 )
 from ..token_counter import CONTEXT_TOKEN_BUDGET, get_token_counter
+from ...services.llm_factory import is_bedrock_llm, make_cached_system_message
 
 logger = logging.getLogger(__name__)
 
@@ -4047,43 +4049,44 @@ class OptimizedWikiGenerationAgent:
         file_stats = self._prepare_basic_file_stats(file_paths)
 
         # Choose prompt based on toggle
+        _use_cache = is_bedrock_llm(self.llm)
         if USE_STRUCTURED_REPO_ANALYSIS:
             # New structured JSON output - ~10x smaller, indexable
-            analysis_prompt = ChatPromptTemplate.from_messages(
-                [
-                    (
-                        "system",
-                        "You are an expert repository analyst. Output ONLY valid JSON matching the specified schema. No markdown, no explanations - just the JSON object.",
-                    ),
-                    ("human", STRUCTURED_REPO_ANALYSIS_PROMPT),
-                ]
+            _sys_text = (
+                "You are an expert repository analyst. Output ONLY valid JSON matching the "
+                "specified schema. No markdown, no explanations - just the JSON object."
             )
+            _user_template = STRUCTURED_REPO_ANALYSIS_PROMPT
             logger.info("Using STRUCTURED_REPO_ANALYSIS_PROMPT (JSON output, ~5-8K chars)")
         else:
             # Legacy markdown output - comprehensive but verbose
-            analysis_prompt = ChatPromptTemplate.from_messages(
-                [
-                    (
-                        "system",
-                        "You are an expert software architect and comprehensive repository analysis specialist. Your mission is to perform exhaustive analysis of codebases, documenting every significant component without omission. You must analyze ALL architectural patterns, technologies, and relationships present in the repository to enable complete documentation coverage.",
-                    ),
-                    ("human", ENHANCED_REPO_ANALYSIS_PROMPT),
-                ]
+            _sys_text = (
+                "You are an expert software architect and comprehensive repository analysis "
+                "specialist. Your mission is to perform exhaustive analysis of codebases, "
+                "documenting every significant component without omission. You must analyze "
+                "ALL architectural patterns, technologies, and relationships present in the "
+                "repository to enable complete documentation coverage."
             )
+            _user_template = ENHANCED_REPO_ANALYSIS_PROMPT
             logger.info("Using ENHANCED_REPO_ANALYSIS_PROMPT (Markdown output, ~67K chars)")
+
+        _user_text = _user_template.format(
+            repository_name=self.repository_url,
+            branch_name=self.branch,
+            repository_tree=repository_tree,
+            readme_content=readme_content if readme_content else "No README found",
+            code_samples=code_samples,
+            file_stats=file_stats,
+        )
 
         logger.info("Invoking LLM for repository analysis...")
 
         try:
             response = self.llm.invoke(
-                analysis_prompt.format_messages(
-                    repository_name=self.repository_url,
-                    branch_name=self.branch,
-                    repository_tree=repository_tree,
-                    readme_content=readme_content if readme_content else "No README found",
-                    code_samples=code_samples,
-                    file_stats=file_stats,
-                ),
+                [
+                    make_cached_system_message(_sys_text, cache=_use_cache),
+                    HumanMessage(content=_user_text),
+                ],
                 config=config,
             )
 

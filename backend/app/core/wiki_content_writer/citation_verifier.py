@@ -51,6 +51,7 @@ from app.core.wiki_content_writer.verifier_prompts import (
     build_verifier_user_prompt,
 )
 from app.core.wiki_structure_planner._evidence_utils import safe_join
+from app.services.llm_factory import is_bedrock_llm, make_cached_system_message
 
 logger = logging.getLogger(__name__)
 
@@ -268,7 +269,7 @@ def _call_llm_batch(
     """
     user_prompt = build_verifier_user_prompt(batch)
     messages = [
-        SystemMessage(content=VERIFIER_SYSTEM_PROMPT),
+        make_cached_system_message(VERIFIER_SYSTEM_PROMPT, cache=is_bedrock_llm(llm)),
         HumanMessage(content=user_prompt),
     ]
     response = llm.invoke(messages)

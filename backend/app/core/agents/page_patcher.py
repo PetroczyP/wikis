@@ -34,6 +34,7 @@ from app.core.prompts.surgical_edit_prompts import (
 )
 from app.core.storage.incremental import compute_content_hash
 from app.services.change_detector import ChangeKind, NodeChange
+from app.services.llm_factory import is_bedrock_llm, make_cached_system_message
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,7 @@ class PagePatcher:
         try:
             response = self._llm.invoke(
                 [
-                    SystemMessage(content=SURGICAL_EDIT_SYSTEM),
+                    make_cached_system_message(SURGICAL_EDIT_SYSTEM, cache=is_bedrock_llm(self._llm)),
                     HumanMessage(content=prompt_user),
                 ]
             )

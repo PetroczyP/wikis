@@ -6,10 +6,17 @@ import importlib
 from typing import Any
 
 import pytest
+from langchain_core.messages import SystemMessage
 from pydantic import SecretStr
 
 from app.config import Settings
-from app.services.llm_factory import create_embeddings, create_llm, safe_bind_tools
+from app.services.llm_factory import (
+    create_embeddings,
+    create_llm,
+    is_bedrock_llm,
+    make_cached_system_message,
+    safe_bind_tools,
+)
 
 _has_ollama = importlib.util.find_spec("langchain_ollama") is not None
 _has_bedrock = importlib.util.find_spec("langchain_aws") is not None
@@ -99,7 +106,15 @@ class TestCreateLLM:
     @pytest.mark.skipif(not _has_bedrock, reason="langchain-aws not installed")
     def test_bedrock_provider(self):
         llm = create_llm(_settings(llm_provider="bedrock", llm_model="anthropic.claude-3-sonnet"))
-        assert type(llm).__name__ == "ChatBedrock"
+        assert type(llm).__name__ == "ChatBedrockConverse"
+
+    @pytest.mark.skipif(not _has_bedrock, reason="langchain-aws not installed")
+    def test_bedrock_provider_not_chat_bedrock(self):
+        """Bedrock provider must use ChatBedrockConverse, not the legacy ChatBedrock."""
+        llm = create_llm(_settings(llm_provider="bedrock", llm_model="anthropic.claude-3-sonnet"))
+        assert type(llm).__name__ != "ChatBedrock", (
+            "Bedrock provider must use ChatBedrockConverse for Converse API + prompt caching"
+        )
 
 
 class TestCreateEmbeddings:
@@ -392,3 +407,86 @@ class TestSafeBindTools:
         rebound = safe_bind_tools(pre_bound, self._TOOLS)
         assert rebound is not pre_bound
         assert rebound.kwargs["tools"] == self._TOOLS
+
+
+# ── make_cached_system_message tests ─────────────────────────────────────────
+
+
+class TestMakeCachedSystemMessage:
+    """make_cached_system_message returns the correct structure for bedrock and non-bedrock."""
+
+    def test_bedrock_cache_true_returns_list_with_cache_point(self) -> None:
+        """When cache=True, content is a list with text block + cachePoint block."""
+        msg = make_cached_system_message("You are a test assistant.", cache=True)
+        assert isinstance(msg, SystemMessage)
+        assert isinstance(msg.content, list), "Expected list content when cache=True"
+        assert len(msg.content) == 2, "Expected exactly 2 content blocks"
+        text_block, cache_block = msg.content
+        assert text_block == {"type": "text", "text": "You are a test assistant."}
+        assert cache_block == {"cachePoint": {"type": "default"}}
+
+    def test_non_bedrock_cache_false_returns_plain_string(self) -> None:
+        """When cache=False, content is a plain string (no cachePoint overhead)."""
+        msg = make_cached_system_message("You are a test assistant.", cache=False)
+        assert isinstance(msg, SystemMessage)
+        assert isinstance(msg.content, str), "Expected plain string content when cache=False"
+        assert msg.content == "You are a test assistant."
+
+    def test_cache_default_is_true(self) -> None:
+        """Default cache=True produces list content."""
+        msg = make_cached_system_message("Hello.")
+        assert isinstance(msg.content, list)
+
+    def test_cache_point_structure(self) -> None:
+        """The cachePoint block must have exactly {'cachePoint': {'type': 'default'}}."""
+        msg = make_cached_system_message("prompt", cache=True)
+        cache_block = msg.content[-1]
+        assert "cachePoint" in cache_block
+        assert cache_block["cachePoint"] == {"type": "default"}
+
+    def test_text_block_content_preserved(self) -> None:
+        """Multiline system prompt text is preserved verbatim in the text block."""
+        prompt = "Line 1\nLine 2\n\nLine 3"
+        msg = make_cached_system_message(prompt, cache=True)
+        text_block = msg.content[0]
+        assert text_block["text"] == prompt
+
+
+# ── is_bedrock_llm tests ──────────────────────────────────────────────────────
+
+
+class TestIsBedrockLlm:
+    """is_bedrock_llm detects ChatBedrockConverse through wrapper chains."""
+
+    def test_non_bedrock_openai_returns_false(self) -> None:
+        """OpenAI LLM is not a Bedrock LLM."""
+        llm = create_llm(_settings(llm_max_retries=0))
+        assert is_bedrock_llm(llm) is False
+
+    def test_anthropic_returns_false(self) -> None:
+        """Anthropic direct LLM is not a Bedrock LLM."""
+        llm = create_llm(_settings(llm_provider="anthropic", llm_model="claude-sonnet-4-20250514"))
+        assert is_bedrock_llm(llm) is False
+
+    def test_none_returns_false(self) -> None:
+        """None does not crash and returns False."""
+        assert is_bedrock_llm(None) is False
+
+    def test_arbitrary_object_returns_false(self) -> None:
+        """Arbitrary objects are not Bedrock LLMs."""
+        assert is_bedrock_llm(object()) is False
+
+    @pytest.mark.skipif(not _has_bedrock, reason="langchain-aws not installed")
+    def test_bedrock_llm_returns_true(self) -> None:
+        """A bare ChatBedrockConverse instance returns True."""
+        llm = create_llm(_settings(llm_provider="bedrock", llm_model="anthropic.claude-3-sonnet"))
+        assert is_bedrock_llm(llm) is True
+
+    @pytest.mark.skipif(not _has_bedrock, reason="langchain-aws not installed")
+    def test_bedrock_llm_with_retry_returns_true(self) -> None:
+        """ChatBedrockConverse wrapped in RunnableRetry returns True."""
+        llm = create_llm(
+            _settings(llm_provider="bedrock", llm_model="anthropic.claude-3-sonnet", llm_max_retries=2)
+        )
+        # The LLM is now wrapped; is_bedrock_llm must walk the chain
+        assert is_bedrock_llm(llm) is True

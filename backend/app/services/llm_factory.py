@@ -13,10 +13,66 @@ from typing import Any
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import SystemMessage
 
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
+
+
+def make_cached_system_message(content: str, cache: bool = True) -> SystemMessage:
+    """Build a SystemMessage, optionally with a Bedrock cachePoint checkpoint.
+
+    On Bedrock (ChatBedrockConverse), appending ``{"cachePoint": {"type": "default"}}``
+    as the last content block marks everything before it as cacheable across calls
+    that share the same system prompt prefix — reducing token cost on repeated
+    agentic tool-loop rounds.
+
+    On all other providers the extra block is omitted and a plain string
+    ``SystemMessage`` is returned instead (no-op for OpenAI / Anthropic direct
+    / Ollama).
+
+    Parameters
+    ----------
+    content:
+        System prompt text.
+    cache:
+        When ``True`` (the default), wraps content in a list with a trailing
+        ``cachePoint`` block.  Pass ``settings.llm_provider == "bedrock"`` at
+        each call site, or use :func:`is_bedrock_llm` to detect from the LLM
+        instance when settings are not available.
+    """
+    if not cache:
+        return SystemMessage(content=content)
+    return SystemMessage(content=[
+        {"type": "text", "text": content},
+        {"cachePoint": {"type": "default"}},
+    ])
+
+
+def is_bedrock_llm(llm: Any) -> bool:
+    """Return ``True`` when *llm* (or its inner LLM) is a ``ChatBedrockConverse``.
+
+    Walks ``RunnableRetry`` (.bound) and ``RunnableWithFallbacks`` (.runnable)
+    chains — the same structure that :func:`safe_bind_tools` navigates — so the
+    check works whether or not the LLM is wrapped.
+    """
+    try:
+        from langchain_aws import ChatBedrockConverse  # noqa: PLC0415
+    except ImportError:
+        return False
+
+    cursor: Any = llm
+    for _ in range(6):  # bounded walk
+        if cursor is None:
+            break
+        if isinstance(cursor, ChatBedrockConverse):
+            return True
+        cursor = (
+            getattr(cursor, "bound", None)
+            or getattr(cursor, "runnable", None)
+        )
+    return False
 
 
 def _bedrock_credentials(settings: Settings) -> dict[str, str]:
@@ -153,17 +209,17 @@ def create_llm(
             )
     elif provider == "bedrock":
         import botocore.config
-        from langchain_aws import ChatBedrock
+        from langchain_aws import ChatBedrockConverse
 
         bedrock_kwargs = _bedrock_credentials(settings)
         bedrock_config = botocore.config.Config(
             read_timeout=settings.llm_timeout, connect_timeout=30, retries={"max_attempts": 3}
         )
-        llm = ChatBedrock(
+        llm = ChatBedrockConverse(
             model_id=model,
             region_name=settings.aws_region,
-            model_kwargs={"temperature": temperature, "max_tokens": max_tokens},
-            streaming=streaming,
+            temperature=temperature,
+            max_tokens=max_tokens,
             config=bedrock_config,
             **bedrock_kwargs,
             **overrides,
