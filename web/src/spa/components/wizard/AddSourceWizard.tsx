@@ -107,13 +107,22 @@ export function AddSourceWizard({
   // ---------------------------------------------------------------------
 
   const urlError = useMemo<string | null>(() => {
-    if (formData.source_type !== 'git') return null;
+    if (formData.source_type !== 'git' || formData.localFsMode) return null;
     const url = formData.git.repo_url.trim();
     if (!url) return 'Repository URL is required';
     if (!isUrlish(url))
       return 'Must be a valid URL (https://, git@, file://, or local /path)';
     return null;
-  }, [formData.source_type, formData.git.repo_url]);
+  }, [formData.source_type, formData.localFsMode, formData.git.repo_url]);
+
+  const pathError = useMemo<string | null>(() => {
+    if (formData.source_type !== 'git' || !formData.localFsMode) return null;
+    const p = formData.localFs.path.trim();
+    if (!p) return 'Filesystem path is required';
+    if (!p.startsWith('/'))
+      return 'Path must be absolute (start with /)';
+    return null;
+  }, [formData.source_type, formData.localFsMode, formData.localFs.path]);
 
   const spaceKeysError = useMemo<string | null>(() => {
     if (formData.source_type !== 'confluence') return null;
@@ -146,6 +155,7 @@ export function AddSourceWizard({
   const configureValid = useMemo(() => {
     if (atlassianRequired && !atlassianReady) return false;
     if (formData.source_type === 'git') {
+      if (formData.localFsMode) return !pathError;
       if (urlError) return false;
       if (formData.git.patSource === 'paste' && !formData.git.pastedPat.trim()) {
         return false;
@@ -159,9 +169,11 @@ export function AddSourceWizard({
     atlassianRequired,
     atlassianReady,
     formData.source_type,
+    formData.localFsMode,
     formData.git.patSource,
     formData.git.pastedPat,
     urlError,
+    pathError,
     spaceKeysError,
     jqlError,
   ]);
@@ -180,6 +192,19 @@ export function AddSourceWizard({
   const buildScanRequest = useCallback((): ScanRequest | null => {
     if (!configureValid) return null;
     if (formData.source_type === 'git') {
+      // Local FS path: no auth, no branch — backend's GitToolkit accepts
+      // bare filesystem paths through the same code path as remote git
+      // URLs, so we still submit ``source_type='git'`` on the wire.
+      if (formData.localFsMode) {
+        // Omit ``branch`` entirely — a filesystem directory has no
+        // branch, and an empty string would be silently coerced to
+        // "main" by ``GitScope._validate_and_backfill`` on the backend.
+        return {
+          source_type: 'git',
+          scope: { repo_url: formData.localFs.path.trim() },
+          auth: { pat: null },
+        };
+      }
       const pat: string | null =
         formData.git.patSource === 'paste' ? formData.git.pastedPat || null : null;
       return {
@@ -222,6 +247,8 @@ export function AddSourceWizard({
   }, [
     configureValid,
     formData.source_type,
+    formData.localFsMode,
+    formData.localFs,
     formData.git,
     formData.confluence.space_keys,
     formData.jira.jql,
@@ -267,6 +294,9 @@ export function AddSourceWizard({
     // step === 1 — compare against the initial form data for the picked
     // connector. Avoids prompting on a connector pick alone.
     if (formData.source_type === 'git') {
+      if (formData.localFsMode) {
+        return formData.localFs.path.trim().length > 0;
+      }
       const g = formData.git;
       const g0 = INITIAL_FORM_DATA.git;
       return (
@@ -309,17 +339,34 @@ export function AddSourceWizard({
     try {
       let body: GenerateWikiMultiSourceRequest;
       if (formData.source_type === 'git') {
-        const pat: string | null =
-          formData.git.patSource === 'paste' ? formData.git.pastedPat || null : null;
-        body = {
-          source_type: 'git',
-          scope: {
-            repo_url: formData.git.repo_url.trim(),
-            branch: formData.git.branch || 'main',
-          },
-          auth: { pat },
-          ...(formData.wiki_title ? { wiki_title: formData.wiki_title } : {}),
-        };
+        if (formData.localFsMode) {
+          // Local FS: same wire shape as Git but with the path in
+          // ``repo_url`` and no auth.  ``branch`` is omitted entirely
+          // — a filesystem directory has no branch concept, and an
+          // empty string would be silently coerced to "main" by the
+          // backend's ``GitScope._validate_and_backfill``.  The
+          // backend's ``GitToolkit`` resolves the path in-place so
+          // refreshes re-read the same directory and pick up files
+          // edited manually.
+          body = {
+            source_type: 'git',
+            scope: { repo_url: formData.localFs.path.trim() },
+            auth: { pat: null },
+            ...(formData.wiki_title ? { wiki_title: formData.wiki_title } : {}),
+          };
+        } else {
+          const pat: string | null =
+            formData.git.patSource === 'paste' ? formData.git.pastedPat || null : null;
+          body = {
+            source_type: 'git',
+            scope: {
+              repo_url: formData.git.repo_url.trim(),
+              branch: formData.git.branch || 'main',
+            },
+            auth: { pat },
+            ...(formData.wiki_title ? { wiki_title: formData.wiki_title } : {}),
+          };
+        }
       } else {
         // Atlassian path: choose auth shape based on the wizard's mode.
         let baseUrl: string;
@@ -416,8 +463,9 @@ export function AddSourceWizard({
       {step === 0 && (
         <StepConnector
           selected={formData.source_type}
-          onSelect={(source_type) => {
-            setFormData((d) => ({ ...d, source_type }));
+          selectedLocalFs={formData.localFsMode}
+          onSelect={(source_type, localFs) => {
+            setFormData((d) => ({ ...d, source_type, localFsMode: localFs }));
             // Auto-advance on pick (cartograph behavior).
             setStep(1);
           }}
@@ -428,6 +476,7 @@ export function AddSourceWizard({
           data={formData}
           onChange={setFormData}
           urlError={urlError}
+          pathError={pathError}
           spaceKeysError={spaceKeysError}
           jqlError={jqlError}
           disabled={submitting}

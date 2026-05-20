@@ -145,14 +145,22 @@ const CONNECTORS: ConnectorOption[] = [
 
 interface StepConnectorProps {
   selected: WikiSourceType;
-  onSelect: (source: WikiSourceType) => void;
+  /**
+   * ``selectedLocalFs`` distinguishes the Local FS card from the Git card
+   * when ``selected === 'git'``.  Both cards share ``id: 'git'`` (the
+   * backend doesn't have a distinct local-fs source type yet), so the
+   * wizard tracks the choice separately on ``WizardFormData.localFsMode``
+   * and forwards it here for the active-state computation.
+   */
+  selectedLocalFs: boolean;
+  onSelect: (source: WikiSourceType, localFs: boolean) => void;
 }
 
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
-export function StepConnector({ selected, onSelect }: StepConnectorProps) {
+export function StepConnector({ selected, selectedLocalFs, onSelect }: StepConnectorProps) {
   return (
     <Stack spacing={2} sx={{ mt: 0.5 }}>
       <Typography variant="body2" color="text.secondary">
@@ -166,14 +174,15 @@ export function StepConnector({ selected, onSelect }: StepConnectorProps) {
           gap: 1.25,
         }}
       >
-        {CONNECTORS.map((c, idx) => {
-          // ``id`` can be shared (Local FS reuses ``id: 'git'``).  Only the
-          // FIRST card with a matching id is rendered "active" on revisit
-          // so the wizard doesn't highlight two cards at once.
-          const firstMatchIdx = CONNECTORS.findIndex(
-            (other) => !other.disabled && other.id === selected,
-          );
-          const active = !c.disabled && c.id === selected && idx === firstMatchIdx;
+        {CONNECTORS.map((c) => {
+          // ``id`` can be shared (Local FS reuses ``id: 'git'``).  Use the
+          // per-card ``key`` together with ``selectedLocalFs`` so only the
+          // card the user actually clicked highlights on revisit.
+          const isLocalFsCard = c.key === 'local_fs';
+          const active =
+            !c.disabled &&
+            c.id === selected &&
+            (isLocalFsCard ? selectedLocalFs : !selectedLocalFs);
           const card = (
             <Card
               variant="outlined"
@@ -194,7 +203,7 @@ export function StepConnector({ selected, onSelect }: StepConnectorProps) {
             >
               <CardActionArea
                 onClick={() => {
-                  if (!c.disabled) onSelect(c.id);
+                  if (!c.disabled) onSelect(c.id, c.key === 'local_fs');
                 }}
                 disabled={c.disabled}
                 data-testid={c.testId}

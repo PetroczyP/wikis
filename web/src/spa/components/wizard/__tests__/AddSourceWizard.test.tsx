@@ -96,16 +96,20 @@ describe('AddSourceWizard', () => {
     expect(await screen.findByTestId('git-repo-url')).toBeInTheDocument();
   });
 
-  it('clicking Local FS lands on the Git Configure step (filesystem path)', async () => {
-    // Local FS reuses the Git source-type because GitToolkit already
-    // handles non-git local directories. The user lands on the same
-    // Configure form whose placeholder mentions "/abs/path for local".
+  it('clicking Local FS lands on its own Configure form (path only, no auth)', async () => {
+    // Local FS now has a dedicated configure form: a single path field
+    // and NO auth dropdown.  The wire still submits source_type='git'
+    // since the backend's GitToolkit accepts bare filesystem paths
+    // through the same code path.
     const user = userEvent.setup();
     renderWizard();
     await user.click(screen.getByTestId('connector-local-fs'));
-    const urlField = (await screen.findByTestId('git-repo-url')) as HTMLInputElement;
-    expect(urlField).toBeInTheDocument();
-    expect(urlField.placeholder).toMatch(/local/i);
+    const pathField = (await screen.findByTestId('local-fs-path')) as HTMLInputElement;
+    expect(pathField).toBeInTheDocument();
+    // No auth dropdown for Local FS.
+    expect(screen.queryByTestId('pat-source-select')).not.toBeInTheDocument();
+    // Not the Git URL field either.
+    expect(screen.queryByTestId('git-repo-url')).not.toBeInTheDocument();
   });
 
   it('Next is disabled until the URL passes validation', async () => {
@@ -723,5 +727,48 @@ describe('AddSourceWizard', () => {
       email: 'alice@acme.com',
       api_token: 'atk-123',
     });
+  });
+
+  it('Local FS submit: source_type=git, no auth, no branch, repo_url=path', async () => {
+    // The wire shape stays source_type='git' because GitToolkit accepts
+    // bare filesystem paths.  But auth must be null and branch must be
+    // empty — the user supplied neither.
+    const user = userEvent.setup();
+    mockScanSource.mockResolvedValue({
+      source_type: 'git',
+      reachable: true,
+      preview: {
+        default_branch: null,
+        resolved_branch: '',
+        commit_hash: null,
+        file_count: 7,
+        top_paths: ['README.md', 'docs/'],
+        size_bytes: 1024,
+      },
+      warnings: [],
+    });
+    mockGenerate.mockResolvedValue({
+      wiki_id: 'local--my-project--none',
+      invocation_id: 'inv-fs-1',
+      status: 'generating',
+      message: 'ok',
+    });
+
+    renderWizard();
+    await user.click(screen.getByTestId('connector-local-fs'));
+    await user.type(screen.getByTestId('local-fs-path'), '/srv/docs/my-project');
+    await user.click(screen.getByTestId('wizard-next'));
+    await screen.findByTestId('scan-success');
+    await user.click(screen.getByTestId('wizard-next'));
+    await user.click(screen.getByTestId('wizard-submit'));
+
+    await waitFor(() => expect(mockGenerate).toHaveBeenCalledTimes(1));
+    const body = mockGenerate.mock.calls[0][0];
+    expect(body.source_type).toBe('git');
+    // ``branch`` is omitted (not empty string) so the backend's default
+    // applies cleanly. Asserting both shapes pins the contract.
+    expect(body.scope).toEqual({ repo_url: '/srv/docs/my-project' });
+    expect(body.scope).not.toHaveProperty('branch');
+    expect(body.auth).toEqual({ pat: null });
   });
 });

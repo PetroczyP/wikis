@@ -27,6 +27,20 @@ export interface JiraFormState {
 }
 
 /**
+ * Local-FS form state — a backend-accessible filesystem path.
+ *
+ * Submitted with ``source_type='git'`` (the backend's ``GitToolkit``
+ * handles non-git directories in-place via ``_ensure_workdir`` without
+ * cloning, so a refresh re-reads the user's path and picks up files
+ * they edited manually).  ``LocalFsFormState`` is kept distinct from
+ * ``GitFormState`` so the Local FS configure form can omit the auth
+ * dropdown and branch field entirely.
+ */
+export interface LocalFsFormState {
+  path: string;
+}
+
+/**
  * Atlassian credentials chosen at the Configure step.  The wizard supports
  * two authentication shapes:
  *
@@ -47,7 +61,15 @@ export interface AtlassianBasicAuthFormState {
 
 export interface WizardFormData {
   source_type: WikiSourceType;
+  /**
+   * Distinguishes Local FS from regular Git when ``source_type='git'``.
+   * The Local FS path is taken from ``localFs.path``; on the wire we still
+   * submit ``source_type='git'`` since the backend's ``GitToolkit`` accepts
+   * both git URLs and bare filesystem paths through the same code path.
+   */
+  localFsMode: boolean;
   git: GitFormState;
+  localFs: LocalFsFormState;
   confluence: ConfluenceFormState;
   jira: JiraFormState;
   atlassianAuthMode: AtlassianAuthMode;
@@ -57,12 +79,14 @@ export interface WizardFormData {
 
 export const INITIAL_FORM_DATA: WizardFormData = {
   source_type: 'git',
+  localFsMode: false,
   git: {
     repo_url: '',
     branch: 'main',
     patSource: 'none',
     pastedPat: '',
   },
+  localFs: { path: '' },
   confluence: { space_keys: [] },
   jira: { jql: 'ORDER BY created DESC' },
   atlassianAuthMode: 'oauth',

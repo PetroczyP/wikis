@@ -1,14 +1,18 @@
 /**
- * Step 2 of the AddSource wizard (#208): connector-specific configuration.
+ * Step 2 of the AddSource wizard: connector-specific configuration.
  *
  * Pure dispatch component — delegates to the appropriate ``*Configure``
- * form based on ``data.source_type``. Validation (URL shape, JQL non-empty,
- * space keys non-empty) is computed by the container and surfaced via the
- * per-connector error props so the Next button can be gated centrally.
+ * form.  ``source_type`` discriminates the four major flows; the
+ * ``localFsMode`` flag further splits ``source_type='git'`` into the
+ * Git form (URL + auth) and the Local FS form (path only, no auth) so
+ * the two surfaces don't have to share fields.  Validation errors are
+ * computed by the container and forwarded via the per-connector error
+ * props so the Next button can be gated centrally.
  */
 
 import { Box } from '@mui/material';
 import { GitConfigure } from './connectors/GitConfigure';
+import { LocalFsConfigure } from './connectors/LocalFsConfigure';
 import { ConfluenceConfigure } from './connectors/ConfluenceConfigure';
 import { JiraConfigure } from './connectors/JiraConfigure';
 import type { WizardFormData } from './types';
@@ -17,6 +21,7 @@ interface StepConfigureProps {
   data: WizardFormData;
   onChange: (next: WizardFormData) => void;
   urlError: string | null;
+  pathError: string | null;
   spaceKeysError: string | null;
   jqlError: string | null;
   disabled?: boolean;
@@ -26,13 +31,22 @@ export function StepConfigure({
   data,
   onChange,
   urlError,
+  pathError,
   spaceKeysError,
   jqlError,
   disabled,
 }: StepConfigureProps) {
   return (
     <Box sx={{ mt: 0.5 }}>
-      {data.source_type === 'git' && (
+      {data.source_type === 'git' && data.localFsMode && (
+        <LocalFsConfigure
+          data={data.localFs}
+          onChange={(localFs) => onChange({ ...data, localFs })}
+          pathError={pathError}
+          disabled={disabled}
+        />
+      )}
+      {data.source_type === 'git' && !data.localFsMode && (
         <GitConfigure
           data={data.git}
           onChange={(git) => onChange({ ...data, git })}

@@ -12,7 +12,12 @@ export type WikiSourceType = 'git' | 'confluence' | 'jira';
 
 export interface GitScope {
   repo_url: string;
-  branch: string;
+  /**
+   * Branch name. Optional — when omitted the backend defaults to
+   * ``"main"``.  Local FS submissions omit it entirely since branches
+   * have no meaning for a bare filesystem directory.
+   */
+  branch?: string;
 }
 
 export interface ConfluenceScope {
