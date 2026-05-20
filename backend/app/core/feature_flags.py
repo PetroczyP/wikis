@@ -265,6 +265,10 @@ class FeatureFlags:
     #: break IDs on minor churn. Tunable via WIKIS_CLUSTER_STABILITY_THRESHOLD.
     cluster_stability_threshold: float = 0.5
 
+    # -- Epic #287 -- Chaptered pages -----------------------------------------
+    #: When True, the unified pipeline uses run_planner_chaptered instead of
+    #: run_planner_with_report. Default off until #290 lands writer changes.
+    chaptered_pages: bool = False
 
 
 def get_feature_flags() -> FeatureFlags:
@@ -310,4 +314,5 @@ def get_feature_flags() -> FeatureFlags:
         cluster_stability_threshold=_env_float(
             "WIKIS_CLUSTER_STABILITY_THRESHOLD", 0.5,
         ),
+        chaptered_pages=_env_bool("WIKIS_CHAPTERED_PAGES", False),
     )

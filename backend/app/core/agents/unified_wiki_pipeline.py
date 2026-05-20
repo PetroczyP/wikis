@@ -40,9 +40,12 @@ from app.core.wiki_content_writer.source_gate import GateReport, ToolCall, apply
 from app.core.wiki_content_writer.writer_agent import WikiContentWriter
 from app.core.wiki_content_writer.writer_tools import WriterTools
 from app.core.wiki_structure_planner.evidence import EvidencePack
+from app.core.feature_flags import get_feature_flags
 from app.core.wiki_structure_planner.planner_agent import (
+    ChapterSpec,
     PageSpec,
     PlanReport,
+    run_planner_chaptered,
     run_planner_with_report,
 )
 from app.core.wiki_structure_planner.structure_skeleton import StructureSkeleton
@@ -430,12 +433,40 @@ def run_unified_pipeline(
         len(evidence_packs),
     )
 
-    page_specs, plan_report = run_planner_with_report(
-        skeleton,
-        evidence_packs,
-        llm=llm,
-        repo_root=repo_root,
-    )
+    flags = get_feature_flags()
+    if flags.chaptered_pages:
+        # Chaptered path (#287): flatten to PageSpec for writer (writer changes in #290).
+        chapters: list[ChapterSpec] = run_planner_chaptered(
+            skeleton, evidence_packs, llm=llm, repo_root=repo_root,
+        )
+        page_specs = []
+        for ch in chapters:
+            if not ch.subpages:
+                continue
+            first_sp = ch.subpages[0]
+            page_specs.append(PageSpec(
+                cluster_id=ch.cluster_id,
+                title=ch.chapter_title,
+                description=ch.chapter_description,
+                retrieval_query=first_sp.retrieval_query,
+                target_symbols=first_sp.target_symbols,
+                target_folders=first_sp.target_folders,
+                target_docs=first_sp.target_docs,
+            ))
+        plan_report = PlanReport(
+            tool_budget_total=3 * len(chapters),
+            tool_budget_used=0,
+            tool_budget_exceeded=False,
+            pages_emitted=len(page_specs),
+            notes=[],
+        )
+    else:
+        page_specs, plan_report = run_planner_with_report(
+            skeleton,
+            evidence_packs,
+            llm=llm,
+            repo_root=repo_root,
+        )
 
     logger.info(
         "[UNIFIED] planner done: pages=%d tool_calls=%d/%d exceeded=%s",

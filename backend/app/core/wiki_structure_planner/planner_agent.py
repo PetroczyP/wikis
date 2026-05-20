@@ -32,6 +32,7 @@ from app.core.agent_tools import WIKI_TOOL_SCHEMAS as _TOOL_SCHEMAS
 from app.core.wiki_structure_planner._evidence_utils import safe_join
 from app.core.wiki_structure_planner.evidence import EvidencePack
 from app.core.wiki_structure_planner.planner_prompts import (
+    CHAPTERED_PLANNER_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
     build_user_prompt,
 )
@@ -42,6 +43,34 @@ from app.core.wiki_structure_planner.structure_skeleton import (
 from app.services.llm_factory import safe_bind_tools
 
 logger = logging.getLogger(__name__)
+
+
+# -- SubPageSpec / ChapterSpec ------------------------------------------------
+
+_SUBPAGE_CAP = 6
+_TINY_CLUSTER_MAX_ARTIFACTS = 5
+
+
+@dataclass
+class SubPageSpec:
+    title: str
+    description: str
+    page_order: int
+    retrieval_query: str
+    target_symbols: list[str] = field(default_factory=list)
+    target_folders: list[str] = field(default_factory=list)
+    target_docs: list[str] = field(default_factory=list)
+    evidence_filter_symbols: list[str] = field(default_factory=list)
+    evidence_filter_paths: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ChapterSpec:
+    cluster_id: int
+    chapter_title: str
+    chapter_description: str
+    subpages: list[SubPageSpec] = field(default_factory=list)
+
 
 # ── PageSpec ──────────────────────────────────────────────────────────────────
 
@@ -655,3 +684,225 @@ def run_planner_with_report(
     )
 
 
+# -- Chaptered planner --------------------------------------------------------
+
+
+def _parse_chapter_spec(cluster: Cluster, obj: dict) -> "ChapterSpec | None":
+    chapter_title = (obj.get("chapter_title") or "").strip()
+    chapter_description = (obj.get("chapter_description") or "").strip()
+    raw_subpages = obj.get("subpages")
+    if not chapter_title or not isinstance(raw_subpages, list):
+        return None
+    subpages: list[SubPageSpec] = []
+    for sp_raw in raw_subpages:
+        if not isinstance(sp_raw, dict):
+            continue
+        title = (sp_raw.get("title") or "").strip()
+        description = (sp_raw.get("description") or "").strip()
+        page_order = sp_raw.get("page_order", len(subpages) + 1)
+        retrieval_query = (sp_raw.get("retrieval_query") or "").strip()
+        if not title or not retrieval_query:
+            continue
+        subpages.append(SubPageSpec(
+            title=title,
+            description=description,
+            page_order=int(page_order),
+            retrieval_query=retrieval_query,
+            target_symbols=list(sp_raw.get("target_symbols") or []),
+            target_folders=list(sp_raw.get("target_folders") or []),
+            target_docs=list(sp_raw.get("target_docs") or []),
+            evidence_filter_symbols=list(sp_raw.get("evidence_filter_symbols") or []),
+            evidence_filter_paths=list(sp_raw.get("evidence_filter_paths") or []),
+        ))
+    if not subpages:
+        return None
+    return ChapterSpec(
+        cluster_id=cluster.cluster_id,
+        chapter_title=chapter_title,
+        chapter_description=chapter_description or chapter_title,
+        subpages=subpages,
+    )
+
+
+def _flat_spec_to_chapter(spec: PageSpec, cluster: Cluster) -> ChapterSpec:
+    subpage = SubPageSpec(
+        title=spec.title,
+        description=spec.description,
+        page_order=1,
+        retrieval_query=spec.retrieval_query,
+        target_symbols=spec.target_symbols,
+        target_folders=spec.target_folders,
+        target_docs=spec.target_docs,
+        evidence_filter_symbols=[],
+        evidence_filter_paths=[],
+    )
+    return ChapterSpec(
+        cluster_id=cluster.cluster_id,
+        chapter_title=spec.title,
+        chapter_description=spec.description,
+        subpages=[subpage],
+    )
+
+
+def _enforce_chapter_constraints(chapter: ChapterSpec, cluster: Cluster) -> ChapterSpec:
+    subpages = chapter.subpages
+    if cluster.total_artifacts <= _TINY_CLUSTER_MAX_ARTIFACTS:
+        subpages = subpages[:1]
+    else:
+        subpages = subpages[:_SUBPAGE_CAP]
+    return ChapterSpec(
+        cluster_id=chapter.cluster_id,
+        chapter_title=chapter.chapter_title,
+        chapter_description=chapter.chapter_description,
+        subpages=subpages,
+    )
+
+
+def _plan_cluster_chaptered(
+    cluster: Cluster,
+    pack: "EvidencePack | None",
+    *,
+    llm_with_tools: Any,
+    repo_root: str,
+    budget_tracker: list[int],
+    notes: list[str],
+) -> ChapterSpec:
+    tool_budget_remaining = budget_tracker[1] - budget_tracker[0]
+    user_msg = build_user_prompt(
+        cluster, pack,
+        tool_budget_remaining=tool_budget_remaining,
+        tool_budget_total=budget_tracker[1],
+    )
+    messages: list[Any] = [
+        SystemMessage(content=CHAPTERED_PLANNER_SYSTEM_PROMPT),
+        HumanMessage(content=user_msg),
+    ]
+    max_tool_rounds = min(3, max(0, tool_budget_remaining))
+    for _round in range(max_tool_rounds + 1):
+        response = llm_with_tools.invoke(messages)
+        tool_calls = getattr(response, "tool_calls", None) or []
+        if not tool_calls:
+            content = response.content if isinstance(response.content, str) else str(response.content)
+            obj = _extract_json_object(content)
+            if obj is not None:
+                chapter = _parse_chapter_spec(cluster, obj)
+                if chapter is not None:
+                    return _enforce_chapter_constraints(chapter, cluster)
+                title = (obj.get("title") or "").strip()
+                description = (obj.get("description") or "").strip()
+                retrieval_query = (obj.get("retrieval_query") or "").strip()
+                if title and retrieval_query:
+                    flat = PageSpec(
+                        cluster_id=cluster.cluster_id,
+                        title=title,
+                        description=description,
+                        retrieval_query=retrieval_query,
+                    )
+                    _inject_from_skeleton(flat, cluster)
+                    chapter = _flat_spec_to_chapter(flat, cluster)
+                    note = f"cluster {cluster.cluster_id}: flat LLM response wrapped in 1-subpage ChapterSpec"
+                    notes.append(note)
+                    logger.debug("[PLANNER-CHAPTERED] %s", note)
+                    return _enforce_chapter_constraints(chapter, cluster)
+            note = f"cluster {cluster.cluster_id}: malformed chaptered JSON — using fallback"
+            notes.append(note)
+            logger.warning("[PLANNER-CHAPTERED] %s", note)
+            flat_spec, _ = _fallback_spec(cluster, note)
+            return _enforce_chapter_constraints(_flat_spec_to_chapter(flat_spec, cluster), cluster)
+        messages.append(response)
+        for tc in tool_calls:
+            tool_name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
+            tool_args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+            tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "")
+            if budget_tracker[0] >= budget_tracker[1]:
+                result_text = "[budget exhausted — tool call not executed]"
+                note = f"cluster {cluster.cluster_id}: tool budget exhausted (chaptered)"
+                if note not in notes:
+                    notes.append(note)
+            else:
+                budget_tracker[0] += 1
+                result_text = _dispatch_tool(repo_root, tool_name, tool_args or {})
+            messages.append(ToolMessage(content=result_text, tool_call_id=tc_id or "", name=tool_name or "unknown"))
+        if budget_tracker[0] >= budget_tracker[1]:
+            note = f"cluster {cluster.cluster_id}: budget drained (chaptered) — using fallback"
+            notes.append(note)
+            flat_spec, _ = _fallback_spec(cluster, note)
+            return _enforce_chapter_constraints(_flat_spec_to_chapter(flat_spec, cluster), cluster)
+    note = f"cluster {cluster.cluster_id}: exceeded tool rounds (chaptered) — using fallback"
+    notes.append(note)
+    flat_spec, _ = _fallback_spec(cluster, note)
+    return _enforce_chapter_constraints(_flat_spec_to_chapter(flat_spec, cluster), cluster)
+
+
+def run_planner_chaptered(
+    skeleton: StructureSkeleton,
+    evidence_packs: dict[int, EvidencePack],
+    *,
+    llm: BaseChatModel,
+    repo_root: str,
+) -> list[ChapterSpec]:
+    """Run the chaptered planner: each cluster -> ChapterSpec with sub-pages.
+
+    Tiny clusters (total_artifacts <= 5) are capped at 1 sub-page.
+    All clusters are capped at 6 sub-pages.
+    Flat LLM responses (old format) are wrapped in 1-subpage ChapterSpec.
+
+    Args:
+        skeleton: Completed structure skeleton.
+        evidence_packs: Pre-built evidence packs keyed by cluster_id.
+        llm: Pre-configured LangChain chat model.
+        repo_root: Absolute path to the checked-out repository root.
+
+    Returns:
+        List of ChapterSpec objects — one per resolved cluster.
+
+    Raises:
+        ValueError: If repo_root is not a valid directory.
+    """
+    import os  # noqa: PLC0415
+
+    if not repo_root or not os.path.isdir(repo_root):
+        raise ValueError(f"repo_root must be a valid directory: {repo_root!r}")
+    if skeleton.clusters:
+        clusters: list[Cluster] = skeleton.clusters
+    else:
+        clusters = list(skeleton.code_clusters)
+    if not clusters:
+        logger.info("[PLANNER-CHAPTERED] no clusters — returning empty list")
+        return []
+    n = len(clusters)
+    budget_total = 3 * n
+    budget_tracker: list[int] = [0, budget_total]
+    notes: list[str] = []
+    logger.info("[PLANNER-CHAPTERED] starting: %d clusters, tool budget=%d", n, budget_total)
+    llm_with_tools = safe_bind_tools(llm, _TOOL_SCHEMAS)
+    chapters_by_id: dict[int, ChapterSpec] = {}
+    for cluster in clusters:
+        pack = evidence_packs.get(cluster.cluster_id)
+        if pack is None:
+            note = f"cluster {cluster.cluster_id} had no evidence pack (chaptered)"
+            notes.append(note)
+            logger.warning("[PLANNER-CHAPTERED] %s", note)
+        try:
+            chapter = _plan_cluster_chaptered(
+                cluster=cluster, pack=pack, llm_with_tools=llm_with_tools,
+                repo_root=repo_root, budget_tracker=budget_tracker, notes=notes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            note = f"cluster {cluster.cluster_id}: LLM call failed (chaptered) ({exc})"
+            notes.append(note)
+            logger.error("[PLANNER-CHAPTERED] %s", note, exc_info=True)
+            flat_spec, _ = _fallback_spec(cluster, note)
+            chapter = _enforce_chapter_constraints(_flat_spec_to_chapter(flat_spec, cluster), cluster)
+        chapters_by_id[cluster.cluster_id] = chapter
+    for cluster in clusters:
+        if cluster.cluster_id not in chapters_by_id:
+            note = f"cluster {cluster.cluster_id}: missing chapter — synthesising fallback"
+            notes.append(note)
+            flat_spec, _ = _fallback_spec(cluster, note)
+            chapters_by_id[cluster.cluster_id] = _enforce_chapter_constraints(
+                _flat_spec_to_chapter(flat_spec, cluster), cluster
+            )
+    result = [chapters_by_id[c.cluster_id] for c in clusters]
+    logger.info("[PLANNER-CHAPTERED] done: %d chapters", len(result))
+    return result
