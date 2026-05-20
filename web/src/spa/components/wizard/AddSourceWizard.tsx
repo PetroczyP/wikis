@@ -70,7 +70,7 @@ interface AddSourceWizardProps {
   onAlreadyExists?: (existingWikiId: string | null) => void;
 }
 
-const URL_PATTERN = /^(https?:\/\/|git@|file:\/\/|\/)/;
+const URL_PATTERN = /^(https?:\/\/|git@|file:\/\/)/;
 
 function isUrlish(value: string): boolean {
   return URL_PATTERN.test(value.trim());
@@ -111,7 +111,7 @@ export function AddSourceWizard({
     const url = formData.git.repo_url.trim();
     if (!url) return 'Repository URL is required';
     if (!isUrlish(url))
-      return 'Must be a valid URL (https://, git@, file://, or local /path)';
+      return 'Must be a valid Git URL (https://, git@, or file://)';
     return null;
   }, [formData.source_type, formData.localFsMode, formData.archiveMode, formData.git.repo_url]);
 

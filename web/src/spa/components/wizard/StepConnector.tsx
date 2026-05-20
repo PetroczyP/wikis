@@ -78,7 +78,7 @@ const CONNECTORS: ConnectorOption[] = [
     disabled: false,
     id: 'git',
     label: 'Git',
-    description: 'GitHub, GitLab, Bitbucket, or a local path',
+    description: 'GitHub, GitLab, Bitbucket, Azure DevOps',
     icon: <GitBrandIcon />,
     iconColor: 'text.primary',
     testId: 'connector-git',

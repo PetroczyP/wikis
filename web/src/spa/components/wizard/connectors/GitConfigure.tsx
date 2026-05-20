@@ -25,7 +25,7 @@ export function GitConfigure({ data, onChange, urlError, disabled }: GitConfigur
     <Box>
       <TextField
         label="Repository URL"
-        placeholder="https://github.com/owner/repo  ·  /abs/path for local"
+        placeholder="https://github.com/owner/repo"
         value={data.repo_url}
         onChange={(e) => set('repo_url', e.target.value)}
         required
