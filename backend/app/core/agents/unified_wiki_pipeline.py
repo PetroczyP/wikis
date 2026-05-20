@@ -362,7 +362,6 @@ def run_unified_pipeline(
     name_index: set[str] | None = None,
     gate_mode: dict[str, str] | None = None,
     stream_callback: Callable[[dict], None] | None = None,
-    storage: Any = None,
 ) -> UnifiedPipelineResult:
     """Run the unified planner → writer → gate → verifier pipeline.
 
