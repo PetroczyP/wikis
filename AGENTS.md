@@ -46,21 +46,22 @@ wikis/
 │   │   ├── api/
 │   │   │   └── routes.py     ← HTTP handlers (thin — delegate to services)
 │   │   ├── core/             ← Wiki engine (40+ modules)
-│   │   │   ├── agents/       ← LangGraph wiki generation agents (`wiki_graph_optimized`)
+│   │   │   ├── agents/       ← LangGraph generation: `wiki_graph_optimized.py` (entry), `unified_wiki_pipeline.py` (orchestrator), `page_patcher.py`
 │   │   │   ├── code_graph/   ← Graph builder + unified FTS/vector index (SQLite or Postgres)
 │   │   │   ├── deep_research/← Multi-step agentic research engine
 │   │   │   ├── parsers/      ← tree-sitter for 14+ languages
 │   │   │   ├── repo_providers/← GitHub, GitLab, Bitbucket, Azure DevOps
 │   │   │   ├── storage/      ← `WikiStorageProtocol` + `sqlite.py` (UnifiedWikiDB) / `postgres.py`
-│   │   │   ├── wiki_structure_planner/ ← LLM outline + cluster planners
+│   │   │   ├── wiki_structure_planner/ ← Unified planner: `planner_agent.py`, `planner_prompts.py`, `structure_skeleton.py`, `doc_clustering.py`, `language_heuristics.py`, `structure_tools.py`; evidence builders: `evidence.py`, `evidence_md.py`, `evidence_confluence.py`, `evidence_jira.py`, `_evidence_utils.py`; `page_validator.py`, `coverage_ledger.py`; `structure_engine.py` (residual scaffolding)
+│   │   │   ├── wiki_content_writer/ ← Writer agent: `writer_agent.py`, `writer_tools.py`; citation: `citation_extractor.py`, `citation_verifier.py`, `verifier_prompts.py`, `source_gate.py`, `link_resolver.py`, `prompts.py`
 │   │   │   ├── prompts/      ← LangChain prompt templates
 │   │   │   ├── state/        ← LangGraph state (`WikiState`)
 │   │   │   ├── multi_retriever.py / unified_retriever.py ← Ensemble retrieval (dense + sparse + reranking)
 │   │   │   ├── wiki_search_engine.py / project_search_engine.py ← FTS + graph re-ranking
 │   │   │   ├── wiki_page_index.py / wiki_page_search.py ← Wikilink graph + page search adapter
-│   │   │   ├── graph_clustering.py / cluster_expansion.py / cluster_planner.py ← Leiden pipeline
+│   │   │   ├── graph_clustering.py / cluster_expansion.py ← Leiden pipeline
 │   │   │   ├── graph_topology.py ← Topology enrichment (hubs, density)
-│   │   │   └── feature_flags.py ← `WIKIS_CLUSTER_*` toggles
+│   │   │   └── feature_flags.py ← `WIKIS_CLUSTER_*` toggles (hierarchical Leiden, smart expansion, language hints, stability)
 │   │   ├── models/           ← Pydantic request/response/event/search models
 │   │   ├── services/         ← Business logic layer
 │   │   │   ├── wiki_service.py / wiki_management.py
@@ -194,7 +195,10 @@ All vars live in `.env` at project root. Both services read it.
 | `AUTH_ENABLED` | No | `false` disables JWT check (local dev only) |
 | `STORAGE_BACKEND` | No | Artifact storage: `local` (default) or `s3` |
 | `LLM_MAX_CONCURRENCY` | No | Cap concurrent LLM calls (per process) |
-| `WIKIS_CLUSTER_*` | No | Feature flags for the Leiden clustering pipeline (default on) |
+| `WIKIS_CLUSTER_HIERARCHICAL_LEIDEN` | No | Feature flag — hierarchical Leiden clustering (default on) |
+| `WIKIS_CLUSTER_SMART_EXPANSION` | No | Feature flag — smart cluster expansion (default on) |
+| `WIKIS_CLUSTER_LANGUAGE_HINTS` | No | Feature flag — language-hint grouping (default on) |
+| `WIKIS_CLUSTER_STABILITY` | No | Feature flag — cluster stability hashing (default on) |
 
 Generate JWT keys:
 ```bash
@@ -318,12 +322,21 @@ repo URL
   → FilesystemIndexer (language detection, file filtering)
   → tree-sitter parsers (14+ languages) → graph builder
   → WikiStorageProtocol (UnifiedWikiDB / SQLite + sqlite-vec  OR  PostgreSQL + pgvector)
-  → graph topology enrichment (hubs, density) + Leiden clustering (cluster_expansion, coverage_ledger)
-  → WikiStructurePlanner (agent planner OR cluster planner — set by PLANNER_TYPE)
-  → OptimizedWikiGenerationAgent (LangGraph: parallel page writer)
+  → graph topology enrichment (hubs, density) + Leiden clustering
+      → four cluster kinds: code | doc | confluence | jira
+  → per-cluster evidence packs (wiki_structure_planner/evidence*.py, ~1500 tokens each)
+  → unified planner agent (planner_agent.py — names/describes pages from evidence;
+      hard tool-call budget = 3 × n_clusters; four-tier fallback on empty input)
+  → writer agent per page (wiki_content_writer/writer_agent.py — per-page budget formula)
+      with citation contract (inline [path:lo-hi] or [path:N] tokens)
+  → source-kind gate (source_gate.py — strips/defers README/SQL/identifier claims)
+  → LLM citation verifier (citation_verifier.py — drops unsupported claims)
+  → UnifiedPipelineResult (agents/unified_wiki_pipeline.py orchestrator)
   → SSE progress events → SPA GenerationProgress component
   → wiki page markdown + WikiPageIndex (wikilink graph) → artifact storage (local or S3)
 ```
+
+`planner_type` / `structure_planner` request fields are accepted for back-compat but are no-ops — the unified path is the only path since #242.
 
 ### Non-code file ingestion (#118)
 

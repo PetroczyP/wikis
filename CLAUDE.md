@@ -128,15 +128,16 @@ Browser → Next.js Web App (:3000)
 - `core/` — The wiki engine (40+ modules):
   - `parsers/` — Tree-sitter for 14+ languages
   - `code_graph/` — Graph builder + standalone FTS5 index for NX-graph cache (`graph_text_index.py`); the unified-storage equivalent lives in `core/storage/text_index.py` (`StorageTextIndex`) and works for both SQLite and Postgres backends
-  - `agents/` — LangGraph wiki generation agents (`wiki_graph_optimized`)
+  - `agents/` — LangGraph wiki generation agents: `wiki_graph_optimized.py` (entry point), `unified_wiki_pipeline.py` (post-#242 orchestrator), `page_patcher.py` (incremental edits)
+  - `wiki_structure_planner/` — Unified planner: `planner_agent.py`, `planner_prompts.py`, `structure_skeleton.py`, `doc_clustering.py`, `language_heuristics.py`, `structure_tools.py`; evidence builders: `evidence.py` (code), `evidence_md.py`, `evidence_confluence.py`, `evidence_jira.py`, `_evidence_utils.py`; `page_validator.py`, `coverage_ledger.py`; `structure_engine.py` (residual scaffolding only — `plan_structure()` entry points removed in #242)
+  - `wiki_content_writer/` — Writer agent: `writer_agent.py`, `writer_tools.py`; citation pipeline: `citation_extractor.py`, `citation_verifier.py`, `verifier_prompts.py`, `source_gate.py`; `link_resolver.py`, `prompts.py`
   - `deep_research/` — Multi-step research engine (LangGraph)
-  - `wiki_structure_planner/` — LLM outline + cluster planners
   - `storage/` — Wiki storage protocol + backends (`sqlite.py` UnifiedWikiDB / `postgres.py` pgvector) selected via `WIKI_STORAGE_BACKEND`
   - `multi_retriever.py`, `unified_retriever.py` — ensemble retrieval (dense + sparse + reranking)
   - `wiki_search_engine.py`, `project_search_engine.py`, `wiki_page_index.py` — search + wikilink graph
   - `graph_clustering.py`, `cluster_expansion.py`, `graph_topology.py` — Leiden clustering + topology enrichment
   - `repo_providers/` — GitHub, GitLab, Bitbucket, Azure DevOps
-  - `feature_flags.py` — `WIKIS_CLUSTER_*` toggles
+  - `feature_flags.py` — `WIKIS_CLUSTER_*` toggles (hierarchical Leiden, smart expansion, language hints, stability); `WIKIS_CLUSTER_CAPABILITY_VALIDATION` and `WIKIS_CLUSTER_COVERAGE_LEDGER` were removed in #242
 - `models/` — Pydantic request/response/event/search models
 - `storage/` — Artifact storage abstraction (local / S3)
 - `mcp_server/` (sibling to `app/`) — FastMCP tools wired to services in `app/main.py`
@@ -145,7 +146,9 @@ Browser → Next.js Web App (:3000)
 The web app issues RS256 JWTs. The backend validates them using `JWT_PUBLIC_KEY`. For local dev without auth: `AUTH_ENABLED=false`.
 
 ### Wiki Generation Pipeline
-Repository → `LocalRepositoryManager` (clone) → `FilesystemIndexer` (filter) → tree-sitter parsers → graph builder + `WikiStorageProtocol` (SQLite/FTS5 + sqlite-vec **or** PostgreSQL/tsvector + pgvector) → topology enrichment + Leiden clustering → `WikiStructurePlanner` (LLM outline) → `OptimizedWikiGenerationAgent` (LangGraph parallel page writer) → SSE events to frontend.
+Repository → `LocalRepositoryManager` (clone) → `FilesystemIndexer` (filter) → tree-sitter parsers → graph builder + `WikiStorageProtocol` (SQLite/FTS5 + sqlite-vec **or** PostgreSQL/tsvector + pgvector) → topology enrichment + Leiden clustering into four cluster kinds (code / doc / confluence / jira) → per-cluster evidence packs (`wiki_structure_planner/evidence*.py`) → **unified planner agent** (`wiki_structure_planner/planner_agent.py`, hard tool-call budget) → **writer agent** (`wiki_content_writer/writer_agent.py`, per-page budget) with citation contract → **source-kind gate** (`wiki_content_writer/source_gate.py`, strips README/SQL claims) → **LLM citation verifier** (`wiki_content_writer/citation_verifier.py`) → final markdown via `agents/unified_wiki_pipeline.py` orchestrator → SSE progress events → SPA.
+
+Four-tier fallback in the planner when evidence is empty: dirs → artifact names → path leaves → cluster-kind keyword; the writer always receives a non-empty spec.
 
 ### Wiki Storage Backend
 Graph nodes/edges, FTS, vector embeddings, and clustering metadata all sit behind `WikiStorageProtocol` (`backend/app/core/storage/`):
@@ -190,7 +193,13 @@ Both services read from `.env` at the project root (Docker Compose loads it). Co
 - `LLM_API_KEY` + `LLM_PROVIDER` for wiki generation
 - `JWT_PRIVATE_KEY` / `JWT_PUBLIC_KEY` — generate with `openssl genrsa` + `openssl rsa -pubout`
 
+`planner_type` and `structure_planner` fields in `GenerateWikiRequest` are accepted for back-compat but are no-ops — the unified planner is the only path since #242.
+
 Default admin credentials (change immediately): `admin@wikis.dev` / `changeme123`
 
 Swagger UI available at `http://localhost:8000/docs` when backend is running.
+
+## Epic #227 — Unified planner + writer (landed May 2026)
+
+Replaced two legacy planner paths (`plan_structure` / `plan_structure_graph_first` in `structure_engine.py`, the DeepAgents-based cluster planner, `structure_refiner`, `candidate_builder`, `context_eviction_middleware`, `WIKIS_UNIFIED_PIPELINE` flag) with a single evidence-first pipeline: each cluster gets a pre-built evidence pack, the unified planner agent names pages from real code context, a writer agent generates content with a citation contract, a source-kind gate strips unsourced README/SQL claims, and an LLM verifier pass validates remaining citations. The legacy UI planner-type picker and "Use stored PAT" Atlassian auth option were removed; Confluence/Jira now offer OAuth or email+API-token (HTTP Basic). Net: ~6042 lines deleted.
 
