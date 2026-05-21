@@ -2,14 +2,14 @@
 Deterministic Structure Skeleton Builder
 
 Builds a complete repository structure skeleton without any LLM calls.
-Uses graph topology (Louvain community detection) to cluster directories
-into page-sized groups, ensuring 100% directory and symbol coverage by
-construction.
+Uses graph topology (Leiden community detection, Louvain fallback) to
+cluster directories into page-sized groups, ensuring 100% directory and
+symbol coverage by construction.
 
 Phase 1 of the Graph-First approach:
   1a. build_dir_symbol_map   – walk graph, extract architectural symbols
   1b. build_dir_interaction_graph – weighted cross-dir edges
-  1c. cluster_directories    – Louvain community detection
+  1c. cluster_directories    – Leiden (or Louvain) community detection
   1d. normalize_clusters     – split large / merge small
   1e. build_doc_clusters     – doc-only directories
   1f. build_skeleton         – top-level orchestrator
@@ -25,6 +25,15 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 import networkx as nx
+
+# Leiden is preferred over Louvain (guarantees internally-connected communities).
+# Fall back gracefully when leidenalg / python-igraph are not installed.
+try:
+    import igraph as _ig
+    import leidenalg as _leidenalg
+    _HAS_LEIDEN = True
+except ImportError:
+    _HAS_LEIDEN = False
 
 from ..constants import (
     COVERAGE_IGNORE_DIRS,
@@ -421,10 +430,11 @@ def cluster_directories(
     dir_symbols: dict[str, list[SymbolInfo]],
     min_symbols: int = 10,
 ) -> list[set[str]]:
-    """Partition directories into clusters using Louvain community detection.
+    """Partition directories into clusters using Leiden (preferred) or Louvain.
 
-    For graphs with few/no edges falls back to directory-tree proximity
-    clustering (siblings under the same parent are grouped together).
+    Leiden guarantees internally-connected communities; Louvain can produce
+    disconnected ones. Falls back to Louvain when leidenalg is not installed,
+    and to directory-tree proximity clustering for sparse graphs.
 
     Returns list of sets, each set = directory paths in one cluster.
     """
@@ -434,7 +444,6 @@ def cluster_directories(
     # ── Check if graph has meaningful edges ───────────────────────────
     total_edge_weight = sum(d.get("weight", 1) for _, _, d in dir_graph.edges(data=True))
     if total_edge_weight < len(dir_graph.nodes) * 0.3:
-        # Too few edges – Louvain won't produce meaningful communities
         logger.info(
             "[SKELETON] Sparse edge graph (%d nodes, total_weight=%d) → falling back to directory-tree clustering",
             len(dir_graph.nodes),
@@ -442,10 +451,16 @@ def cluster_directories(
         )
         return _cluster_by_directory_tree(dir_graph, dir_symbols, min_symbols)
 
-    # ── Louvain with adaptive resolution ──────────────────────────────
-    # Higher resolution → more (smaller) communities
-    # Binary-search to get cluster count ≈ page_budget ± 30%
-    best_communities: list[set[str]] = []
+    # ── Leiden (preferred) with adaptive resolution ───────────────────
+    if _HAS_LEIDEN:
+        best_communities = _leiden_dir_communities(dir_graph, page_budget)
+        if best_communities:
+            logger.debug("[SKELETON] Used Leiden for directory clustering")
+            return best_communities
+        logger.debug("[SKELETON] Leiden produced no communities; falling back to Louvain")
+
+    # ── Louvain fallback ──────────────────────────────────────────────
+    best_communities = []
     best_diff = float("inf")
     target = page_budget
 
@@ -465,15 +480,57 @@ def cluster_directories(
         if diff < best_diff:
             best_diff = diff
             best_communities = communities
-        # Good enough
         if diff <= max(3, target * 0.2):
             break
 
     if not best_communities:
-        # Louvain failed entirely – fallback
         return _cluster_by_directory_tree(dir_graph, dir_symbols, min_symbols)
 
     return best_communities
+
+
+def _leiden_dir_communities(dir_graph: nx.Graph, page_budget: int) -> list[set[str]]:
+    """Run Leiden on the directory interaction graph with adaptive resolution.
+
+    Requires `leidenalg` and `igraph` — callers must check `_HAS_LEIDEN`.
+    Returns empty list on any failure so the caller can fall back to Louvain.
+    """
+    try:
+        node_list = list(dir_graph.nodes())
+        node_index = {n: i for i, n in enumerate(node_list)}
+        edges = [(node_index[u], node_index[v]) for u, v in dir_graph.edges()]
+        weights = [dir_graph[u][v].get("weight", 1.0) for u, v in dir_graph.edges()]
+
+        ig = _ig.Graph(n=len(node_list), edges=edges, directed=False)
+        ig.es["weight"] = weights
+
+        best_communities: list[set[str]] = []
+        best_diff = float("inf")
+        target = page_budget
+
+        for resolution in (0.3, 0.5, 0.7, 1.0, 1.3, 1.6, 2.0, 2.5):
+            partition = _leidenalg.find_partition(
+                ig,
+                _leidenalg.RBConfigurationVertexPartition,
+                weights="weight",
+                resolution_parameter=resolution,
+                seed=42,
+            )
+            communities = [
+                {node_list[i] for i in part}
+                for part in partition
+            ]
+            diff = abs(len(communities) - target)
+            if diff < best_diff:
+                best_diff = diff
+                best_communities = communities
+            if diff <= max(3, target * 0.2):
+                break
+
+        return best_communities
+    except Exception as exc:
+        logger.debug("[SKELETON] Leiden dir clustering failed: %s", exc)
+        return []
 
 
 def _cluster_by_directory_tree(
@@ -785,7 +842,7 @@ def build_skeleton(
         dir_symbols,
     )
     logger.info(
-        "[SKELETON] 1c. Louvain produced %d raw clusters",
+        "[SKELETON] 1c. Leiden/Louvain produced %d raw clusters",
         len(raw_clusters),
     )
 

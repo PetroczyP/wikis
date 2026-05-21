@@ -1,4 +1,4 @@
-"""Semantic enrichment passes on top of structural Louvain clustering.
+"""Semantic enrichment passes on top of structural Leiden clustering.
 
 This module implements:
 
