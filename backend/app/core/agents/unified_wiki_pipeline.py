@@ -488,7 +488,8 @@ def run_unified_pipeline(
         chapter_pages: list[GeneratedPage] = []
         chapter_gate_reports: dict[int, GateReport] = {}
 
-        for ch in chapters:
+        total_chapters = len(chapters)
+        for ch_idx, ch in enumerate(chapters):
             slices = chapter_evidence.get(ch.cluster_id, [])
             if len(slices) < len(ch.subpages):
                 logger.warning(
@@ -496,6 +497,29 @@ def run_unified_pipeline(
                     "trailing subpages will use empty evidence",
                     ch.cluster_id, len(ch.subpages), len(slices),
                 )
+
+            # Emit chapter-level progress events directly — sub-page events fire
+            # from thread pool executors and don't reliably reach the SSE stream.
+            if stream_callback:
+                try:
+                    stream_callback({
+                        "event": "writer.page_started",
+                        "page_id": ch.cluster_id,
+                        "title": ch.chapter_title,
+                    })
+                except Exception:
+                    pass
+            for sp in ch.subpages:
+                if stream_callback:
+                    try:
+                        stream_callback({
+                            "event": "writer.page_started",
+                            "page_id": ch.cluster_id * 1000 + sp.page_order,
+                            "title": sp.title,
+                        })
+                    except Exception:
+                        pass
+
             try:
                 # Use new_event_loop / run_until_complete / close instead of
                 # asyncio.run() — safe both inside and outside a running loop.
@@ -503,7 +527,7 @@ def run_unified_pipeline(
                 try:
                     index_md, subpage_mds = _loop.run_until_complete(
                         chapter_writer.generate_chapter(
-                            ch, slices, stream_callback=stream_callback,
+                            ch, slices, stream_callback=None,  # handled above
                         )
                     )
                 finally:
@@ -521,6 +545,28 @@ def run_unified_pipeline(
                     f"# {sp.title}\n\n{sp.description}\n"
                     for sp in ch.subpages
                 ]
+
+            # Emit done events for chapter + sub-pages
+            if stream_callback:
+                try:
+                    stream_callback({
+                        "event": "writer.page_done",
+                        "page_id": ch.cluster_id,
+                        "title": ch.chapter_title,
+                        "n_paragraphs": len(index_md.split("\n\n")) if index_md else 0,
+                    })
+                except Exception:
+                    pass
+                for sp_idx, (sp, md) in enumerate(zip(ch.subpages, subpage_mds)):
+                    try:
+                        stream_callback({
+                            "event": "writer.page_done",
+                            "page_id": ch.cluster_id * 1000 + sp.page_order,
+                            "title": sp.title,
+                            "n_paragraphs": len(md.split("\n\n")) if md else 0,
+                        })
+                    except Exception:
+                        pass
 
             # Chapter index page
             chapter_pages.append(GeneratedPage(
