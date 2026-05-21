@@ -1898,6 +1898,23 @@ class OptimizedWikiGenerationAgent:
 
         repo_name = os.path.basename(repo_root.rstrip("/"))
 
+        # ── Agentic repo analysis (RepoExplorer) ─────────────────────
+        # Run HERE after indexing so repo_root, WriterTools, and the code
+        # graph are all available. The analyze_repository state runs too
+        # early (before cloning) and always falls back to the blind LLM call.
+        _readme = state.get("readme_content", "")
+        _repo_tree = state.get("repository_tree", "")
+        logger.info("[UNIFIED] running agentic repo analysis (post-index)")
+        fresh_repo_analysis = self._explore_repository(
+            _repo_tree, _readme, repo_name=repo_name
+        )
+        if fresh_repo_analysis:
+            # Override the stale state value with the post-index agentic analysis.
+            repo_analysis = fresh_repo_analysis
+            logger.info("[UNIFIED] agentic repo analysis complete: %d chars", len(repo_analysis))
+        else:
+            logger.warning("[UNIFIED] agentic repo analysis failed — using state value (%d chars)", len(repo_analysis))
+
         # ── Compute page budget (same formula as graph-first path) ────
         file_count = len(repository_files)
         file_factor = max(8, min(file_count // 25, 120))
