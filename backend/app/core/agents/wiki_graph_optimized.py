@@ -2276,6 +2276,32 @@ class OptimizedWikiGenerationAgent:
                 f"{result.plan_report.tool_budget_total} tool calls used."
             )
 
+        # ── Repo-level cluster relationship diagram ────────────────────
+        # Build cluster title map from chapter-index pages, then generate a
+        # Mermaid cluster-dependency diagram and append it to the overview.
+        try:
+            from ..wiki_content_writer.diagram_generator import DiagramGenerator  # noqa: PLC0415
+            _chapter_cluster_ids: list[int] = []
+            _chapter_cluster_titles: dict[int, str] = {}
+            for _gp in result.pages:
+                if _gp.metadata.get("is_chapter_index"):
+                    _cid = _gp.page_id
+                    if isinstance(_cid, int):
+                        _chapter_cluster_ids.append(_cid)
+                        _chapter_cluster_titles[_cid] = _gp.title
+            if _chapter_cluster_ids and self._cluster_db is not None:
+                _dg = DiagramGenerator(self._cluster_db)
+                _repo_diagram = _dg.generate_repo_diagram(
+                    _chapter_cluster_ids, _chapter_cluster_titles
+                )
+                if _repo_diagram:
+                    overview_markdown = (
+                        f"{overview_markdown.rstrip()}\n\n"
+                        f"## Cluster Dependencies\n\n{_repo_diagram}\n"
+                    )
+        except Exception as _diag_exc:
+            logger.debug("[UNIFIED] repo diagram generation failed: %s", _diag_exc)
+
         # ── Convert GeneratedPage → WikiStructureSpec + WikiPage ──────
         from ..state.wiki_state import (  # noqa: PLC0415
             PageSpec as StatePageSpec,

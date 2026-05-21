@@ -490,6 +490,200 @@ class WikiContentWriter:
 
     # ── generate_chapter ──────────────────────────────────────────────────
 
+    # Budget for the chapter-index mini research loop (6 tool calls).
+    _CHAPTER_INDEX_BUDGET: int = 6
+
+    def _generate_chapter_index(
+        self,
+        chapter_spec: "ChapterSpec",
+        evidence_slices: "list[EvidenceSlice]",
+        toc_wikilinks: str,
+        *,
+        stream_callback: Callable[[dict], None] | None = None,
+    ) -> str:
+        """Run a mini tool-augmented loop to write the chapter _index.md.
+
+        Uses up to ``_CHAPTER_INDEX_BUDGET`` (6) tool calls focused on the
+        cluster's own symbols to produce a structured Markdown overview with:
+
+        ``## Overview`` — 2-3 sentences describing the cluster.
+        ``## Key Components`` — list of main symbols with 1-sentence roles.
+        ``## Sub-pages`` — ``[[wikilink]]`` TOC built deterministically.
+
+        Falls back to a minimal stub if the LLM call fails or the client is
+        unavailable.  Never raises.
+        """
+        effective_llm = self.llm_client
+        if effective_llm is None:
+            return self._chapter_index_fallback(
+                chapter_spec.chapter_title, toc_wikilinks
+            )
+
+        # Gather seed symbols and file paths from the first evidence slice.
+        seed_symbols: list[str] = []
+        seed_files: list[str] = []
+        for sl in evidence_slices[:2]:  # limit context to first 2 slices
+            seed_symbols.extend(sl.symbols[:4])
+            seed_files.extend(sl.file_paths[:3])
+
+        # Build the wikilink TOC line so the LLM can reference it in the
+        # ## Sub-pages section (the deterministic version is appended after).
+        system_prompt = (
+            f"You are writing the overview page for a wiki chapter about "
+            f"{chapter_spec.chapter_title}.\n"
+            "Your goal: write a clear, human-readable _index.md that helps "
+            "developers understand this cluster of code. Use tools to read "
+            "2-3 key files and understand what the code does.\n\n"
+            "Output ONLY this Markdown structure (no extra commentary):\n"
+            "## Overview\n"
+            "[2-3 sentences explaining what this cluster does and why it "
+            "exists in the system]\n\n"
+            "## Key Components\n"
+            "- **SymbolName**: [1 sentence role]\n"
+            "- **SymbolName**: [1 sentence role]\n"
+            "...\n\n"
+            "## Sub-pages\n"
+            f"{toc_wikilinks}\n\n"
+            "IMPORTANT: Do NOT write code. Write only prose descriptions. "
+            "Do NOT call more than 6 tools total."
+        )
+
+        user_prompt = (
+            f"Chapter: {chapter_spec.chapter_title}\n"
+            f"Description: {chapter_spec.chapter_description}\n\n"
+            f"Key symbols: {', '.join(seed_symbols) or 'none'}\n"
+            f"Key files: {', '.join(seed_files) or 'none'}\n\n"
+            f"Sub-pages to document:\n{toc_wikilinks}\n\n"
+            "Read 2-3 key files to understand the code, then write the "
+            "chapter index following the system prompt structure exactly."
+        )
+
+        llm_with_tools = safe_bind_tools(effective_llm, _WRITER_TOOL_SCHEMAS)
+
+        messages: list[Any] = [
+            make_cached_system_message(system_prompt, cache=is_bedrock_llm(effective_llm)),
+            HumanMessage(content=user_prompt),
+        ]
+
+        tool_calls_made = 0
+        content = ""
+
+        try:
+            for _round in range(self._CHAPTER_INDEX_BUDGET):
+                response = llm_with_tools.invoke(messages)
+                tool_calls = getattr(response, "tool_calls", None) or []
+
+                if not tool_calls:
+                    content = (
+                        response.content
+                        if isinstance(response.content, str)
+                        else str(response.content)
+                    )
+                    break
+
+                # Execute all tool calls in this round.
+                messages.append(response)
+                for tc in tool_calls:
+                    tc_name = (
+                        tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+                    )
+                    tc_args = (
+                        tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+                    )
+                    tc_id = (
+                        tc.get("id", str(_round))
+                        if isinstance(tc, dict)
+                        else getattr(tc, "id", str(_round))
+                    )
+
+                    if isinstance(tc_args, str):
+                        try:
+                            tc_args = json.loads(tc_args)
+                        except json.JSONDecodeError:
+                            tc_args = {}
+                    if not isinstance(tc_args, dict):
+                        tc_args = {}
+
+                    result_text = self._dispatch_tool(tc_name, tc_args)
+                    tool_calls_made += 1
+
+                    if stream_callback:
+                        try:
+                            stream_callback({
+                                "event": "writer.tool_call",
+                                "tool": tc_name,
+                                "args": tc_args,
+                            })
+                        except Exception:
+                            pass
+
+                    messages.append(
+                        ToolMessage(content=result_text, tool_call_id=tc_id, name=tc_name)
+                    )
+
+                logger.debug(
+                    "[WRITER] chapter index tool round %d/%d: %d calls this round, %d total",
+                    _round + 1,
+                    self._CHAPTER_INDEX_BUDGET,
+                    len(tool_calls),
+                    tool_calls_made,
+                )
+
+                if tool_calls_made >= self._CHAPTER_INDEX_BUDGET:
+                    # Budget exhausted — force final write.
+                    messages.append(HumanMessage(content=(
+                        "You have used all available tool calls. Based on the "
+                        "evidence you gathered, write the complete chapter index "
+                        "in Markdown now. Follow the structure exactly: "
+                        "## Overview, ## Key Components, ## Sub-pages. "
+                        "Do NOT call any more tools."
+                    )))
+                    response = llm_with_tools.invoke(messages)
+                    final_tc = getattr(response, "tool_calls", None) or []
+                    if not final_tc:
+                        content = (
+                            response.content
+                            if isinstance(response.content, str)
+                            else str(response.content)
+                        )
+                    break
+
+        except Exception as exc:
+            logger.warning("[WRITER] chapter index loop failed: %s", exc)
+
+        if not content:
+            return self._chapter_index_fallback(chapter_spec.chapter_title, toc_wikilinks)
+
+        # Ensure the deterministic Sub-pages TOC is always present.
+        if "## Sub-pages" not in content:
+            content = f"{content.rstrip()}\n\n## Sub-pages\n{toc_wikilinks}"
+        elif toc_wikilinks and toc_wikilinks.strip() not in content:
+            # Replace everything from "## Sub-pages" to end-of-string with the
+            # deterministic TOC. Keep everything the LLM wrote BEFORE that section.
+            sub_pos = content.find("## Sub-pages")
+            content = f"{content[:sub_pos].rstrip()}\n\n## Sub-pages\n{toc_wikilinks}"
+
+        logger.info(
+            "[WRITER] chapter index done: title=%r tool_calls=%d chars=%d",
+            chapter_spec.chapter_title,
+            tool_calls_made,
+            len(content),
+        )
+        return content
+
+    def _chapter_index_fallback(self, chapter_title: str, toc_wikilinks: str) -> str:
+        """Minimal chapter index when the LLM loop fails or is unavailable."""
+        parts = [
+            "## Overview",
+            f"{chapter_title}.",
+            "",
+            "## Key Components",
+            "",
+        ]
+        if toc_wikilinks:
+            parts += ["## Sub-pages", toc_wikilinks]
+        return "\n".join(parts)
+
     async def generate_chapter(
         self,
         chapter_spec: "ChapterSpec",
@@ -503,8 +697,9 @@ class WikiContentWriter:
         ``zip(chapter_spec.subpages, evidence_slices)``, builds a
         page-spec dict and calls ``self.generate_page`` in parallel via
         ``asyncio.gather``.  After all sub-pages are done, generates the
-        chapter index: a short LLM-written overview paragraph followed by a
-        ``[[wikilink]]`` TOC.
+        chapter index via a mini tool-augmented loop (budget=6) that reads
+        key files from the cluster before writing a structured
+        ``## Overview / ## Key Components / ## Sub-pages`` index.
 
         Parameters
         ----------
@@ -520,7 +715,7 @@ class WikiContentWriter:
         Returns
         -------
         (chapter_index_markdown, list_of_subpage_markdowns)
-            ``chapter_index_markdown`` — short overview + ``[[wikilink]]`` TOC.
+            ``chapter_index_markdown`` — structured overview + wikilink TOC.
             ``list_of_subpage_markdowns`` — one entry per sub-page (never empty
             when subpages exist; fallback applied on per-subpage error).
         """
@@ -579,50 +774,24 @@ class WikiContentWriter:
         ]
         subpage_mds: list[str] = list(await asyncio.gather(*tasks))
 
-        # ── 2. Build chapter index via a direct LLM call ──────────────
-        # LLM writes ONLY the 2-3 sentence overview — no TOC in the prompt.
-        # The static [[wikilink]] TOC is appended deterministically after,
-        # so we never ask the LLM to reproduce it (which would double it).
-        index_prompt = (
-            f'Write a brief 2-3 sentence overview of the chapter '
-            f'"{chapter_spec.chapter_title}": {chapter_spec.chapter_description}. '
-            f"Focus on what the reader will learn and the key components covered. "
-            f"Output only the overview paragraph — do not list sub-pages."
-        )
-
-        # Chapter index must NOT use the tool-bound LLM — tools cause the LLM
-        # to call list_doc_chunks instead of writing prose, leaking raw tool_use
-        # dicts into the page content. Reach the inner base LLM directly.
-        _base_llm = self.llm_client
-        if _base_llm is not None:
-            # Unwrap RunnableRetry / _ChatModelBinding to get the base model
-            # which has no tools bound — we want plain text, not tool calls.
-            _inner = getattr(_base_llm, "bound", _base_llm)
-            _inner = getattr(_inner, "bound", _inner)  # two levels for binding+retry
-            _base_llm = _inner
-
-        index_overview = ""
-        if _base_llm is not None:
-            try:
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: _base_llm.invoke([HumanMessage(content=index_prompt)]),
-                )
-                raw = response.content if hasattr(response, "content") else str(response)
-                # Guard: if LLM still returned tool_calls, ignore and use empty string
-                if getattr(response, "tool_calls", None):
-                    logger.warning("[WRITER] chapter index LLM returned tool_calls — ignored")
-                    raw = ""
-                index_overview = raw if isinstance(raw, str) else str(raw)
-            except Exception as exc:
-                logger.warning("[WRITER] chapter index LLM call failed: %s", exc)
-
-        # ── 3. Append the [[wikilink]] TOC deterministically ─────────
+        # ── 2. Build the deterministic [[wikilink]] TOC ───────────────
         toc_wikilinks = "\n".join(
             f"- [[{sp.title}]]: {sp.description}"
             for sp in subpages
         )
-        chapter_index_md = f"{index_overview}\n\n{toc_wikilinks}".strip()
+
+        # ── 3. Chapter index via mini tool-augmented loop ─────────────
+        # Run synchronously in the executor so we can share the event loop
+        # with the sub-page tasks without nesting asyncio.run() calls.
+        chapter_index_md = await loop.run_in_executor(
+            None,
+            lambda: self._generate_chapter_index(
+                chapter_spec,
+                evidence_slices,
+                toc_wikilinks,
+                stream_callback=stream_callback,
+            ),
+        )
 
         logger.info(
             "[WRITER] generate_chapter done: title=%r subpages=%d index_chars=%d",

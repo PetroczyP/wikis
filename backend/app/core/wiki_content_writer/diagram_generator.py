@@ -87,10 +87,105 @@ def _node_name(node: dict) -> str:
     return node.get("symbol_name") or node.get("name") or node["node_id"]
 
 
+_MAX_REPO_CLUSTERS = 10
+_MAX_LABEL_CHARS = 30
+
+# Cross-cluster relationship types to include in the repo diagram.
+_CROSS_CLUSTER_REL_TYPES = {
+    "calls", "imports", "references", "creates",
+    "member_uses", "inheritance", "composition",
+}
+
+
 class DiagramGenerator:
     def __init__(self, storage: Any, llm_client: Any = None) -> None:
         self.storage = storage
         self._llm = llm_client
+
+    def generate_repo_diagram(
+        self,
+        cluster_ids: list[int],
+        cluster_titles: dict[int, str],
+    ) -> str:
+        """Generate a Mermaid diagram showing cluster-level dependencies.
+
+        Queries edges between clusters (cross-cluster edges only — intra-cluster
+        edges are excluded).  Returns a ``graph LR`` flowchart where nodes are
+        cluster titles (slugified, ≤30 chars) and edges represent cross-cluster
+        dependencies (calls/imports/etc.).
+
+        Parameters
+        ----------
+        cluster_ids:
+            Ordered list of cluster IDs to include.  Capped at 10.
+        cluster_titles:
+            Mapping from cluster_id → human-readable title.
+
+        Returns
+        -------
+        str
+            Fenced Mermaid code block, or ``''`` on failure / empty input.
+        """
+        if self.storage is None:
+            return ""
+        if not cluster_ids:
+            return ""
+
+        # Cap at 10 clusters.
+        selected = cluster_ids[:_MAX_REPO_CLUSTERS]
+
+        try:
+            return self._build_repo_diagram(selected, cluster_titles)
+        except Exception as exc:
+            logger.debug("generate_repo_diagram error: %s", exc)
+            return ""
+
+    def _build_repo_diagram(
+        self,
+        cluster_ids: list[int],
+        cluster_titles: dict[int, str],
+    ) -> str:
+        """Internal: build the Mermaid graph LR for cluster-level deps.
+
+        Raises on storage errors so the outer ``generate_repo_diagram`` can
+        catch them and return '' gracefully.
+        """
+        # Build a mapping from cluster_id → set of node_ids in that cluster.
+        # Let storage errors propagate — the outer method catches them.
+        cluster_node_ids: dict[int, set[str]] = {}
+        for cid in cluster_ids:
+            nodes = self.storage.get_nodes_by_cluster(cid)
+            cluster_node_ids[cid] = {n["node_id"] for n in nodes}
+
+        # Invert: node_id → cluster_id (for quick lookup during edge scan).
+        node_to_cluster: dict[str, int] = {}
+        for cid, node_ids in cluster_node_ids.items():
+            for nid in node_ids:
+                node_to_cluster[nid] = cid
+
+        # Collect cross-cluster edges: (src_cluster_id, tgt_cluster_id)
+        seen: set[tuple[int, int]] = set()
+        cross_edges: list[tuple[int, int]] = []
+
+        for src_cid in cluster_ids:
+            for src_nid in cluster_node_ids.get(src_cid, set()):
+                try:
+                    raw_edges = self.storage.get_edges_from(
+                        src_nid, rel_types=list(_CROSS_CLUSTER_REL_TYPES)
+                    )
+                except Exception:
+                    raw_edges = []
+                for e in raw_edges:
+                    tgt_nid = e.get("target_id", "")
+                    tgt_cid = node_to_cluster.get(tgt_nid)
+                    if tgt_cid is None or tgt_cid == src_cid:
+                        continue  # skip intra-cluster or external
+                    pair = (src_cid, tgt_cid)
+                    if pair not in seen:
+                        seen.add(pair)
+                        cross_edges.append(pair)
+
+        return _render_repo_clusters(cluster_ids, cluster_titles, cross_edges)
 
     def generate_cluster_diagram(self, cluster_id: int, page_spec: Any) -> str:
         """Return a ## Architecture section with Mermaid diagram + LLM context.
@@ -250,6 +345,48 @@ def _render(id_to_name: dict[str, str], edges: list[tuple[str, str]]) -> str:
         src = _safe_id(id_to_name[src_id])
         tgt = _safe_id(id_to_name[tgt_id])
         lines.append(f"    {src} --> {tgt}")
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def _render_repo_clusters(
+    cluster_ids: list[int],
+    cluster_titles: dict[int, str],
+    cross_edges: list[tuple[int, int]],
+) -> str:
+    """Build a Mermaid graph LR block for the repo-level cluster diagram.
+
+    Node identifiers are derived from the cluster title (slugified).
+    Labels are truncated to ``_MAX_LABEL_CHARS`` (30) chars so no node label
+    overflows Mermaid's rendering box.
+
+    When there are no clusters, returns ``''``.
+    """
+    if not cluster_ids:
+        return ""
+
+    lines: list[str] = ["```mermaid", "graph LR"]
+
+    # Map cluster_id → (safe_node_id, display_label)
+    cid_to_safe: dict[int, str] = {}
+    for cid in cluster_ids:
+        raw_title = cluster_titles.get(cid) or f"cluster_{cid}"
+        # Truncate label to _MAX_LABEL_CHARS before sanitizing.
+        label = _sanitize_label(raw_title[:_MAX_LABEL_CHARS])
+        safe = _safe_id(raw_title[:_MAX_LABEL_CHARS])
+        # Guarantee uniqueness by appending cluster id when safe id collides.
+        if safe in cid_to_safe.values():
+            safe = f"{safe}_{cid}"
+        cid_to_safe[cid] = safe
+        lines.append(f'    {safe}["{label}"]')
+
+    # Emit cross-cluster edges.
+    for src_cid, tgt_cid in cross_edges:
+        src_safe = cid_to_safe.get(src_cid)
+        tgt_safe = cid_to_safe.get(tgt_cid)
+        if src_safe and tgt_safe:
+            lines.append(f"    {src_safe} --> {tgt_safe}")
 
     lines.append("```")
     return "\n".join(lines)
