@@ -463,6 +463,16 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           ]);
         }
       },
+      // onError: terminal failures (401 auth expired, 404 invocation gone)
+      // exit the generating state so the UI doesn't hang forever.
+      (err) => {
+        source.close();
+        setIsGenerating(false);
+        setActiveInvocationId(null);
+        setSearchParams({}, { replace: true });
+        // Reload wiki — it may already be complete from a prior run.
+        if (wikiId) void loadAndReconcile({ isInitial: false });
+      },
     );
 
     return () => source.close();
