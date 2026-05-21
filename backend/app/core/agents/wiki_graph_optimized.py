@@ -1905,13 +1905,22 @@ class OptimizedWikiGenerationAgent:
         _readme = state.get("readme_content", "")
         _repo_tree = state.get("repository_tree", "")
         logger.info("[UNIFIED] running agentic repo analysis (post-index)")
+        if self.progress_callback:
+            try:
+                self.progress_callback("planning", 0.27, "Exploring repository with agent (reading files, understanding architecture)...")
+            except Exception:
+                pass
         fresh_repo_analysis = self._explore_repository(
             _repo_tree, _readme, repo_name=repo_name
         )
         if fresh_repo_analysis:
-            # Override the stale state value with the post-index agentic analysis.
             repo_analysis = fresh_repo_analysis
             logger.info("[UNIFIED] agentic repo analysis complete: %d chars", len(repo_analysis))
+            if self.progress_callback:
+                try:
+                    self.progress_callback("planning", 0.35, f"Repository explored — {len(repo_analysis)} chars of architectural context")
+                except Exception:
+                    pass
         else:
             logger.warning("[UNIFIED] agentic repo analysis failed — using state value (%d chars)", len(repo_analysis))
 
