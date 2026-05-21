@@ -1373,6 +1373,17 @@ class UnifiedWikiDB:
         )
         return total
 
+    def update_node_summary(self, node_id: str, summary: str, model_name: str = "") -> None:
+        """Write llm_summary for a single node (agentic summary path)."""
+        import time as _time  # noqa: PLC0415
+        now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+        self.conn.execute(
+            "UPDATE repo_nodes SET llm_summary = ?, summary_model = ?, summary_at = ? "
+            "WHERE node_id = ?",
+            (summary or None, model_name, now, node_id),
+        )
+        self.conn.commit()
+
     def populate_summaries(
         self,
         summary_fn: Callable[[list[str]], list[str]],

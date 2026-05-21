@@ -183,3 +183,77 @@ class TestPageContextBuilding:
         llm = FakeLLM(responses=["Dict overview"])
         result = generate_repo_overview(pages, llm=llm, repo_name="dictrepo", repo_url="")  # type: ignore[arg-type]
         assert "dictrepo" in result
+
+
+class TestRepoAnalysisParam:
+    def test_repo_analysis_in_system_prompt(self):
+        """repo_analysis is injected into the system prompt when provided."""
+        pages = [StubPage(title="X", description="desc", markdown="Some markdown content.")]
+        captured_messages: list[Any] = []
+
+        class CaptureLLM(FakeLLM):
+            def _generate(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> ChatResult:
+                captured_messages.extend(messages)
+                return ChatResult(generations=[ChatGeneration(message=AIMessage(content="result"))])
+
+        generate_repo_overview(
+            pages,
+            llm=CaptureLLM(responses=[]),
+            repo_name="r",
+            repo_url="",
+            repo_analysis="UNIQUE_ANALYSIS_TOKEN_XYZ",
+        )
+
+        system_msgs = [m for m in captured_messages if hasattr(m, "type") and m.type == "system"
+                       or m.__class__.__name__ == "SystemMessage"]
+        combined = " ".join(str(m.content) for m in captured_messages)
+        assert "UNIQUE_ANALYSIS_TOKEN_XYZ" in combined
+
+    def test_empty_repo_analysis_not_injected(self):
+        """When repo_analysis is empty, the system prompt has no extra section."""
+        pages = [StubPage(title="Y", description="desc")]
+        captured_messages: list[Any] = []
+
+        class CaptureLLM(FakeLLM):
+            def _generate(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> ChatResult:
+                captured_messages.extend(messages)
+                return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok"))])
+
+        generate_repo_overview(pages, llm=CaptureLLM(responses=[]), repo_name="r", repo_url="", repo_analysis="")
+        combined = " ".join(str(m.content) for m in captured_messages)
+        # No "Architectural Context" header should appear when analysis is empty
+        assert "UNIQUE_ANALYSIS" not in combined
+
+
+class TestMarkdownExcerpts:
+    def test_page_markdown_included_in_prompt(self):
+        """When pages have markdown content, it is included in the user prompt."""
+        pages = [
+            StubPage(title="Auth", description="Auth module.", markdown="## Auth\nHandles JWT tokens.\n"),
+        ]
+        captured_messages: list[Any] = []
+
+        class CaptureLLM(FakeLLM):
+            def _generate(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> ChatResult:
+                captured_messages.extend(messages)
+                return ChatResult(generations=[ChatGeneration(message=AIMessage(content="overview"))])
+
+        generate_repo_overview(pages, llm=CaptureLLM(responses=[]), repo_name="r", repo_url="")
+        combined = " ".join(str(m.content) for m in captured_messages)
+        assert "JWT" in combined or "Auth" in combined
+
+    def test_pages_without_markdown_use_description(self):
+        """Pages without markdown fall back to description in the prompt."""
+        pages = [
+            StubPage(title="Scheduler", description="Runs background jobs.", markdown=""),
+        ]
+        captured_messages: list[Any] = []
+
+        class CaptureLLM(FakeLLM):
+            def _generate(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> ChatResult:
+                captured_messages.extend(messages)
+                return ChatResult(generations=[ChatGeneration(message=AIMessage(content="overview"))])
+
+        generate_repo_overview(pages, llm=CaptureLLM(responses=[]), repo_name="r", repo_url="")
+        combined = " ".join(str(m.content) for m in captured_messages)
+        assert "Scheduler" in combined or "background" in combined

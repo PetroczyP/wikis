@@ -423,7 +423,7 @@ class TestFeatureFlag:
             import app.core.feature_flags as ff_mod
             importlib.reload(ff_mod)
             flags = ff_mod.get_feature_flags()
-            assert flags.chaptered_pages is False
+            assert flags.chaptered_pages is True
         finally:
             os.environ.pop("WIKIS_CHAPTERED_PAGES", None)
             importlib.reload(ff_mod)

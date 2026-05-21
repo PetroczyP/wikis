@@ -6,6 +6,9 @@ Uses local repository clones and Enhanced Unified Graph Builder for optimal perf
 Supports multi-provider repositories: GitHub, GitLab, Bitbucket, Azure DevOps.
 """
 
+from __future__ import annotations
+
+import json
 import logging
 import os
 from datetime import datetime
@@ -34,6 +37,176 @@ try:
 except ImportError:
     logger.error("Enhanced Unified Graph Builder not available")
     EnhancedUnifiedGraphBuilder = None
+
+
+# ── Symbol layers that trigger the agentic summary path ──────────────────────
+
+
+def _agentic_summary(
+    node: dict[str, Any],
+    *,
+    tools: Any,  # WriterTools — imported lazily to avoid circular deps
+    llm: Any,
+    repo_analysis: str = "",
+    budget: int = 4,
+) -> str | None:
+    """Generate a richer summary for architectural nodes using tool exploration.
+
+    Used for hub nodes and nodes in ``entry_point`` / ``public_api`` layers.
+    Falls back to a direct LLM call when the tool loop fails.
+
+    Parameters
+    ----------
+    node : dict
+        A repo_nodes row (must have symbol_name, rel_path, start_line, source_text).
+    tools : WriterTools
+        Tool surface for file/symbol access.
+    llm : BaseChatModel
+        Chat model for the agentic loop.
+    repo_analysis : str
+        Repository analysis text — included in the system prompt for context
+        (enables prompt caching when stable across calls).
+    budget : int
+        Maximum number of tool calls (default 4 per hub node).
+
+    Returns
+    -------
+    str | None
+        Summary text (≤ 400 chars) or None on failure (keeps node eligible
+        for future populate_summaries runs).
+    """
+    symbol = node.get("symbol_name", "")
+    file_path = node.get("rel_path", "")
+    start_line = node.get("start_line", 1) or 1
+    end_line = min(start_line + 100, node.get("end_line", start_line + 50) or start_line + 50)
+    source_snippet = (node.get("source_text") or "")[:800]
+
+    system = (
+        f"Repository context:\n{repo_analysis[:2000]}\n\n"
+        "Summarise this code symbol in 3-4 sentences covering: "
+        "its role in the system, key behaviour, callers/callees, and what engineers need to know. "
+        "Use read_file to see the full implementation, get_callers to understand usage. "
+        "Write ONLY the summary — no headings, no bullets, no extra commentary."
+    )
+    user = (
+        f"Symbol: {symbol} in {file_path} (lines {start_line}-{end_line})\n"
+        f"Source:\n{source_snippet}"
+    )
+
+    try:
+        from langchain_core.messages import HumanMessage, ToolMessage  # noqa: PLC0415
+
+        from app.core.agent_tools import WIKI_TOOL_SCHEMAS  # noqa: PLC0415
+        from app.services.llm_factory import (  # noqa: PLC0415
+            is_bedrock_llm,
+            make_cached_system_message,
+            safe_bind_tools,
+        )
+
+        try:
+            llm_with_tools = safe_bind_tools(llm, WIKI_TOOL_SCHEMAS)
+        except Exception:
+            llm_with_tools = llm
+        _use_cache = is_bedrock_llm(llm)
+
+        messages: list[Any] = [
+            make_cached_system_message(system, cache=_use_cache),
+            HumanMessage(content=user),
+        ]
+
+        tool_calls_made = 0
+        content = ""
+
+        for _round in range(budget):
+            response = llm_with_tools.invoke(messages)
+            tc_list = getattr(response, "tool_calls", None) or []
+
+            if not tc_list:
+                raw = response.content
+                content = raw if isinstance(raw, str) else str(raw)
+                break
+
+            messages.append(response)
+            for tc in tc_list:
+                tc_name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+                tc_args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+                tc_id = tc.get("id", str(_round)) if isinstance(tc, dict) else getattr(tc, "id", str(_round))
+
+                if isinstance(tc_args, str):
+                    try:
+                        tc_args = json.loads(tc_args)
+                    except json.JSONDecodeError:
+                        tc_args = {}
+                if not isinstance(tc_args, dict):
+                    tc_args = {}
+
+                # Dispatch through WriterTools
+                result_text = _dispatch_writer_tool(tools, tc_name, tc_args)
+                tool_calls_made += 1
+                messages.append(ToolMessage(content=result_text, tool_call_id=tc_id, name=tc_name))
+
+            if tool_calls_made >= budget:
+                break
+
+        if not content:
+            # Budget exhausted — force a write
+            messages.append(HumanMessage(content=(
+                "Write the 3-4 sentence summary now. Do NOT call any more tools."
+            )))
+            response = llm.invoke(messages)
+            raw = response.content
+            content = raw if isinstance(raw, str) else str(raw)
+
+        return (content.strip())[:400] if content.strip() else None
+
+    except Exception as exc:
+        logger.warning("_agentic_summary failed for %r: %s", symbol, exc)
+        return None
+
+
+def _dispatch_writer_tool(tools: Any, name: str, args: dict[str, Any]) -> str:
+    """Dispatch a single WriterTools tool call from the agentic summary loop."""
+    try:
+        if name == "read_file":
+            path = args.get("path", "")
+            start_line = args.get("start_line")
+            end_line = args.get("end_line")
+            line_range = None
+            if start_line is not None and end_line is not None:
+                line_range = (int(start_line), int(end_line))
+            fc = tools.read_file(path, line_range=line_range)
+            if fc.error:
+                return f"[error] {fc.error}"
+            start = line_range[0] if line_range else 1
+            return "\n".join(f"{i + start}: {ln}" for i, ln in enumerate(fc.lines)) or "[empty]"
+        elif name == "get_signature":
+            sig = tools.get_signature(args.get("symbol", ""))
+            if not sig.found:
+                return f"[not found] {args.get('symbol', '')}"
+            return f"{sig.file_path}: {sig.signature} ({sig.layer})\n{sig.docstring}"
+        elif name == "grep":
+            matches = tools.grep(args.get("pattern", ""))
+            if not matches:
+                return "[no matches]"
+            return "\n".join(f"{m.file_path}:{m.line_number}: {m.line_text}" for m in matches)
+        elif name == "get_callers":
+            result = tools.get_callers(args.get("symbol", ""))
+            if not result.found:
+                return f"[not found] {args.get('symbol', '')}"
+            if not result.callers:
+                return "[no callers]"
+            return "\n".join(f"{c.file_path}: {c.symbol}" for c in result.callers)
+        elif name == "get_callees":
+            result = tools.get_callees(args.get("symbol", ""))
+            if not result.found:
+                return f"[not found] {args.get('symbol', '')}"
+            if not result.callees:
+                return "[no callees]"
+            return "\n".join(f"{c.file_path}: {c.symbol}" for c in result.callees)
+        else:
+            return f"[unknown tool: {name}]"
+    except Exception as exc:
+        return f"[tool error: {exc}]"
 
 
 class FilesystemRepositoryIndexer:
@@ -748,8 +921,21 @@ class FilesystemRepositoryIndexer:
         # Register in cache_index.json so toolkit_bridge can find it
         self._register_unified_db_cache(repo_identifier, cache_key, cache_dir)
 
-    def populate_summaries(self, llm: Any = None, batch_size: int = 20, *, _db: Any = None) -> int:
+    def populate_summaries(
+        self,
+        llm: Any = None,
+        batch_size: int = 20,
+        *,
+        _db: Any = None,
+        repo_analysis_text: str = "",
+        tools: Any = None,
+    ) -> int:
         """Summarise architectural nodes using the provided LLM.
+
+        Hub nodes and nodes in ``entry_point`` / ``public_api`` layers use an
+        agentic tool loop (``_agentic_summary``) that can call ``read_file``
+        and ``get_callers`` before writing the summary.  All other nodes use
+        the existing batch single-call approach.
 
         Parameters
         ----------
@@ -757,11 +943,18 @@ class FilesystemRepositoryIndexer:
             A LangChain-compatible chat model with an ``invoke(prompt)`` method.
             When None or the indexer has no DB path, returns 0.
         batch_size : int
-            Nodes per LLM batch call (default 20).
+            Nodes per LLM batch call (default 20) — applies to non-agentic nodes.
         _db :
             Optional already-open storage instance (used internally by
             ``_write_unified_db`` to avoid a double-open).  When None the
             method opens a new connection to ``_unified_db_path``.
+        repo_analysis_text : str
+            Repository analysis document included in the agentic summary system
+            prompt.  Enables prompt caching when the same analysis is passed for
+            all hub nodes.
+        tools : WriterTools | None
+            Tool surface for the agentic path.  When None, agentic summaries
+            fall back to the plain single-call approach.
         """
         if llm is None:
             return 0
@@ -786,6 +979,71 @@ class FilesystemRepositoryIndexer:
                 or getattr(llm, "model_name", None)
                 or "unknown"
             )
+
+            # ── Agentic path for hub/entry_point/public_api nodes ──────────
+            # When WriterTools are available, run individual agentic loops for
+            # architecturally important nodes before the batch pass.
+            agentic_count = 0
+            if tools is not None:
+                try:
+                    # Fetch hub nodes + entry_point/public_api layer nodes
+                    agentic_nodes: list[dict[str, Any]] = []
+                    try:
+                        # Hub nodes (is_hub=1)
+                        hub_ids = db.get_hub_node_ids() if hasattr(db, "get_hub_node_ids") else []
+                        for nid in hub_ids:
+                            node = db.get_node(nid)
+                            if node and not node.get("llm_summary"):
+                                agentic_nodes.append(node)
+                    except Exception as exc:
+                        logger.debug("get_hub_node_ids failed (non-fatal): %s", exc)
+
+                    # NOTE: entry_point / public_api are computed by
+                    # classify_symbol_layer() and not persisted in the DB.
+                    # Layer-based selection requires persisting that value to
+                    # a `layer` column — tracked as a future improvement.
+                    # For now, hub nodes (above) cover the highest-value candidates.
+
+                    # De-duplicate by node_id
+                    seen_ids: set[str] = set()
+                    unique_agentic: list[dict[str, Any]] = []
+                    for n in agentic_nodes:
+                        nid = n.get("node_id")
+                        if nid and nid not in seen_ids:
+                            seen_ids.add(nid)
+                            unique_agentic.append(n)
+
+                    logger.info(
+                        "[SUMMARIES] agentic path: %d hub/entry_point/public_api nodes",
+                        len(unique_agentic),
+                    )
+
+                    for node in unique_agentic:
+                        nid = node.get("node_id", "")
+                        summary = _agentic_summary(
+                            node,
+                            tools=tools,
+                            llm=llm,
+                            repo_analysis=repo_analysis_text,
+                            budget=4,
+                        )
+                        if summary:
+                            try:
+                                # update_node_summary is the protocol method
+                                # that works on both SQLite and Postgres.
+                                db.update_node_summary(nid, summary[:400], model_name)
+                                agentic_count += 1
+                            except Exception as exc:
+                                logger.warning(
+                                    "Agentic summary write failed for node %r: %s", nid, exc
+                                )
+
+                    logger.info("[SUMMARIES] agentic path complete: %d written", agentic_count)
+
+                except Exception as exc:
+                    logger.warning("Agentic summary pass failed (non-fatal): %s", exc)
+
+            # ── Batch path for remaining nodes ──────────────────────────────
 
             def _summary_fn(texts: list[str]) -> list[str]:
                 results: list[str] = []
@@ -812,9 +1070,10 @@ class FilesystemRepositoryIndexer:
                         results.append(None)
                 return results
 
-            return db.populate_summaries(
+            batch_count = db.populate_summaries(
                 _summary_fn, model_name=model_name, batch_size=batch_size
             )
+            return agentic_count + batch_count
         finally:
             if _owned_db is not None:
                 _owned_db.close()

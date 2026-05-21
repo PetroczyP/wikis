@@ -1373,6 +1373,20 @@ class PostgresWikiStorage:
         )
         return total
 
+    def update_node_summary(self, node_id: str, summary: str, model_name: str = "") -> None:
+        """Write llm_summary for a single node (agentic summary path)."""
+        import time as _time  # noqa: PLC0415
+        now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    f"UPDATE {self._schema}.repo_nodes "
+                    "SET llm_summary = :summary, summary_model = :model, summary_at = :at "
+                    "WHERE node_id = :nid"
+                ),
+                {"summary": summary or None, "model": model_name, "at": now, "nid": node_id},
+            )
+
     def populate_summaries(
         self,
         summary_fn: "Callable[[list[str]], list[str]]",

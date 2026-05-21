@@ -315,3 +315,148 @@ def enrich_clusters_with_semantics(
         sum(len(info.low_coherence_nodes) for info in result.values()),
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Post-summary re-clustering
+# ---------------------------------------------------------------------------
+
+def recluster_with_semantic_embeddings(
+    clusters: list,
+    storage: Any,
+    embedding_fn: Any,
+    similarity_threshold: float = 0.85,
+    small_cluster_max: int = 7,
+) -> list:
+    """Rerun semantic merging on enriched embeddings after summaries land.
+
+    After ``llm_summary`` is populated for hub/architectural nodes, their
+    embeddings are richer in semantic content.  This function merges pairs of
+    small clusters whose centroids are highly similar — preventing the planner
+    from generating trivially redundant wiki pages.
+
+    Only clusters with fewer than ``small_cluster_max + 1`` symbols are eligible
+    for merging.  Large clusters are left alone to avoid over-merging.
+
+    This function performs NO LLM calls — it is embedding-only.
+
+    Parameters
+    ----------
+    clusters : list
+        Structural clusters produced by Leiden clustering.  Each element must
+        expose a ``.cluster_id`` attribute.
+    storage : WikiStorageProtocol | None
+        Storage instance used to fetch node embeddings.  Returns ``clusters``
+        unchanged when ``None``.
+    embedding_fn : Callable | None
+        Unused — kept for API symmetry; embeddings are read from storage.
+    similarity_threshold : float
+        Minimum centroid-to-centroid cosine similarity for merging (default 0.85).
+    small_cluster_max : int
+        Maximum member count for a cluster to qualify as "small" (default 7).
+        Clusters with ≤ ``small_cluster_max`` symbols can be merged.
+
+    Returns
+    -------
+    list
+        Updated cluster list with merged pairs removed.  Order is preserved;
+        merged clusters are removed (the survivor — lower cluster_id — stays).
+    """
+    if storage is None:
+        return clusters
+
+    if not clusters:
+        return clusters
+
+    # ── Collect node IDs and embeddings per cluster ──────────────────────────
+    cluster_node_ids: dict[int, list[str]] = {}
+    for cluster in clusters:
+        cid = cluster.cluster_id
+        try:
+            rows = storage.get_nodes_by_cluster(cid, limit=small_cluster_max + 1)
+        except Exception as exc:
+            logger.debug("[RECLUSTER] get_nodes_by_cluster(%d) failed: %s", cid, exc)
+            rows = []
+        cluster_node_ids[cid] = [r["node_id"] for r in rows if r.get("node_id")]
+
+    all_node_ids: list[str] = []
+    for ids in cluster_node_ids.values():
+        all_node_ids.extend(ids)
+
+    if not all_node_ids:
+        return clusters
+
+    all_embeddings = _fetch_embeddings(all_node_ids, storage)
+    if not all_embeddings:
+        logger.debug("[RECLUSTER] no embeddings available — skipping recluster")
+        return clusters
+
+    # ── Compute per-cluster centroids ────────────────────────────────────────
+    centroids: dict[int, list[float]] = {}
+    cluster_sizes: dict[int, int] = {}
+    for cluster in clusters:
+        cid = cluster.cluster_id
+        node_ids = cluster_node_ids.get(cid, [])
+        vecs = [all_embeddings[nid] for nid in node_ids if nid in all_embeddings]
+        if not vecs:
+            continue
+        cluster_sizes[cid] = len(node_ids)
+        centroids[cid] = _mean_vector(vecs)
+
+    if not centroids:
+        return clusters
+
+    # ── Find merge candidates (both clusters must be small) ──────────────────
+    # Greedy: iterate pairs in cluster_id order; once a cluster is merged away
+    # it cannot be merged again (prevent chained merges).
+    cids = sorted(centroids.keys())
+    merged_away: set[int] = set()
+    merge_pairs: list[tuple[int, int]] = []  # (survivor, removed)
+
+    for i in range(len(cids)):
+        cid_a = cids[i]
+        if cid_a in merged_away:
+            continue
+        size_a = cluster_sizes.get(cid_a, 0)
+        if size_a > small_cluster_max:
+            continue
+
+        for j in range(i + 1, len(cids)):
+            cid_b = cids[j]
+            if cid_b in merged_away:
+                continue
+            size_b = cluster_sizes.get(cid_b, 0)
+            if size_b > small_cluster_max:
+                continue
+
+            sim = _cosine_similarity(centroids[cid_a], centroids[cid_b])
+            if sim >= similarity_threshold:
+                # Survivor is the lower cluster_id
+                survivor = min(cid_a, cid_b)
+                removed = max(cid_a, cid_b)
+                merge_pairs.append((survivor, removed))
+                merged_away.add(removed)
+                logger.info(
+                    "[RECLUSTER] merging cluster %d into %d (sim=%.3f, sizes=%d+%d)",
+                    removed,
+                    survivor,
+                    sim,
+                    size_a,
+                    size_b,
+                )
+                # Each cluster can only trigger one merge (greedy)
+                break
+
+    if not merge_pairs:
+        return clusters
+
+    # ── Remove merged-away clusters ──────────────────────────────────────────
+    result_clusters = [c for c in clusters if c.cluster_id not in merged_away]
+
+    logger.info(
+        "[RECLUSTER] complete: %d clusters → %d (merged %d pairs)",
+        len(clusters),
+        len(result_clusters),
+        len(merge_pairs),
+    )
+    return result_clusters
