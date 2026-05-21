@@ -1904,14 +1904,17 @@ class OptimizedWikiGenerationAgent:
         # early (before cloning) and always falls back to the blind LLM call.
         _readme = state.get("readme_content", "")
         _repo_tree = state.get("repository_tree", "")
-        logger.info("[UNIFIED] running agentic repo analysis (post-index)")
+        # Scale explorer budget with repo size — small repos need fewer reads,
+        # large repos need more to cover entry points, routes, services, models.
+        _explore_budget = max(20, min(len(repository_files) // 40, 100))
+        logger.info("[UNIFIED] running agentic repo analysis (post-index, budget=%d, files=%d)", _explore_budget, len(repository_files))
         if self.progress_callback:
             try:
-                self.progress_callback("planning", 0.27, "Exploring repository with agent (reading files, understanding architecture)...")
+                self.progress_callback("planning", 0.27, f"Exploring repository with agent ({len(repository_files)} files, budget={_explore_budget} tool calls)...")
             except Exception:
                 pass
         fresh_repo_analysis = self._explore_repository(
-            _repo_tree, _readme, repo_name=repo_name
+            _repo_tree, _readme, repo_name=repo_name, budget=_explore_budget
         )
         if fresh_repo_analysis:
             repo_analysis = fresh_repo_analysis
