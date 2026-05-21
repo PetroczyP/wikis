@@ -39,18 +39,67 @@ def _node_name(node: dict) -> str:
 
 
 class DiagramGenerator:
-    def __init__(self, storage: Any) -> None:
+    def __init__(self, storage: Any, llm_client: Any = None) -> None:
         self.storage = storage
+        self._llm = llm_client
 
     def generate_cluster_diagram(self, cluster_id: int, page_spec: Any) -> str:
-        """Return a Mermaid diagram string for this cluster, or '' if no data."""
+        """Return a ## Architecture section with Mermaid diagram + LLM context.
+
+        The section includes:
+        - A 2-3 sentence LLM-written explanation of the component relationships
+          shown in the diagram (when an LLM client is provided).
+        - The Mermaid graph block.
+
+        Returns '' when no nodes are found for the cluster.
+        """
         if self.storage is None:
             return ""
 
         try:
-            return self._build_diagram(cluster_id)
+            mermaid = self._build_diagram(cluster_id)
         except Exception as exc:
             logger.debug("DiagramGenerator: cluster_id=%d error: %s", cluster_id, exc)
+            return ""
+
+        if not mermaid:
+            return ""
+
+        # Build context: symbol names visible in the diagram
+        try:
+            nodes = self.storage.get_nodes_by_cluster(cluster_id)
+            node_names = [_node_name(n) for n in _select_nodes(nodes)]
+        except Exception:
+            node_names = []
+
+        explanation = self._explain(mermaid, node_names, page_spec)
+        if explanation:
+            return f"## Architecture\n\n{explanation}\n\n{mermaid}"
+        return f"## Architecture\n\n{mermaid}"
+
+    def _explain(self, mermaid: str, node_names: list[str], page_spec: Any) -> str:
+        """Ask the LLM for a 2-3 sentence explanation of the diagram."""
+        if self._llm is None:
+            return ""
+        try:
+            from langchain_core.messages import HumanMessage  # noqa: PLC0415
+            title = getattr(page_spec, "title", "") or (
+                page_spec.get("title", "") if isinstance(page_spec, dict) else ""
+            )
+            prompt = (
+                f"The following Mermaid diagram shows the architecture of "
+                f'"{title}". '
+                f"Components: {', '.join(node_names[:12])}.\n\n"
+                f"{mermaid}\n\n"
+                f"Write 2-3 sentences describing the key relationships and "
+                f"architectural pattern shown. Be specific and concise. "
+                f"Do not repeat the component names as a list."
+            )
+            response = self._llm.invoke([HumanMessage(content=prompt)])
+            text = response.content if hasattr(response, "content") else str(response)
+            return text.strip() if text and text.strip() else ""
+        except Exception as exc:
+            logger.debug("DiagramGenerator LLM explain failed: %s", exc)
             return ""
 
     # ── internals ──────────────────────────────────────────────────────────────

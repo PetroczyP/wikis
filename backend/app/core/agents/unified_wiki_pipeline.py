@@ -241,13 +241,14 @@ def _run_page(
     # ── 5. Reconstruct final markdown from kept paragraphs ────────────
     final_markdown = _claims_to_markdown(kept_after_verify)
 
-    # ── 5b. Prepend architecture diagram ──────────────────────────────
+    # ── 5b. Prepend architecture diagram with LLM-written context ─────
     if storage is not None:
         from app.core.wiki_content_writer.diagram_generator import DiagramGenerator  # noqa: PLC0415
-        dg = DiagramGenerator(storage)
-        diagram = dg.generate_cluster_diagram(page_id, spec)
-        if diagram:
-            final_markdown = diagram + "\n\n" + final_markdown
+        # Use verifier_llm (low-tier) for the diagram explanation — cheap call.
+        dg = DiagramGenerator(storage, llm_client=verifier_llm)
+        diagram_section = dg.generate_cluster_diagram(page_id, spec)
+        if diagram_section:
+            final_markdown = diagram_section + "\n\n" + final_markdown
 
     # ── 7. Format for human readability ───────────────────────────────
     try:
