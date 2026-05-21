@@ -304,6 +304,11 @@ CREATE TABLE IF NOT EXISTS wiki_pages (
     title              TEXT NOT NULL DEFAULT '',
     anchor_slug        TEXT NOT NULL DEFAULT '',
     content_hash       TEXT DEFAULT NULL,
+    -- #322: snapshot of content_hash at the time this page was last indexed
+    -- into the FTS/vector search index. NULL = never indexed (or pre-#322
+    -- row). populate_wiki_page_index() skips pages where
+    -- embedding_content_hash == content_hash.
+    embedding_content_hash TEXT DEFAULT NULL,
     macro_cluster      INTEGER DEFAULT NULL,
     micro_cluster      INTEGER DEFAULT NULL,
     primary_symbol_id  TEXT DEFAULT NULL,
@@ -604,6 +609,18 @@ class UnifiedWikiDB:
                     "ALTER TABLE wiki_pages ADD COLUMN page_spec_json TEXT "
                     "DEFAULT NULL "
                     "CHECK (page_spec_json IS NULL OR json_valid(page_spec_json))"
+                )
+                self.conn.commit()
+            # #322: embedding_content_hash for skip-if-unchanged in
+            # populate_wiki_page_index. Existing rows stay NULL →
+            # re-indexed once on next call, then stamped.
+            if "embedding_content_hash" not in page_cols:
+                logger.info(
+                    "Migrating schema: adding embedding_content_hash to wiki_pages"
+                )
+                cur.execute(
+                    "ALTER TABLE wiki_pages "
+                    "ADD COLUMN embedding_content_hash TEXT DEFAULT NULL"
                 )
                 self.conn.commit()
 
@@ -2970,6 +2987,7 @@ class UnifiedWikiDB:
         "title",
         "anchor_slug",
         "content_hash",
+        "embedding_content_hash",
         "macro_cluster",
         "micro_cluster",
         "primary_symbol_id",
@@ -2997,6 +3015,11 @@ class UnifiedWikiDB:
             "title": page.get("title", ""),
             "anchor_slug": page.get("anchor_slug", ""),
             "content_hash": page.get("content_hash"),
+            # embedding_content_hash is intentionally omitted from the INSERT
+            # value (defaults to NULL) and excluded from the ON CONFLICT
+            # UPDATE so that populate_wiki_page_index() stamps never get
+            # clobbered by a page re-upsert.
+            "embedding_content_hash": None,
             "macro_cluster": page.get("macro_cluster"),
             "micro_cluster": page.get("micro_cluster"),
             "primary_symbol_id": page.get("primary_symbol_id"),
@@ -3012,8 +3035,13 @@ class UnifiedWikiDB:
         # would resolve a slug-uniqueness conflict by silently deleting the
         # other page — we want that to bubble up as IntegrityError so
         # callers learn to resolve slug collisions with compute_anchor_slug.
+        # embedding_content_hash is excluded from the update so re-upserts
+        # don't reset the stamp set by populate_wiki_page_index().
+        _skip_on_update = {"page_id", "embedding_content_hash"}
         update_set = ", ".join(
-            f"{c} = excluded.{c}" for c in self._WIKI_PAGE_COLUMNS if c != "page_id"
+            f"{c} = excluded.{c}"
+            for c in self._WIKI_PAGE_COLUMNS
+            if c not in _skip_on_update
         )
         self.conn.execute(
             f"INSERT INTO wiki_pages ({cols}) VALUES ({placeholders}) "
@@ -3071,6 +3099,67 @@ class UnifiedWikiDB:
         )
         self.conn.commit()
         return bool(cur.rowcount)
+
+    def populate_wiki_page_index(
+        self,
+        wiki_id: str,
+        index_fn: "Callable[[list[dict[str, Any]]], None]",
+    ) -> int:
+        """Index wiki pages whose content has changed since the last run.
+
+        Mirrors the ``populate_embeddings`` skip-if-unchanged pattern for
+        ``repo_nodes``, applied to wiki pages (#322).
+
+        A page is considered stale when:
+        - ``embedding_content_hash`` is NULL (never indexed, or pre-#322 row), or
+        - ``content_hash`` is NULL (page written before content_hash was stored), or
+        - ``embedding_content_hash != content_hash`` (content changed since last index).
+
+        After ``index_fn`` returns successfully the ``embedding_content_hash``
+        column is updated to match ``content_hash`` so the next run skips
+        these pages.
+
+        Parameters
+        ----------
+        wiki_id : str
+            Only pages belonging to this wiki are considered.
+        index_fn : callable
+            ``(list[dict]) -> None`` — receives the list of stale page rows
+            (as dicts) and performs the actual FTS / vector indexing.
+            Each dict contains at minimum ``page_id``, ``wiki_id``,
+            ``title``, and ``content_hash``.
+
+        Returns
+        -------
+        int
+            Number of pages passed to ``index_fn`` (0 when all are up-to-date).
+        """
+        rows = self.conn.execute(
+            "SELECT page_id, wiki_id, title, content_hash, embedding_content_hash "
+            "FROM wiki_pages "
+            "WHERE wiki_id = ? "
+            "AND ("
+            "  embedding_content_hash IS NULL "
+            "  OR content_hash IS NULL "
+            "  OR embedding_content_hash != content_hash"
+            ")",
+            (wiki_id,),
+        ).fetchall()
+
+        if not rows:
+            return 0
+
+        page_dicts = [dict(r) for r in rows]
+        index_fn(page_dicts)
+
+        # Stamp the hashes so subsequent runs skip unchanged pages.
+        self.conn.executemany(
+            "UPDATE wiki_pages SET embedding_content_hash = content_hash "
+            "WHERE page_id = ?",
+            [(r["page_id"],) for r in rows],
+        )
+        self.conn.commit()
+        return len(rows)
 
     def record_page_symbols(
         self,

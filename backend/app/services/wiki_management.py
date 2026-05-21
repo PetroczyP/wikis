@@ -125,43 +125,82 @@ class WikiManagementService:
         wiki_id: str,
         pages: dict[str, str],
     ) -> int:
-        """Index wiki pages into PostgreSQL for full-text search.
+        """Index wiki pages into the FTS table for full-text search.
 
-        Replaces any existing pages for *wiki_id* (idempotent on re-generation).
+        Unchanged pages (same content hash as stored) are skipped so that
+        large wikis don't re-embed / re-index every page on every regen
+        (#322).  Pages that are new, changed, or removed are updated.
 
         Args:
             wiki_id: Wiki identifier.
             pages: Mapping of ``{page_id: markdown_content}``.
 
         Returns:
-            Number of pages indexed.
+            Number of pages actually written (0 when all were unchanged).
         """
+        from app.core.storage.incremental import compute_content_hash as _content_hash
         from app.core.wiki_page_index import _parse_frontmatter
+
+        # Build the new set: {record_id → (title, description, content, hash)}
+        new_records: dict[str, tuple[str, str | None, str, str]] = {}
+        for page_id, content in pages.items():
+            title, description = _parse_frontmatter(content)
+            if not title:
+                title = page_id
+            record_id = f"{wiki_id}/{title}"
+            new_records[record_id] = (title, description, content, _content_hash(content))
 
         async with self.session_factory() as session:
             async with session.begin():
-                # Clear existing pages for this wiki (idempotent re-index).
-                await session.execute(
-                    delete(WikiPageRecord).where(WikiPageRecord.wiki_id == wiki_id)
-                )
-
-                count = 0
-                for page_id, content in pages.items():
-                    title, description = _parse_frontmatter(content)
-                    if not title:
-                        title = page_id
-
-                    record = WikiPageRecord(
-                        id=f"{wiki_id}/{title}",
-                        wiki_id=wiki_id,
-                        page_title=title,
-                        description=description,
-                        content=content,
+                # Fetch stored hashes for this wiki in one query.
+                result = await session.execute(
+                    select(WikiPageRecord.id, WikiPageRecord.content_hash).where(
+                        WikiPageRecord.wiki_id == wiki_id
                     )
-                    session.add(record)
+                )
+                stored: dict[str, str | None] = {row[0]: row[1] for row in result}
+
+                # Remove pages that are no longer present.
+                stale_ids = set(stored) - set(new_records)
+                if stale_ids:
+                    await session.execute(
+                        delete(WikiPageRecord).where(
+                            WikiPageRecord.id.in_(stale_ids)
+                        )
+                    )
+
+                # Insert or update changed / new pages.
+                count = 0
+                for record_id, (title, description, content, chash) in new_records.items():
+                    if stored.get(record_id) == chash:
+                        # Content unchanged — skip FTS re-index for this page.
+                        continue
+
+                    if record_id in stored:
+                        # Update existing row — fetch by PK directly, no dead select.
+                        existing = await session.get(WikiPageRecord, record_id)
+                        if existing is not None:
+                            existing.page_title = title
+                            existing.description = description
+                            existing.content = content
+                            existing.content_hash = chash
+                    else:
+                        # Insert new row.
+                        session.add(WikiPageRecord(
+                            id=record_id,
+                            wiki_id=wiki_id,
+                            page_title=title,
+                            description=description,
+                            content=content,
+                            content_hash=chash,
+                        ))
                     count += 1
 
-        logger.info("Indexed %d wiki pages for %s", count, wiki_id)
+        skipped = len(new_records) - count
+        logger.info(
+            "Indexed %d wiki pages for %s (%d unchanged, skipped)",
+            count, wiki_id, skipped,
+        )
         return count
 
     async def ensure_pages_indexed(self, wiki_id: str) -> None:

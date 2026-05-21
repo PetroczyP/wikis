@@ -859,6 +859,35 @@ class WikiStorageProtocol(Protocol):
         """
         ...
 
+    def populate_wiki_page_index(
+        self,
+        wiki_id: str,
+        index_fn: "Callable[[list[dict[str, Any]]], None]",
+    ) -> int:
+        """Index wiki pages whose content has changed since the last run (#322).
+
+        Mirrors the ``populate_embeddings`` skip-if-unchanged pattern.
+        Pages where ``content_hash == embedding_content_hash`` are skipped;
+        stale pages (NULL or mismatched hash) are passed to ``index_fn``.
+        After ``index_fn`` returns, ``embedding_content_hash`` is stamped
+        with ``content_hash`` so subsequent runs skip unchanged pages.
+
+        Parameters
+        ----------
+        wiki_id : str
+            Only pages belonging to this wiki are considered.
+        index_fn : callable
+            ``(list[dict]) -> None`` — receives stale page rows as dicts
+            (with at minimum ``page_id``, ``wiki_id``, ``title``,
+            ``content_hash``) and performs the actual indexing.
+
+        Returns
+        -------
+        int
+            Number of pages passed to ``index_fn`` (0 when all up-to-date).
+        """
+        ...
+
     def record_page_symbols(
         self,
         page_id: str,

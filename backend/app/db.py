@@ -111,6 +111,8 @@ async def _add_missing_columns(engine: AsyncEngine) -> None:
         ("wiki", "source_type", "VARCHAR", "'git'"),
         # JSON stored as TEXT in SQLite; PostgreSQL uses a native JSON column.
         ("wiki", "source_scope", "TEXT", None),
+        # #322: content hash for skip-if-unchanged in index_wiki_pages().
+        ("wiki_page", "content_hash", "VARCHAR", None),
     ]
 
     # All identifiers are hardcoded constants — no user input in SQL.

@@ -62,6 +62,9 @@ class WikiPageRecord(Base):
     page_title = Column(String, nullable=False)
     description = Column(String, nullable=True)     # From YAML frontmatter
     content = Column(Text, nullable=False)          # Full markdown body
+    # #322: SHA-256[:16] of the content at last index time. Used by
+    # index_wiki_pages() to skip re-indexing unchanged pages.
+    content_hash = Column(String, nullable=True)
 
     __table_args__ = (Index("ix_wiki_page_wiki", "wiki_id"),)
 
