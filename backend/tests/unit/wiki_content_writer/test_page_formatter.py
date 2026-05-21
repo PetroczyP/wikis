@@ -240,22 +240,26 @@ class TestPass2RichnessGuard:
         assert "I cannot reorganize" not in result
         assert "[^1]" in result
 
-    def test_good_llm_output_used(self):
-        """Sufficient LLM output that passes all checks → returned."""
+    def test_pass2_disabled_always_returns_pass1(self):
+        """Pass 2 (LLM reorganisation) is disabled — format_page always returns Pass 1 output.
+
+        Pass 2 was adding noise without improving readability at current quality levels.
+        Pass 1 (citation → footnote conversion) still runs.
+        """
         paragraph = "Word " * 30 + "[g.py:1]."
         md = "\n\n".join([paragraph] * 4)
 
-        # Pass 1 processes first; we build expected Pass 1 output length
         formatter_no_llm = PageFormatter(llm_client=None)
         pass1_out = formatter_no_llm.format_page(md)
 
-        # LLM returns something longer than 50% of pass1_out
-        good_output = "X " * (len(pass1_out) // 2 + 100)
-        llm = _make_llm(good_output)
+        # Even with an LLM client provided, Pass 2 is skipped.
+        llm = _make_llm("X " * 1000)
         formatter = PageFormatter(llm_client=llm)
         result = formatter.format_page(md)
 
-        assert result == good_output
+        # LLM must NOT be called; result must equal Pass 1 output.
+        llm.invoke.assert_not_called()
+        assert result == pass1_out
 
 
 # ── Integration: pipeline failure safety ─────────────────────────────────────
