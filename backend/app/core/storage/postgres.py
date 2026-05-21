@@ -63,6 +63,41 @@ def _warn_if_truncated(rows: list[Any], limit: int | None, method: str, **ctx: A
     _shared_warn_if_truncated(rows, limit, method, logger=logger, **ctx)
 
 
+def _build_embedding_text(
+    llm_summary: str | None,
+    signature: str | None,
+    docstring: str | None,
+    symbol_name: str | None,
+) -> str:
+    """Build the canonical embedding text string with priority ordering.
+
+    Priority: llm_summary (richest) is included first when present, then
+    signature and docstring (always appended if non-empty regardless of
+    whether llm_summary is set).  symbol_name is used *only* as a last
+    resort when all three richer fields are empty.
+
+    This function is the single source of truth for the embedding text
+    composition used by ``_normalize_node``, ``update_node_summary``,
+    ``populate_summaries``, and ``populate_embeddings`` so that the hash
+    stored at upsert time always matches what the embedder actually receives.
+    """
+    parts: list[str] = []
+    s = (llm_summary or "").strip()
+    if s:
+        parts.append(s)
+    sig = (signature or "").strip()
+    if sig:
+        parts.append(sig)
+    doc = (docstring or "").strip()
+    if doc:
+        parts.append(doc)
+    if not parts:  # last resort
+        sym = (symbol_name or "").strip()
+        if sym:
+            parts.append(sym)
+    return " | ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # pgvector availability
 # ---------------------------------------------------------------------------
@@ -139,9 +174,14 @@ def _define_tables(
         Column("return_type", Text, server_default=""),
         # #116 incremental regen: sha256 hex of normalize(source_text)
         Column("content_hash", Text),
-        # #116 PR 4: snapshot of content_hash at last embedding; lets
-        # populate_embeddings skip nodes whose source is unchanged.
+        # #116 PR 4: sha256(embedding_text) stored at last embedding, where
+        # embedding_text is composed from llm_summary | signature | docstring |
+        # symbol_name (priority order). populate_embeddings skips nodes whose
+        # current sha256(embedding_text) matches this value.
         Column("embedding_content_hash", Text),
+        # sha256 of current embeddable text; kept in sync at upsert/summary-update
+        # time so populate_embeddings can apply a DB-level freshness filter.
+        Column("embedding_text_hash", Text, nullable=True),
         Column("is_architectural", Integer, server_default="0"),
         Column("is_doc", Integer, server_default="0"),
         Column("is_test", Integer, server_default="0"),
@@ -469,6 +509,16 @@ class PostgresWikiStorage:
                         ALTER TABLE {schema}.repo_nodes
                             ADD COLUMN embedding_content_hash TEXT;
                     END IF;
+                    -- embedding_text_hash: sha256 of current embeddable text, kept
+                    -- in sync at upsert/summary-update time for DB-level freshness filter.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = 'repo_nodes'
+                          AND column_name = 'embedding_text_hash'
+                    ) THEN
+                        ALTER TABLE {schema}.repo_nodes
+                            ADD COLUMN embedding_text_hash TEXT;
+                    END IF;
                     -- #116 PR 2 prep: last_indexed_commit on wiki_pages.
                     IF EXISTS (
                         SELECT 1 FROM information_schema.tables
@@ -717,8 +767,24 @@ class PostgresWikiStorage:
         row["score_norm"] = max(0.0, min(float(rank) / cap, 1.0))
         return row
 
-    def _normalize_node(self, n: dict[str, Any]) -> dict[str, Any]:
-        """Normalize a node dict for insertion."""
+    def _normalize_node(
+        self,
+        n: dict[str, Any],
+        existing_summaries: dict[str, str | None] | None = None,
+    ) -> dict[str, Any]:
+        """Normalize a node dict for insertion.
+
+        Parameters
+        ----------
+        n:
+            Raw node dict (e.g. from the graph builder or a re-index call).
+        existing_summaries:
+            Optional mapping of ``node_id → llm_summary`` pre-fetched from the
+            DB.  When provided, the stored summary is used to compute
+            ``embedding_text_hash`` for nodes whose incoming dict omits
+            ``llm_summary`` (i.e. every re-index call, since that column is
+            intentionally excluded from the ON CONFLICT SET clause).
+        """
         symbol_type = n.get("symbol_type", "")
         if hasattr(symbol_type, "value"):
             symbol_type = symbol_type.value
@@ -750,6 +816,24 @@ class PostgresWikiStorage:
         content_hash = n.get("content_hash")
         if content_hash is None and source_text:
             content_hash = compute_content_hash(source_text)
+
+        # Compute embedding_text_hash: sha256 of the text that would be embedded
+        # (same priority order as populate_embeddings so the DB filter stays in
+        # sync with what the embedder actually receives).
+        # Use the stored llm_summary (from existing_summaries pre-fetch) when the
+        # incoming dict omits it — re-index calls never include llm_summary since
+        # that column is intentionally excluded from the ON CONFLICT SET clause.
+        nid = n["node_id"]
+        _stored_summary = (existing_summaries or {}).get(nid) if existing_summaries else None
+        _llm_summary = n.get("llm_summary") or _stored_summary or ""
+        _emb_text = _build_embedding_text(
+            _llm_summary,
+            _s(n.get("signature")),
+            _s(n.get("docstring")),
+            _s(n.get("symbol_name")),
+        )
+        embedding_text_hash = compute_content_hash(_emb_text) if _emb_text else None
+
         return {
             "node_id": _s(n["node_id"]),
             "rel_path": _s(rel_path),
@@ -767,6 +851,7 @@ class PostgresWikiStorage:
             "parameters": _s(params),
             "return_type": _s(n.get("return_type", "")),
             "content_hash": content_hash,
+            "embedding_text_hash": embedding_text_hash,
             "is_architectural": is_arch,
             "is_doc": is_doc,
             "is_test": is_test,
@@ -790,7 +875,27 @@ class PostgresWikiStorage:
             return
 
         schema = self._schema
-        rows = [self._normalize_node(n) for n in nodes]
+
+        # Pre-fetch existing llm_summary for nodes already in the DB so that
+        # _normalize_node can compute embedding_text_hash using the stored
+        # summary.  Re-index calls omit llm_summary from the incoming dict
+        # because that column is excluded from the ON CONFLICT SET clause; without
+        # this pre-fetch the hash would be recomputed as if llm_summary were
+        # empty, desynchronising the freshness filter in populate_embeddings.
+        incoming_ids = [n["node_id"] for n in nodes]
+        existing_summaries: dict[str, str | None] = {}
+        if incoming_ids:
+            with self._engine.connect() as _conn:
+                _rows = _conn.execute(
+                    text(
+                        f"SELECT node_id, llm_summary FROM {schema}.repo_nodes "
+                        "WHERE node_id = ANY(:ids)"
+                    ),
+                    {"ids": incoming_ids},
+                ).fetchall()
+            existing_summaries = {r[0]: r[1] for r in _rows}
+
+        rows = [self._normalize_node(n, existing_summaries) for n in nodes]
 
         # Use PostgreSQL UPSERT (INSERT ... ON CONFLICT ... DO UPDATE)
         cols = list(rows[0].keys())
@@ -1201,7 +1306,10 @@ class PostgresWikiStorage:
         conn,
         pairs: list[tuple[str, str | None]],
     ) -> None:
-        """Persist content_hash snapshots on an existing connection.
+        """Persist sha256(embedding_text) snapshots on an existing connection.
+
+        Stores the hash of the text that was just embedded so that future
+        calls to ``populate_embeddings`` can skip unchanged nodes.
 
         Paired with ``_upsert_embeddings_in_conn`` inside one
         ``engine.begin()`` block so a partial failure rolls both back.
@@ -1237,38 +1345,43 @@ class PostgresWikiStorage:
             except ValueError:
                 max_workers = 1
 
+        arch_filter = " AND is_architectural = 1" if architectural_only else ""
         with self._engine.connect() as conn:
-            # Fetch nodes that need (re-)embedding; use source_text with
-            # fallback to docstring / symbol_name so that nodes with empty
-            # source_text still get an embedding vector.
-            #
-            # #116 PR 4: skip nodes whose embedding is already up-to-date
-            # (embedding_content_hash matches the current content_hash).
-            arch_filter = " AND is_architectural = 1" if architectural_only else ""
+            # DB-level freshness filter: only fetch nodes where embedding_text_hash
+            # differs from embedding_content_hash (or either is NULL).
+            # embedding_text_hash is kept in sync at upsert/summary-update time,
+            # so this avoids the O(N) full-table Python scan the old approach required.
+            # Nodes with embedding_text_hash IS NULL have no embeddable text and are
+            # excluded directly by the SQL predicate.
             rows = conn.execute(
                 text(
-                    f"SELECT node_id, source_text, docstring, symbol_name, content_hash "
+                    f"SELECT node_id, llm_summary, signature, docstring, symbol_name, "
+                    f"embedding_text_hash "
                     f"FROM {self._schema}.repo_nodes "
-                    "WHERE ("
-                    "embedding_content_hash IS NULL "
-                    "OR content_hash IS NULL "
-                    "OR embedding_content_hash IS DISTINCT FROM content_hash"
-                    ")"
+                    "WHERE (embedding_content_hash IS NULL OR embedding_content_hash != embedding_text_hash) "
+                    "AND embedding_text_hash IS NOT NULL"
                     + arch_filter
                 ),
             ).fetchall()
 
-        embeddable: list[tuple[str, str, str | None]] = []
+        # Build embeddable text using priority order: llm_summary is richest
+        # (bounded natural-language description from the LLM); signature +
+        # docstring give structured semantics and are always short; symbol_name
+        # is the last resort — still beats raw source_text which can exceed
+        # 8192 tokens and cause Bedrock ValidationException.
+        # No Python-side hash comparison needed — the DB filter already selected
+        # only stale nodes.
+        embeddable: list[tuple[str, str, str]] = []
         for r in rows:
-            txt = (r[1] or "").strip()
+            txt = _build_embedding_text(
+                r["llm_summary"], r["signature"], r["docstring"], r["symbol_name"]
+            )
             if not txt:
-                txt = (r[2] or "").strip()  # docstring
-            if not txt:
-                txt = (r[3] or "").strip()  # symbol_name
-            if txt:
-                embeddable.append((r[0], txt, r[4]))  # node_id, text, content_hash
+                continue
+            # Use the stored embedding_text_hash — no need to recompute.
+            embeddable.append((r["node_id"], txt, r["embedding_text_hash"]))
 
-        batches: list[tuple[int, list[str], list[str], list[str | None]]] = []
+        batches: list[tuple[int, list[str], list[str], list[str]]] = []
         for i in range(0, len(embeddable), batch_size):
             batch = embeddable[i: i + batch_size]
             batches.append(
@@ -1294,7 +1407,7 @@ class PostgresWikiStorage:
             idx: int,
             node_ids: list[str],
             texts: list[str],
-            hashes: list[str | None],
+            hashes: list[str],
         ):
             try:
                 vectors = embedding_fn(texts)
@@ -1374,22 +1487,49 @@ class PostgresWikiStorage:
         return total
 
     def update_node_summary(self, node_id: str, summary: str, model_name: str = "") -> None:
-        """Write llm_summary for a single node (agentic summary path)."""
+        """Write llm_summary for a single node (agentic summary path).
+
+        Also recomputes ``embedding_text_hash`` so that the next
+        ``populate_embeddings`` call sees this node as stale and re-embeds it
+        with the richer LLM-generated summary text.
+        """
         import time as _time  # noqa: PLC0415
         now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
         with self._engine.begin() as conn:
+            # Fetch existing embeddable fields to recompute embedding_text_hash.
+            row = conn.execute(
+                text(
+                    f"SELECT signature, docstring, symbol_name "
+                    f"FROM {self._schema}.repo_nodes WHERE node_id = :nid"
+                ),
+                {"nid": node_id},
+            ).fetchone()
+            _s = self._strip_nul
+            clean_summary = _s(summary)
+            clean_model = _s(model_name)
+            new_emb_hash: str | None = None
+            if row is not None:
+                _emb_text = _build_embedding_text(
+                    clean_summary,
+                    _s(row[0]),  # signature
+                    _s(row[1]),  # docstring
+                    _s(row[2]),  # symbol_name
+                )
+                new_emb_hash = compute_content_hash(_emb_text) if _emb_text else None
             conn.execute(
                 text(
                     f"UPDATE {self._schema}.repo_nodes "
-                    "SET llm_summary = :summary, summary_model = :model, summary_at = :at "
+                    "SET llm_summary = :summary, summary_model = :model, summary_at = :at, "
+                    "embedding_text_hash = :eth "
                     "WHERE node_id = :nid"
                 ),
-                {"summary": summary or None, "model": model_name, "at": now, "nid": node_id},
+                {"summary": clean_summary or None, "model": clean_model, "at": now,
+                 "eth": new_emb_hash, "nid": node_id},
             )
 
     def populate_summaries(
         self,
-        summary_fn: "Callable[[list[str]], list[str]]",
+        summary_fn: "Callable[[list[str]], list[str | None]]",
         model_name: str = "",
         batch_size: int = 20,
         architectural_only: bool = True,
@@ -1402,8 +1542,10 @@ class PostgresWikiStorage:
         Parameters
         ----------
         summary_fn : callable
-            ``(list[str]) -> list[str]`` — receives a batch of ``source_text``
-            strings and returns the same number of summary strings.
+            ``(list[str]) -> list[str | None]`` — receives a batch of
+            ``source_text`` strings and returns the same number of summary
+            strings.  A ``None`` item leaves the node with ``llm_summary =
+            NULL``, keeping it eligible for future summarisation retries.
         model_name : str
             Model identifier stored in ``summary_model`` for provenance.
         batch_size : int
@@ -1415,7 +1557,8 @@ class PostgresWikiStorage:
 
         arch_filter = " AND is_architectural = 1" if architectural_only else ""
         query = text(
-            f"SELECT node_id, source_text FROM {self._schema}.repo_nodes "
+            f"SELECT node_id, source_text, signature, docstring, symbol_name "
+            f"FROM {self._schema}.repo_nodes "
             f"WHERE llm_summary IS NULL"
             f" AND source_text IS NOT NULL"
             f" AND trim(source_text) != ''"
@@ -1436,10 +1579,15 @@ class PostgresWikiStorage:
             len(rows), (len(rows) + batch_size - 1) // batch_size, batch_size,
         )
 
+        _s = self._strip_nul
+        clean_model = _s(model_name)
         for i in range(0, len(rows), batch_size):
             batch = rows[i : i + batch_size]
             node_ids = [r[0] for r in batch]
             texts = [r[1] for r in batch]
+            # Keep embeddable fields so we can recompute embedding_text_hash
+            # after writing the summary — same field ordering as populate_embeddings.
+            node_fields = {r[0]: (_s(r[2]) or "", _s(r[3]) or "", _s(r[4]) or "") for r in batch}
             try:
                 summaries = summary_fn(texts)
             except Exception as exc:
@@ -1455,13 +1603,24 @@ class PostgresWikiStorage:
                     # Write None (NULL) for failed summaries — empty string
                     # satisfies IS NOT NULL and would lock the node out of
                     # future populate_summaries retries.
+                    # Also recompute embedding_text_hash with the new llm_summary
+                    # so populate_embeddings will re-embed these nodes on the
+                    # next call.
+                    clean_summary = _s(summary)
+                    sig, doc, sym = node_fields[nid]
+                    _emb_text = _build_embedding_text(clean_summary, sig, doc, sym)
+                    eth = compute_content_hash(_emb_text) if _emb_text else None
                     conn.execute(
                         text(
                             f"UPDATE {self._schema}.repo_nodes "
-                            "SET llm_summary = :summary, summary_model = :model, summary_at = :at "
+                            "SET llm_summary = :summary, summary_model = :model, "
+                            "summary_at = :at, embedding_text_hash = :eth "
                             "WHERE node_id = :nid"
                         ),
-                        {"summary": summary or None, "model": model_name, "at": now, "nid": nid},
+                        {
+                            "summary": clean_summary or None, "model": clean_model,
+                            "at": now, "eth": eth, "nid": nid,
+                        },
                     )
             total += sum(1 for s in summaries if s)
 

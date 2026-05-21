@@ -86,6 +86,41 @@ except ImportError:
     logger.debug("sqlite-vec not installed — vector search disabled in UnifiedWikiDB")
 
 
+def _build_embedding_text(
+    llm_summary: str | None,
+    signature: str | None,
+    docstring: str | None,
+    symbol_name: str | None,
+) -> str:
+    """Build the canonical embedding text string with priority ordering.
+
+    Priority: llm_summary (richest) is included first when present, then
+    signature and docstring (always appended if non-empty regardless of
+    whether llm_summary is set).  symbol_name is used *only* as a last
+    resort when all three richer fields are empty.
+
+    This function is the single source of truth for the embedding text
+    composition used by ``_upsert_nodes_batch``, ``update_node_summary``,
+    ``populate_summaries``, and ``populate_embeddings`` so that the hash
+    stored at upsert time always matches what the embedder actually receives.
+    """
+    parts: list[str] = []
+    s = (llm_summary or "").strip()
+    if s:
+        parts.append(s)
+    sig = (signature or "").strip()
+    if sig:
+        parts.append(sig)
+    doc = (docstring or "").strip()
+    if doc:
+        parts.append(doc)
+    if not parts:  # last resort
+        sym = (symbol_name or "").strip()
+        if sym:
+            parts.append(sym)
+    return " | ".join(parts)
+
+
 def _serialize_float32_vec(vec: list[float]) -> bytes:
     """Serialize a list of floats to bytes for sqlite-vec insertion."""
     return struct.pack(f"{len(vec)}f", *vec)
@@ -160,11 +195,16 @@ CREATE TABLE IF NOT EXISTS repo_nodes (
     -- Change detection (#116 incremental regen)
     -- sha256 hex of normalize(source_text); NULL for pre-incremental rows
     content_hash    TEXT DEFAULT NULL,
-    -- #116 PR 4: snapshot of content_hash at the time this node was last
-    -- embedded into repo_vec. populate_embeddings skips nodes whose
-    -- content_hash matches this value. NULL = never embedded (or pre-PR4
-    -- row — force re-embed once after deploy).
+    -- #116 PR 4: sha256(embedding_text) at the time this node was last
+    -- embedded into repo_vec, where embedding_text is composed from
+    -- llm_summary | signature | docstring | symbol_name (priority order).
+    -- populate_embeddings skips nodes whose current hash matches this value.
+    -- NULL = never embedded (or pre-PR4 row — force re-embed once after deploy).
     embedding_content_hash TEXT DEFAULT NULL,
+    -- sha256 of current embeddable text (llm_summary|signature|docstring|symbol_name);
+    -- updated on every upsert/summary-update so populate_embeddings can filter
+    -- stale nodes at the DB level without a full-table Python-side scan.
+    embedding_text_hash TEXT DEFAULT NULL,
 
     -- Classification
     is_architectural INTEGER DEFAULT 0,
@@ -578,6 +618,19 @@ class UnifiedWikiDB:
             )
             self.conn.commit()
 
+        # embedding_text_hash: sha256 of current embeddable text, kept in sync
+        # at upsert/summary-update time so populate_embeddings can do a DB-level
+        # freshness filter instead of a full Python-side scan.
+        if "embedding_text_hash" not in cols:
+            logger.info(
+                "Migrating schema: adding embedding_text_hash to repo_nodes"
+            )
+            cur.execute(
+                "ALTER TABLE repo_nodes "
+                "ADD COLUMN embedding_text_hash TEXT DEFAULT NULL"
+            )
+            self.conn.commit()
+
         # #116 PR 2 prep: last_indexed_commit on wiki_pages for fast-exit
         # change detection. Idempotent — only fires on legacy schemas that
         # have wiki_pages but lack this column.
@@ -736,7 +789,7 @@ class UnifiedWikiDB:
             start_line, end_line,
             symbol_name, symbol_type, parent_symbol, analysis_level,
             source_text, docstring, signature, parameters, return_type,
-            content_hash,
+            content_hash, embedding_text_hash,
             is_architectural, is_doc, is_test, chunk_type,
             macro_cluster, micro_cluster, is_hub, hub_assignment,
             api_surface
@@ -745,7 +798,7 @@ class UnifiedWikiDB:
             :start_line, :end_line,
             :symbol_name, :symbol_type, :parent_symbol, :analysis_level,
             :source_text, :docstring, :signature, :parameters, :return_type,
-            :content_hash,
+            :content_hash, :embedding_text_hash,
             :is_architectural, :is_doc, :is_test, :chunk_type,
             :macro_cluster, :micro_cluster, :is_hub, :hub_assignment,
             :api_surface
@@ -766,6 +819,7 @@ class UnifiedWikiDB:
             parameters = excluded.parameters,
             return_type = excluded.return_type,
             content_hash = excluded.content_hash,
+            embedding_text_hash = excluded.embedding_text_hash,
             is_architectural = excluded.is_architectural,
             is_doc = excluded.is_doc,
             is_test = excluded.is_test,
@@ -777,7 +831,31 @@ class UnifiedWikiDB:
             api_surface = excluded.api_surface
         -- llm_summary, summary_model, summary_at are intentionally excluded:
         -- they are managed by populate_summaries() and must survive re-indexing.
+        -- embedding_content_hash is intentionally excluded: managed by
+        -- populate_embeddings() to track what was actually embedded.
         """
+
+        # Pre-fetch existing llm_summary for nodes already in the DB so that
+        # embedding_text_hash is computed using the stored summary (which is
+        # intentionally NOT overwritten on conflict).  Incoming node dicts from
+        # re-indexing typically omit llm_summary, so without this pre-fetch the
+        # hash would be computed as if llm_summary were empty, desynchronising
+        # the freshness filter in populate_embeddings.
+        incoming_ids = [n["node_id"] for n in nodes]
+        existing_summaries: dict[str, str | None] = {}
+        if incoming_ids:
+            # SQLite's IN clause is limited to 999 bound parameters.  Chunk
+            # the pre-fetch to stay safely under that limit.
+            _CHUNK = 900
+            for _i in range(0, len(incoming_ids), _CHUNK):
+                _chunk = incoming_ids[_i : _i + _CHUNK]
+                _placeholders = ",".join("?" * len(_chunk))
+                _rows = self.conn.execute(
+                    f"SELECT node_id, llm_summary FROM repo_nodes WHERE node_id IN ({_placeholders})",  # noqa: S608
+                    _chunk,
+                ).fetchall()
+                for _r in _rows:
+                    existing_summaries[_r[0]] = _r[1]
 
         rows = []
         for n in nodes:
@@ -812,6 +890,22 @@ class UnifiedWikiDB:
             if content_hash is None and source_text:
                 content_hash = compute_content_hash(source_text)
 
+            # Compute embedding_text_hash: sha256 of the text that would be
+            # embedded (same priority order as populate_embeddings so the DB
+            # filter stays in sync with what the embedder actually receives).
+            # Use the stored llm_summary (pre-fetched above) if the incoming
+            # dict doesn't carry one — re-index calls never include llm_summary
+            # since that column is intentionally excluded from ON CONFLICT SET.
+            nid = n["node_id"]
+            _llm_summary = n.get("llm_summary") or existing_summaries.get(nid) or ""
+            _emb_text = _build_embedding_text(
+                _llm_summary,
+                n.get("signature"),
+                n.get("docstring"),
+                n.get("symbol_name"),
+            )
+            embedding_text_hash = compute_content_hash(_emb_text) if _emb_text else None
+
             # Phase 6: api_surface may arrive as list[dict] from
             # extract_api_surfaces_for_graph; serialize to JSON for
             # storage. Empty lists collapse to NULL so the column stays
@@ -840,6 +934,7 @@ class UnifiedWikiDB:
                     "parameters": params,
                     "return_type": n.get("return_type", ""),
                     "content_hash": content_hash,
+                    "embedding_text_hash": embedding_text_hash,
                     "is_architectural": is_arch,
                     "is_doc": is_doc,
                     "is_test": is_test,
@@ -1204,8 +1299,12 @@ class UnifiedWikiDB:
     ) -> int:
         """Embed all nodes' text and populate the ``repo_vec`` table.
 
-        Uses ``embed_documents`` (batch API) for throughput.  Nodes whose
-        ``source_text`` is empty or whitespace-only are skipped.
+        Uses ``embed_documents`` (batch API) for throughput.  The embedding
+        text is composed from ``llm_summary | signature | docstring |
+        symbol_name`` (priority order); nodes with no non-empty embeddable
+        field are skipped.  Freshness is checked by comparing
+        ``sha256(embedding_text)`` against the stored
+        ``embedding_content_hash``; unchanged nodes are skipped.
 
         Parameters
         ----------
@@ -1242,41 +1341,49 @@ class UnifiedWikiDB:
             except ValueError:
                 max_workers = 1
 
-        # SQLite trim() only strips spaces; use explicit whitespace chars
-        _ws = " ' ' || char(9) || char(10) || char(13) "
         arch_filter = " AND is_architectural = 1" if architectural_only else ""
-        # #116 PR 4: skip nodes whose embedding is already up-to-date.
-        # A node is "fresh" iff embedding_content_hash equals content_hash.
-        # Anything else (NULL embedding_content_hash, NULL content_hash, or
-        # mismatched hashes) is re-embedded. content_hash is NULL only for
-        # pre-PR1 rows that haven't been re-upserted; those will be re-hashed
-        # and then re-embedded the next time their file is parsed.
-        skip_filter = (
-            " AND ("
-            "embedding_content_hash IS NULL "
-            "OR content_hash IS NULL "
-            "OR embedding_content_hash != content_hash"
-            ")"
-        )
-        rows = self.conn.execute(
-            "SELECT node_id, source_text, content_hash FROM repo_nodes "  # noqa: S608 — internal whitespace-trim query, _ws is a hardcoded SQLite expression
-            f"WHERE source_text IS NOT NULL AND length(trim(source_text, {_ws})) > 0"
+        # DB-level freshness filter: only fetch nodes where embedding_text_hash
+        # differs from embedding_content_hash (or either is NULL).
+        # embedding_text_hash is kept in sync at upsert/summary-update time,
+        # so this avoids the O(N) full-table Python scan that the old approach
+        # required.  Nodes with embedding_text_hash IS NULL have no embeddable
+        # text and are excluded directly by the SQL predicate.
+        rows = self.conn.execute(  # noqa: S608 — internal, no user input in query
+            "SELECT node_id, llm_summary, signature, docstring, symbol_name, "
+            "embedding_text_hash "
+            "FROM repo_nodes "
+            "WHERE (embedding_content_hash IS NULL OR embedding_content_hash != embedding_text_hash) "
+            "AND embedding_text_hash IS NOT NULL"
             + arch_filter
-            + skip_filter
         ).fetchall()
 
-        batches: list[tuple[int, list[str], list[str], list[str | None]]] = []
+        # Build embeddable text using priority order: llm_summary is richest
+        # (bounded natural-language description from the LLM); signature +
+        # docstring give structured semantics and are always short; symbol_name
+        # is the last resort — still beats raw source_text which can exceed
+        # 8192 tokens and cause Bedrock ValidationException.
+        # No Python-side hash comparison needed — the DB filter already selected
+        # only stale nodes.
+        batches: list[tuple[int, list[str], list[str], list[str]]] = []
         for i in range(0, len(rows), batch_size):
             batch = rows[i : i + batch_size]
-            batches.append(
-                (
-                    i,
-                    [r["node_id"] for r in batch],
-                    [r["source_text"] for r in batch],
-                    [r["content_hash"] for r in batch],
+            node_ids: list[str] = []
+            texts: list[str] = []
+            hashes: list[str] = []
+            for r in batch:
+                txt = _build_embedding_text(
+                    r["llm_summary"], r["signature"], r["docstring"], r["symbol_name"]
                 )
-            )
+                if not txt:
+                    continue
+                # Use the stored embedding_text_hash — no need to recompute.
+                node_ids.append(r["node_id"])
+                texts.append(txt)
+                hashes.append(r["embedding_text_hash"])
+            if node_ids:
+                batches.append((i, node_ids, texts, hashes))
 
+        total_to_embed = sum(len(b[1]) for b in batches)
         total = 0
         n_batches = len(batches)
         # Log every ~5% of batches (or every 10 batches, whichever is larger)
@@ -1285,16 +1392,16 @@ class UnifiedWikiDB:
         log_every = max(10, n_batches // 20) if n_batches else 1
         t_start = time.time()
         logger.info(
-            "populate_embeddings: starting — %d nodes in %d batches "
+            "populate_embeddings: starting — %d/%d nodes need embedding in %d batches "
             "(batch_size=%d, workers=%d)",
-            len(rows), n_batches, batch_size, max_workers,
+            total_to_embed, len(rows), n_batches, batch_size, max_workers,
         )
 
         def _embed_one(
             idx: int,
             node_ids: list[str],
             texts: list[str],
-            hashes: list[str | None],
+            hashes: list[str],
         ):
             try:
                 vectors = embedding_fn(texts)
@@ -1310,10 +1417,11 @@ class UnifiedWikiDB:
             )
 
         def _stamp_embedding_hashes(pairs: list[tuple[str, str | None]]) -> None:
-            """Persist the content_hash snapshot so the next regen skips
-            these nodes when their source is unchanged. Pre-PR1 rows with
-            NULL content_hash get NULL stamped — they'll be re-embedded
-            once after their next upsert backfills the hash."""
+            """Persist the embedding-text hash so the next regen skips
+            nodes whose embedding text is unchanged. The hash is derived
+            from the actual text passed to the embedder (llm_summary |
+            signature | docstring | symbol_name), not from source_text,
+            so nodes with NULL source_text are stamped correctly."""
             self.conn.executemany(
                 "UPDATE repo_nodes SET embedding_content_hash = ? "
                 "WHERE node_id = ?",
@@ -1369,24 +1477,44 @@ class UnifiedWikiDB:
         logger.info(
             "populate_embeddings: %d/%d nodes embedded "
             "(arch_only=%s, workers=%d)",
-            total, len(rows), architectural_only, max_workers,
+            total, total_to_embed, architectural_only, max_workers,
         )
         return total
 
     def update_node_summary(self, node_id: str, summary: str, model_name: str = "") -> None:
-        """Write llm_summary for a single node (agentic summary path)."""
+        """Write llm_summary for a single node (agentic summary path).
+
+        Also recomputes ``embedding_text_hash`` so that the next
+        ``populate_embeddings`` call sees this node as stale and re-embeds it
+        with the richer LLM-generated summary text.
+        """
         import time as _time  # noqa: PLC0415
         now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+        # Fetch the existing embeddable fields so we can recompute embedding_text_hash.
+        row = self.conn.execute(
+            "SELECT signature, docstring, symbol_name FROM repo_nodes WHERE node_id = ?",
+            (node_id,),
+        ).fetchone()
+        new_emb_hash: str | None = None
+        if row is not None:
+            _emb_text = _build_embedding_text(
+                summary,
+                row["signature"],
+                row["docstring"],
+                row["symbol_name"],
+            )
+            new_emb_hash = compute_content_hash(_emb_text) if _emb_text else None
         self.conn.execute(
-            "UPDATE repo_nodes SET llm_summary = ?, summary_model = ?, summary_at = ? "
+            "UPDATE repo_nodes "
+            "SET llm_summary = ?, summary_model = ?, summary_at = ?, embedding_text_hash = ? "
             "WHERE node_id = ?",
-            (summary or None, model_name, now, node_id),
+            (summary or None, model_name, now, new_emb_hash, node_id),
         )
         self.conn.commit()
 
     def populate_summaries(
         self,
-        summary_fn: Callable[[list[str]], list[str]],
+        summary_fn: Callable[[list[str]], list[str | None]],
         model_name: str = "",
         batch_size: int = 20,
         architectural_only: bool = True,
@@ -1399,8 +1527,10 @@ class UnifiedWikiDB:
         Parameters
         ----------
         summary_fn : callable
-            ``(list[str]) -> list[str]`` — receives a batch of ``source_text``
-            strings and returns the same number of summary strings.
+            ``(list[str]) -> list[str | None]`` — receives a batch of
+            ``source_text`` strings and returns the same number of summary
+            strings.  A ``None`` item leaves the node with ``llm_summary =
+            NULL``, keeping it eligible for future summarisation retries.
         model_name : str
             Model identifier stored in ``summary_model`` for provenance.
         batch_size : int
@@ -1411,7 +1541,8 @@ class UnifiedWikiDB:
         _ws = " ' ' || char(9) || char(10) || char(13) "
         arch_filter = " AND is_architectural = 1" if architectural_only else ""
         rows = self.conn.execute(
-            "SELECT node_id, source_text FROM repo_nodes "  # noqa: S608
+            "SELECT node_id, source_text, signature, docstring, symbol_name "  # noqa: S608
+            "FROM repo_nodes "
             f"WHERE llm_summary IS NULL"
             f" AND source_text IS NOT NULL"
             f" AND length(trim(source_text, {_ws})) > 0"
@@ -1435,6 +1566,9 @@ class UnifiedWikiDB:
             batch = rows[i : i + batch_size]
             node_ids = [r[0] for r in batch]
             texts = [r[1] for r in batch]
+            # Keep embeddable fields so we can recompute embedding_text_hash
+            # after writing the summary — same field ordering as populate_embeddings.
+            node_fields = {r[0]: (r[2] or "", r[3] or "", r[4] or "") for r in batch}
             try:
                 summaries = summary_fn(texts)
             except Exception as exc:
@@ -1448,13 +1582,19 @@ class UnifiedWikiDB:
             # Write None (NULL) for failed summaries so the node stays
             # eligible for future runs — empty string satisfies IS NOT NULL
             # and would permanently lock the node out of retries.
+            # Also recompute embedding_text_hash with the new llm_summary so
+            # that the next populate_embeddings call re-embeds these nodes.
+            update_params: list[tuple] = []
+            for nid, summary in zip(node_ids, summaries, strict=True):
+                sig, doc, sym = node_fields[nid]
+                _emb_text = _build_embedding_text(summary, sig, doc, sym)
+                eth = compute_content_hash(_emb_text) if _emb_text else None
+                update_params.append((summary or None, model_name, now, eth, nid))
             self.conn.executemany(
-                "UPDATE repo_nodes SET llm_summary = ?, summary_model = ?, summary_at = ? "
+                "UPDATE repo_nodes "
+                "SET llm_summary = ?, summary_model = ?, summary_at = ?, embedding_text_hash = ? "
                 "WHERE node_id = ?",
-                [
-                    (summary or None, model_name, now, nid)
-                    for nid, summary in zip(node_ids, summaries, strict=True)
-                ],
+                update_params,
             )
             total += sum(1 for s in summaries if s)
 

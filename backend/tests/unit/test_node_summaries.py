@@ -392,32 +392,30 @@ class TestIndexerPopulateSummaries:
 
         idx = FilesystemRepositoryIndexer(cache_dir=str(tmp_path))
 
-        # Create a real DB file
+        # Create a real SQLite DB and keep it open so we can pass it directly
+        # via _db= to avoid open_storage() picking up the wrong backend.
         db_path = tmp_path / "test.wiki.db"
         db = UnifiedWikiDB(db_path, embedding_dim=4)
-        db.upsert_node(
-            "arch_fn",
-            rel_path="src/x.py",
-            symbol_name="arch_fn",
-            symbol_type="function",
-            source_text="def arch_fn(): pass",
-        )
-        db.conn.commit()
-        db.close()
-
-        idx._unified_db_path = str(db_path)
-        mock_llm = self._make_mock_llm("This function does X.")
-
-        count = idx.populate_summaries(llm=mock_llm)
-        assert count == 1
-
-        # Verify the summary was persisted
-        db2 = UnifiedWikiDB(db_path, embedding_dim=4)
         try:
-            node = db2.get_node("arch_fn")
+            db.upsert_node(
+                "arch_fn",
+                rel_path="src/x.py",
+                symbol_name="arch_fn",
+                symbol_type="function",
+                source_text="def arch_fn(): pass",
+            )
+            db.conn.commit()
+
+            mock_llm = self._make_mock_llm("This function does X.")
+
+            # Pass _db directly to bypass open_storage backend selection.
+            count = idx.populate_summaries(llm=mock_llm, _db=db)
+            assert count == 1
+
+            node = db.get_node("arch_fn")
             assert node["llm_summary"] == "This function does X."
         finally:
-            db2.close()
+            db.close()
 
     def test_uses_model_name_from_llm(self, tmp_path):
         from app.core.filesystem_indexer import FilesystemRepositoryIndexer
@@ -426,27 +424,25 @@ class TestIndexerPopulateSummaries:
         idx = FilesystemRepositoryIndexer(cache_dir=str(tmp_path))
         db_path = tmp_path / "test.wiki.db"
         db = UnifiedWikiDB(db_path, embedding_dim=4)
-        db.upsert_node(
-            "fn_m",
-            rel_path="src/m.py",
-            symbol_name="fn_m",
-            symbol_type="function",
-            source_text="def fn_m(): pass",
-        )
-        db.conn.commit()
-        db.close()
-
-        idx._unified_db_path = str(db_path)
-        mock_llm = self._make_mock_llm("Useful summary.", model_name="claude-sonnet-4-6")
-
-        idx.populate_summaries(llm=mock_llm)
-
-        db2 = UnifiedWikiDB(db_path, embedding_dim=4)
         try:
-            node = db2.get_node("fn_m")
+            db.upsert_node(
+                "fn_m",
+                rel_path="src/m.py",
+                symbol_name="fn_m",
+                symbol_type="function",
+                source_text="def fn_m(): pass",
+            )
+            db.conn.commit()
+
+            mock_llm = self._make_mock_llm("Useful summary.", model_name="claude-sonnet-4-6")
+
+            # Pass _db directly to bypass open_storage backend selection.
+            idx.populate_summaries(llm=mock_llm, _db=db)
+
+            node = db.get_node("fn_m")
             assert node["summary_model"] == "claude-sonnet-4-6"
         finally:
-            db2.close()
+            db.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Any
 
@@ -208,6 +209,90 @@ def _dispatch_writer_tool(tools: Any, name: str, args: dict[str, Any]) -> str:
             return f"[unknown tool: {name}]"
     except Exception as exc:
         return f"[tool error: {exc}]"
+
+
+def _parse_numbered_list(text: str, expected: int) -> list[str]:
+    """Extract numbered items from an LLM response.
+
+    Splits on lines that start with a digit followed by a period and space,
+    e.g. ``"1. foo"`` → ``["foo", ...]``.  Returns at most ``expected`` items.
+    """
+    pattern = re.compile(r"^\s*\d+\.\s+", re.MULTILINE)
+    parts = pattern.split(text)
+    # parts[0] is always the pre-"1." preamble (may be empty) — discard it.
+    # Items start from index 1.
+    items = [p.strip() for p in parts[1:] if p.strip()]
+    return items[:expected]
+
+
+def _batch_summarise(llm: Any, texts: list[str], batch_size: int = 20) -> list[str | None]:
+    """Summarise a list of code-symbol texts with batched LLM calls.
+
+    Sends ``batch_size`` texts in a single numbered prompt, parses the
+    numbered response, and falls back to per-node calls when the batch
+    call fails or the response cannot be parsed.
+
+    Parameters
+    ----------
+    llm :
+        LangChain-compatible chat model.
+    texts :
+        Raw source texts to summarise (one per node).
+    batch_size :
+        Number of texts per LLM call.
+
+    Returns
+    -------
+    list[str | None]
+        One entry per input text.  ``None`` for nodes that could not be
+        summarised (keeps them eligible for future runs).
+    """
+    results: list[str | None] = [None] * len(texts)
+    for i in range(0, len(texts), batch_size):
+        chunk = texts[i : i + batch_size]
+        numbered = "\n\n".join(
+            f"{j + 1}. {t[:1500]}" for j, t in enumerate(chunk)
+        )
+        prompt = (
+            f"Summarise each of the following {len(chunk)} code symbols in 2-3 sentences. "
+            "Focus on: role in the system, key behaviour, what callers need to know. "
+            f"Return exactly {len(chunk)} numbered items (1. 2. 3. ...) matching input order. "
+            "Write only the summaries — no headings, no extra commentary.\n\n"
+            f"{numbered}"
+        )
+        batch_ok = False
+        try:
+            resp = llm.invoke(prompt)
+            raw = resp.content if hasattr(resp, "content") else str(resp)
+            if isinstance(raw, list):
+                raw = "".join(c if isinstance(c, str) else c.get("text", "") for c in raw)
+            parsed = _parse_numbered_list(raw, expected=len(chunk))
+            if len(parsed) == len(chunk):
+                for k, s in enumerate(parsed):
+                    results[i + k] = s.strip()[:400] or None
+                batch_ok = True
+        except Exception as exc:
+            logger.warning("[SUMMARIES] batch call failed (%s) — falling back to per-node", exc)
+
+        if not batch_ok:
+            # Per-node fallback for this chunk
+            for k, t in enumerate(chunk):
+                try:
+                    r = llm.invoke(
+                        f"Summarise this code symbol in 2-3 sentences "
+                        f"(role, key behaviour, what callers need to know). "
+                        f"Write only the summary.\n\n{t[:1500]}"
+                    )
+                    raw = r.content if hasattr(r, "content") else str(r)
+                    if isinstance(raw, list):
+                        raw = "".join(c if isinstance(c, str) else c.get("text", "") for c in raw)
+                    results[i + k] = raw.strip()[:400] or None
+                except Exception as _exc:
+                    logger.warning(
+                        "[SUMMARIES] per-node fallback failed for node %d in chunk %d: %s",
+                        k, i, _exc,
+                    )
+    return results
 
 
 class FilesystemRepositoryIndexer:
@@ -766,23 +851,28 @@ class FilesystemRepositoryIndexer:
             self._emit_progress(0.21, "Importing graph into unified DB...")
             udb.from_networkx(self.relationship_graph)
 
-            # Phase 1b — Populate vector embeddings (repo_vec table)
+            # Phase 1b — Initial vector embeddings (before Phase 2)
+            # Phase 2 orphan resolution calls db.search_vec (hybrid RRF) which
+            # requires repo_vec to be populated.  Embed using the new
+            # text-selection order (llm_summary | signature | docstring |
+            # symbol_name — no raw source_text) so that Bedrock and other
+            # providers with token limits are not overwhelmed.
+            # LLM summaries are not available yet, but signature + docstring +
+            # symbol_name give sufficient semantic signal for Phase 2.
             if _embed_batch_fn:
-                self._emit_progress(0.22, "Embedding code symbols...")
+                self._emit_progress(0.215, "Initial embedding pass (Phase 1b)...")
                 try:
-                    # Default 256: ``text-embedding-3-large`` accepts up
-                    # to 2048 inputs / 300k tokens per request, and code
-                    # symbols are typically short.  64 was conservative
-                    # and made indexing wall-clock dominated by HTTP RTT.
-                    n_embedded = udb.populate_embeddings(
+                    n_embedded_phase1b = udb.populate_embeddings(
                         embedding_fn=_embed_batch_fn,
                         batch_size=int(os.getenv("WIKI_EMBED_BATCH_SIZE", "256")),
                     )
-                    logger.info("Unified DB: %d node embeddings stored", n_embedded)
+                    logger.info(
+                        "Phase 1b: %d node embeddings stored (pre-Phase-2)", n_embedded_phase1b
+                    )
                 except Exception as exc:
-                    logger.warning("Embedding population failed (non-fatal): %s", exc)
+                    logger.warning("Phase 1b embedding failed (non-fatal): %s", exc)
             else:
-                logger.info("No embeddings model available — repo_vec will be empty")
+                logger.info("Phase 1b: no embeddings model available — Phase 2 semantic links will be skipped")
 
             # Phase 2 — Edge weighting, hub detection, orphan resolution
             self._emit_progress(0.23, "Weighting edges & detecting hubs...")
@@ -973,6 +1063,28 @@ class FilesystemRepositoryIndexer:
             except Exception as exc:
                 logger.warning("Node summary population failed (non-fatal): %s", exc)
 
+            # Phase 1b (second pass) — Re-embed nodes that now have llm_summary.
+            # populate_embeddings skips nodes whose embedding_content_hash already
+            # matches the hash of their current embedding text, so only hub nodes
+            # (which got new llm_summary via the agentic path above) and any
+            # remaining un-summarised architectural nodes are re-embedded here.
+            # Nodes that were embedded in Phase 1b with signature/docstring only
+            # and did NOT receive an llm_summary are skipped (hash unchanged).
+            if _embed_batch_fn:
+                self._emit_progress(0.248, "Re-embedding nodes with LLM summaries...")
+                try:
+                    n_embedded = udb.populate_embeddings(
+                        embedding_fn=_embed_batch_fn,
+                        batch_size=int(os.getenv("WIKI_EMBED_BATCH_SIZE", "256")),
+                    )
+                    logger.info(
+                        "Unified DB: %d node embeddings updated (post-summaries)", n_embedded
+                    )
+                except Exception as exc:
+                    logger.warning("Post-summary embedding population failed (non-fatal): %s", exc)
+            else:
+                logger.info("No embeddings model available — skipping post-summary re-embed")
+
             # Store build metadata
             udb.set_meta("repo_identifier", repo_identifier)
             udb.set_meta("commit_hash", self._last_commit_hash)
@@ -1123,30 +1235,14 @@ class FilesystemRepositoryIndexer:
 
             # ── Batch path for remaining nodes ──────────────────────────────
 
-            def _summary_fn(texts: list[str]) -> list[str]:
-                results: list[str] = []
-                for text in texts:
-                    prompt = (
-                        "Summarise what this code symbol does in 2-3 sentences. "
-                        "Focus on its role in the system, key behaviour, and what callers need to know. "
-                        "Be specific to the code shown — do not generalise.\n\n"
-                        f"{text[:2000]}"
-                    )
-                    try:
-                        response = llm.invoke(prompt)
-                        raw = (
-                            response.content
-                            if hasattr(response, "content")
-                            else str(response)
-                        )
-                        results.append(raw[:400])
-                    except Exception as exc:
-                        logger.warning("Summary LLM call failed: %s", exc)
-                        # Return None (not "") so the node stays eligible for
-                        # future populate_summaries runs — "" satisfies
-                        # "llm_summary IS NOT NULL" and would lock it out.
-                        results.append(None)
-                return results
+            def _summary_fn(texts: list[str]) -> list[str | None]:
+                # Use batched LLM calls: one prompt per batch_size nodes,
+                # parsed from a numbered response.  Falls back to per-node
+                # calls when the batch response cannot be parsed.
+                # db.populate_summaries passes each batch as a single list
+                # (already sized to batch_size), so _batch_summarise is
+                # called once per db-level batch with batch_size=len(texts).
+                return _batch_summarise(llm, texts, batch_size=len(texts))
 
             batch_count = db.populate_summaries(
                 _summary_fn, model_name=model_name, batch_size=batch_size
