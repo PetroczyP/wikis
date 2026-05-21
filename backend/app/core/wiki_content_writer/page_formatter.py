@@ -128,17 +128,13 @@ class PageFormatter:
         if not markdown or not markdown.strip():
             return markdown
 
-        # Pass 1 ─────────────────────────────────────────────────────────────
+        # Pass 1 (deterministic) — convert [path:line] → [^N] footnotes
         pass1_output = self._pass1_footnotes(markdown)
 
-        # Pass 2 ─────────────────────────────────────────────────────────────
-        if self._llm is None:
-            return pass1_output
-
-        if not self._passes_richness_guard(pass1_output):
-            return pass1_output
-
-        return self._pass2_llm(pass1_output)
+        # Pass 2 (LLM reorganisation) disabled — agentic writers now produce
+        # well-structured content directly. LLM reorganisation added noise
+        # without improving readability at current content quality levels.
+        return pass1_output
 
     # ── Pass 1: deterministic footnote rewriting ──────────────────────────────
 

@@ -590,19 +590,30 @@ class WikiContentWriter:
             f"Output only the overview paragraph — do not list sub-pages."
         )
 
-        effective_llm = self.llm_client
+        # Chapter index must NOT use the tool-bound LLM — tools cause the LLM
+        # to call list_doc_chunks instead of writing prose, leaking raw tool_use
+        # dicts into the page content. Reach the inner base LLM directly.
+        _base_llm = self.llm_client
+        if _base_llm is not None:
+            # Unwrap RunnableRetry / _ChatModelBinding to get the base model
+            # which has no tools bound — we want plain text, not tool calls.
+            _inner = getattr(_base_llm, "bound", _base_llm)
+            _inner = getattr(_inner, "bound", _inner)  # two levels for binding+retry
+            _base_llm = _inner
+
         index_overview = ""
-        if effective_llm is not None:
+        if _base_llm is not None:
             try:
                 response = await loop.run_in_executor(
                     None,
-                    lambda: effective_llm.invoke([HumanMessage(content=index_prompt)]),
+                    lambda: _base_llm.invoke([HumanMessage(content=index_prompt)]),
                 )
-                index_overview = (
-                    response.content
-                    if isinstance(response.content, str)
-                    else str(response.content)
-                )
+                raw = response.content if hasattr(response, "content") else str(response)
+                # Guard: if LLM still returned tool_calls, ignore and use empty string
+                if getattr(response, "tool_calls", None):
+                    logger.warning("[WRITER] chapter index LLM returned tool_calls — ignored")
+                    raw = ""
+                index_overview = raw if isinstance(raw, str) else str(raw)
             except Exception as exc:
                 logger.warning("[WRITER] chapter index LLM call failed: %s", exc)
 
