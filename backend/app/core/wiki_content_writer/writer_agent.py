@@ -493,12 +493,31 @@ class WikiContentWriter:
     # Budget for the chapter-index mini research loop (6 tool calls).
     _CHAPTER_INDEX_BUDGET: int = 6
 
+    @staticmethod
+    def _extract_subpage_outline(title: str, md: str, char_cap: int = 3000) -> str:
+        """Return a compact heading outline of a generated sub-page.
+
+        Extracts ## and ### headings from *md*, prepended with the page title,
+        and truncates at *char_cap* characters.  Used to give the chapter-index
+        LLM call context about what was actually written without sending the
+        full page.
+        """
+        headings: list[str] = []
+        for line in md.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## ") or stripped.startswith("### "):
+                headings.append(stripped)
+        heading_text = "\n".join(headings[:40]) or "(no headings)"
+        raw = f"### {title}\n{heading_text}"
+        return raw[:char_cap]
+
     def _generate_chapter_index(
         self,
         chapter_spec: "ChapterSpec",
         evidence_slices: "list[EvidenceSlice]",
         toc_wikilinks: str,
         *,
+        subpage_mds: "list[str] | None" = None,
         stream_callback: Callable[[dict], None] | None = None,
     ) -> str:
         """Run a mini tool-augmented loop to write the chapter _index.md.
@@ -509,6 +528,11 @@ class WikiContentWriter:
         ``## Overview`` — 2-3 sentences describing the cluster.
         ``## Key Components`` — list of main symbols with 1-sentence roles.
         ``## Sub-pages`` — ``[[wikilink]]`` TOC built deterministically.
+
+        When *subpage_mds* is provided, a heading outline of each already-
+        generated sub-page is included in the prompt so the index accurately
+        reflects the actual content rather than re-reading the codebase from
+        scratch.
 
         Falls back to a minimal stub if the LLM call fails or the client is
         unavailable.  Never raises.
@@ -525,6 +549,20 @@ class WikiContentWriter:
         for sl in evidence_slices[:2]:  # limit context to first 2 slices
             seed_symbols.extend(sl.symbols[:4])
             seed_files.extend(sl.file_paths[:3])
+
+        # Build outlines from already-generated sub-pages so the LLM index
+        # reflects the actual written content instead of re-deriving it.
+        subpage_context = ""
+        if subpage_mds and chapter_spec.subpages:
+            outlines = [
+                self._extract_subpage_outline(sp.title, md)
+                for sp, md in zip(chapter_spec.subpages, subpage_mds)
+            ]
+            subpage_context = (
+                "\n\nAlready-generated sub-page outlines (use these to write "
+                "an accurate index — do NOT contradict what was written):\n"
+                + "\n\n".join(outlines)
+            )
 
         # Build the wikilink TOC line so the LLM can reference it in the
         # ## Sub-pages section (the deterministic version is appended after).
@@ -553,7 +591,8 @@ class WikiContentWriter:
             f"Description: {chapter_spec.chapter_description}\n\n"
             f"Key symbols: {', '.join(seed_symbols) or 'none'}\n"
             f"Key files: {', '.join(seed_files) or 'none'}\n\n"
-            f"Sub-pages to document:\n{toc_wikilinks}\n\n"
+            f"Sub-pages to document:\n{toc_wikilinks}"
+            f"{subpage_context}\n\n"
             "Read 2-3 key files to understand the code, then write the "
             "chapter index following the system prompt structure exactly."
         )
@@ -789,6 +828,7 @@ class WikiContentWriter:
                 chapter_spec,
                 evidence_slices,
                 toc_wikilinks,
+                subpage_mds=subpage_mds,
                 stream_callback=stream_callback,
             ),
         )
