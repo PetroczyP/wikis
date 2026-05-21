@@ -6,8 +6,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import shutil
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
 
 import app.events as events
@@ -192,6 +195,7 @@ class WikiService:
             for inv_id, inv_data in raw.items():
                 try:
                     inv = Invocation(**inv_data)
+                    inv.id = inv_id  # key is authoritative; JSON field may differ
                     # #146: any non-terminal status from a previous
                     # process lifetime is by definition orphaned —
                     # the task that was driving it is gone. Without
@@ -202,11 +206,148 @@ class WikiService:
                     # incremental refresh.
                     if inv.status in ("generating", "running"):
                         prior_status = inv.status
+
+                        if prior_status == "generating" and inv.run_dir:
+                            # Validate run_dir resolves to the expected path under cache_dir
+                            # to prevent path traversal / untrusted data from being used.
+                            # Use the outer dict key (inv_id) as the authoritative identifier —
+                            # inv.id is loaded from persisted JSON and could contain
+                            # path-separator characters that bypass the safety check.
+                            import uuid as _uuid
+                            try:
+                                _uuid.UUID(inv_id)
+                            except (ValueError, AttributeError):
+                                logger.warning(
+                                    "Skipping persisted invocation with non-UUID key %r", inv_id
+                                )
+                                inv.run_dir = None
+                            else:
+                                try:
+                                    _resolved = Path(inv.run_dir).resolve()
+                                    _expected_unresolved = Path(self.settings.cache_dir) / "wiki-runs" / inv_id
+                                    _expected = _expected_unresolved.resolve()
+                                    if _resolved != _expected:
+                                        logger.warning(
+                                            "Untrusted run_dir for %s — skipping recovery", inv.wiki_id
+                                        )
+                                        inv.run_dir = None
+                                    else:
+                                        # Reject symlinked expected paths — attacker could pre-create symlink
+                                        # at cache_dir/wiki-runs/<inv_id> pointing outside the intended area
+                                        if _expected_unresolved.exists() and _expected_unresolved.is_symlink():
+                                            logger.warning(
+                                                "Expected run_dir is a symlink for %s — skipping recovery", inv.wiki_id
+                                            )
+                                            inv.run_dir = None
+                                except Exception:
+                                    inv.run_dir = None
+
+                        if prior_status == "generating" and inv.run_dir:
+                            run_dir = Path(inv.run_dir)
+                            output_path = run_dir / "output.json"
+
+                            # Reject symlinked output.json to prevent reading arbitrary files
+                            if output_path.exists() and output_path.is_symlink():
+                                logger.warning(
+                                    "output.json is a symlink for %s — skipping recovery", inv.wiki_id
+                                )
+                                inv.run_dir = None
+
+                            # Case 1: subprocess already finished — output file exists
+                            if inv.run_dir and output_path.exists():
+                                logger.info(
+                                    "Startup recovery: output.json found for wiki %s — processing",
+                                    inv.wiki_id,
+                                )
+
+                                def _make_done_callback(key: str) -> Callable:
+                                    def _cb(fut: asyncio.Future) -> None:
+                                        self._tasks.pop(key, None)
+                                    return _cb
+
+                                _recovery_task = asyncio.create_task(
+                                    self._recover_completed_generation(inv, str(output_path))
+                                )
+                                _recovery_task.add_done_callback(_make_done_callback(inv_id))
+                                self._tasks[inv_id] = _recovery_task
+                                # Keep status as "generating" until _recover handles it
+                                self._invocations[inv_id] = inv
+                                continue
+
+                            # Case 2: subprocess may still be running
+                            pid_alive = False
+                            pid = inv.subprocess_pid
+                            if inv.run_dir and pid and isinstance(pid, int) and 0 < pid < 2**31:
+                                try:
+                                    os.kill(pid, 0)  # signal 0 = existence check
+                                    pid_alive = True
+                                except ProcessLookupError:
+                                    pid_alive = False
+                                except PermissionError:
+                                    pid_alive = True  # EPERM = process exists, we lack permission
+                                except (OverflowError, ValueError, OSError):
+                                    pid_alive = False  # corrupted PID
+
+                            if pid_alive:
+                                logger.info(
+                                    "Startup recovery: subprocess PID %d still running for wiki %s — watching for output",
+                                    pid,
+                                    inv.wiki_id,
+                                )
+
+                                def _make_done_callback(key: str) -> Callable:
+                                    def _cb(fut: asyncio.Future) -> None:
+                                        self._tasks.pop(key, None)
+                                    return _cb
+
+                                _watch_task = asyncio.create_task(
+                                    self._watch_for_generation_output(inv, str(output_path))
+                                )
+                                _watch_task.add_done_callback(_make_done_callback(inv_id))
+                                self._tasks[inv_id] = _watch_task
+                                self._invocations[inv_id] = inv
+                                continue
+
+                            # Case 2b: no PID recorded but run_dir exists — subprocess may
+                            # still be running (crash in the tiny window between persisting
+                            # run_dir and persisting subprocess_pid).  Poll for output.json
+                            # with a shorter timeout; skip PID liveness checks.
+                            if inv.run_dir and pid is None:
+                                logger.info(
+                                    "Startup recovery: no PID for wiki %s but run_dir exists"
+                                    " — polling for output (no PID check)",
+                                    inv.wiki_id,
+                                )
+
+                                def _make_done_callback(key: str) -> Callable:
+                                    def _cb(fut: asyncio.Future) -> None:
+                                        self._tasks.pop(key, None)
+                                    return _cb
+
+                                _no_pid_task = asyncio.create_task(
+                                    self._watch_for_generation_output(
+                                        inv, str(output_path), max_wait=1800
+                                    )
+                                )
+                                _no_pid_task.add_done_callback(_make_done_callback(inv_id))
+                                self._tasks[inv_id] = _no_pid_task
+                                self._invocations[inv_id] = inv
+                                continue
+
+                            # Case 3: no output, process dead — fall through to fail
+                            if inv.run_dir:
+                                logger.warning(
+                                    "Startup recovery: subprocess dead and no output for wiki %s — marking failed",
+                                    inv.wiki_id,
+                                )
+
+                        # Fall through: mark failed (running=incremental refresh, or no run_dir,
+                        # or generating+dead with no output)
                         inv.status = "failed"
-                        inv.error = (
-                            f"Server restarted during {prior_status}"
-                        )
+                        inv.error = f"Server restarted during {prior_status}"
                         inv.completed_at = datetime.now()
+                        # Clean up run_dir on terminal failure — may contain input.json with secrets
+                        self._cleanup_run_dir(inv.run_dir)
                         # #177 (inverts #191 C5): now that incremental_refresh
                         # writes status="running" to the DB at start, an
                         # orphaned ``running`` row means the refresh crashed
@@ -258,6 +399,13 @@ class WikiService:
                 for key in ("created_at", "completed_at"):
                     if d.get(key) and hasattr(d[key], "isoformat"):
                         d[key] = d[key].isoformat()
+                # run_dir and subprocess_pid are excluded from API serialisation
+                # via Field(exclude=True) but must be persisted for restart
+                # recovery.  Read them directly from the instance to include
+                # them in the storage payload without exposing them in API
+                # responses.
+                d["run_dir"] = inv.run_dir
+                d["subprocess_pid"] = inv.subprocess_pid
                 data[inv_id] = d
             raw = _json.dumps(data, default=str).encode("utf-8")
             await self.storage.upload(self.INVOCATIONS_BUCKET, self.INVOCATIONS_KEY, raw)
@@ -428,8 +576,6 @@ class WikiService:
         upload the resulting pages and artifacts.
         """
         try:
-            from app.core.repo_providers.factory import RepoProviderFactory
-
             await self._emit_progress(invocation, "configuring", 0.05, "Preparing wiki generation")
 
             # The unified pipeline is the only path (#242).
@@ -463,104 +609,12 @@ class WikiService:
                     error_msg = "Generation returned no result" if result is None else "Generation returned non-dict"
                 raise RuntimeError(error_msg)
 
-            # Save pages incrementally as they're generated
-            await self._emit_progress(invocation, "storing", 0.9, "Storing wiki pages")
+            await self._finalize_generation(invocation, result, request=request)
 
-            generated_pages = result.get("generated_pages", {})
-            invocation.pages_total = len(generated_pages)
-            invocation.pages_completed = 0
-
-            for page_id, content in generated_pages.items():
-                try:
-                    data = content.encode("utf-8") if isinstance(content, str) else content
-                    await self.storage.upload("wiki_artifacts", f"{invocation.wiki_id}/{page_id}.md", data)
-                    invocation.pages_completed += 1
-                    await invocation.emit(events.page_complete(invocation.id, page_id, page_id))
-                except Exception as e:
-                    logger.warning(f"Failed to save page {page_id}: {e}")
-
-            # Index pages into PostgreSQL for full-text search
-            if self.wiki_management and generated_pages:
-                try:
-                    await self.wiki_management.index_wiki_pages(
-                        invocation.wiki_id, generated_pages,
-                    )
-                except Exception as e:
-                    logger.warning("Failed to index pages for FTS: %s", e)
-
-            # Store export artifacts (index, summary, etc.)
-            artifacts = result.get("artifacts", [])
-            for artifact in artifacts:
-                name = artifact.get("name", "unknown")
-                data = artifact.get("data", b"")
-                if isinstance(data, str):
-                    data = data.encode("utf-8")
-                await self.storage.upload("wiki_artifacts", f"{invocation.wiki_id}/{name}", data)
-
-            page_count = invocation.pages_completed
-            if self.wiki_management:
-                from app.core.local_repo_provider import is_local_path as _is_local
-
-                # For local repos: store remote URL (if any) for source links, else local path
-                registry_url = request.repo_url
-                registry_branch = request.branch
-                if _is_local(request.repo_url):
-                    clone_cfg = RepoProviderFactory.from_url(url=request.repo_url, branch=request.branch)
-                    from app.core.repo_providers import LocalPathConfig as _LPC
-
-                    if isinstance(clone_cfg, _LPC) and clone_cfg.remote_url:
-                        registry_url = clone_cfg.remote_url
-                    registry_branch = clone_cfg.branch or request.branch
-                _reg_title = request.wiki_title or (
-                    f"Wiki for {request.repo_url}"
-                    if request.source_type == "git"
-                    else f"Wiki from {request.source_type.capitalize()} ({request.scope.get('base_url', '')})"
-                )
-                await self.wiki_management.register_wiki(
-                    wiki_id=invocation.wiki_id,
-                    repo_url=registry_url,
-                    branch=registry_branch,
-                    title=_reg_title,
-                    page_count=page_count,
-                    owner_id=invocation.owner_id,
-                    visibility=getattr(request, "visibility", "personal"),
-                    commit_hash=result.get("commit_hash"),
-                    indexed_at=datetime.now(),
-                    status="complete",
-                    requires_token=bool(request.access_token),
-                    source_type=request.source_type,
-                    source_scope=request.scope or None,
-                )
-
-            # Mark every project containing this wiki as stale so PR-15 can
-            # decide to enqueue a project recompute. Best-effort, never raises.
-            try:
-                await self._mark_owning_projects_stale(invocation.wiki_id)
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "mark_owning_projects_stale failed for %s",
-                    invocation.wiki_id,
-                    exc_info=True,
-                )
-
-            invocation.status = "complete"
-            invocation.progress = 1.0
-            invocation.current_phase = "done"
-            invocation.message = "Wiki generation complete"
-            invocation.completed_at = datetime.now()
-
-            elapsed = (invocation.completed_at - invocation.created_at).total_seconds()
-            await invocation.emit(
-                events.task_status(
-                    invocation.id,
-                    "completed",
-                    "Wiki generation complete",
-                    wiki_id=invocation.wiki_id,
-                    page_count=page_count,
-                    execution_time=elapsed,
-                )
-            )
-            logger.info(f"Wiki generation complete: {invocation.wiki_id}")
+            # Clean up the persistent run directory AFTER finalization so that
+            # if the server crashes between subprocess completion and finalize,
+            # startup recovery can still find output.json in the run dir.
+            self._cleanup_run_dir(invocation.run_dir)
 
         except asyncio.CancelledError:
             invocation.status = "cancelled"
@@ -599,6 +653,23 @@ class WikiService:
                 logger.exception(f"Wiki generation failed: {invocation.wiki_id}")
         finally:
             self._tasks.pop(invocation.id, None)
+            # Clean up run_dir on failure/cancellation.  The success path
+            # already removed it above; the complete-status guard here
+            # avoids a double-rmtree on the success path and ensures we
+            # never delete the directory while recovery might still need it.
+            if invocation.run_dir and invocation.status != "complete":
+                _run_dir_path = Path(invocation.run_dir)
+                try:
+                    _wiki_runs_root = (Path(self.settings.cache_dir) / "wiki-runs").resolve()
+                    if _run_dir_path.resolve().is_relative_to(_wiki_runs_root):
+                        shutil.rmtree(_run_dir_path, ignore_errors=True)
+                    else:
+                        logger.warning(
+                            "Skipping rmtree for %s — not under expected wiki-runs root",
+                            _run_dir_path,
+                        )
+                except Exception as _cleanup_err:
+                    logger.warning("run_dir cleanup skipped due to validation error: %s", _cleanup_err)
             await self._persist_invocations()
             # #191: reconcile the persistent WikiRecord with the final
             # invocation status on *every* terminal outcome. The success
@@ -700,9 +771,7 @@ class WikiService:
         """
         import base64
         import json
-        import os
         import sys
-        import tempfile
 
         payload = {
             "invocation_id": invocation.id,
@@ -727,92 +796,477 @@ class WikiService:
             "exclude_tests": exclude_tests,
         }
 
-        with tempfile.TemporaryDirectory(prefix="wiki-run-") as tmp:
-            input_path = os.path.join(tmp, "input.json")
-            output_path = os.path.join(tmp, "output.json")
-            with open(input_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f)
+        run_dir = Path(self.settings.cache_dir) / "wiki-runs" / invocation.id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        # Guard: if cache_dir/wiki-runs/<inv_id> is a symlink, an attacker could
+        # redirect secret writes to an arbitrary location.
+        if run_dir.is_symlink():
+            raise RuntimeError(f"run_dir is a symlink — refusing to write secrets: {run_dir}")
+        input_path = str(run_dir / "input.json")
+        output_path = str(run_dir / "output.json")
 
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-u",  # unbuffered stdout — lines reach us promptly
-                "-m",
-                "app.core.wiki_runner",
-                "--input",
-                input_path,
-                "--output",
-                output_path,
-                stdout=asyncio.subprocess.PIPE,
-                # stderr inherits the parent's fd so logging lands in docker logs.
+        with open(input_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+        # Persist run_dir on the invocation BEFORE starting the subprocess so
+        # that if the server restarts immediately after the process starts,
+        # load_persisted_invocations can locate the output file.
+        invocation.run_dir = str(run_dir)
+        await self._persist_invocations()
+
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-u",  # unbuffered stdout — lines reach us promptly
+            "-m",
+            "app.core.wiki_runner",
+            "--input",
+            input_path,
+            "--output",
+            output_path,
+            stdout=asyncio.subprocess.PIPE,
+            # stderr inherits the parent's fd so logging lands in docker logs.
+        )
+        invocation.subprocess_pid = proc.pid
+        await self._persist_invocations()
+
+        # input.json deletion is handled by wiki_runner.py immediately after
+        # it loads the payload — this avoids the race where the parent deletes
+        # the file before the child has opened it.
+
+        async def _pump_stdout() -> None:
+            assert proc.stdout is not None
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    return
+                try:
+                    ev = json.loads(line.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    # Stray non-JSON line — ignore, it'll show up in docker logs via stderr.
+                    continue
+                kind = ev.get("t")
+                if kind == "progress":
+                    await self._emit_progress(
+                        invocation,
+                        ev.get("phase") or "",
+                        float(ev.get("progress") or 0.0),
+                        ev.get("message") or "",
+                    )
+                elif kind == "token_estimate":
+                    invocation.estimated_tokens = ev.get("estimated_tokens")
+                    invocation.model_context_limit = ev.get("model_context_limit")
+                    if invocation.estimated_tokens and invocation.model_context_limit:
+                        ratio = invocation.estimated_tokens / invocation.model_context_limit
+                        if ratio > 0.8:
+                            await invocation.emit(
+                                events.progress(
+                                    invocation.id,
+                                    int(invocation.progress * 100) or 20,
+                                    100,
+                                    (
+                                        f"Large repo: ~{invocation.estimated_tokens:,} estimated tokens "
+                                        f"vs {invocation.model_context_limit:,} context limit "
+                                        f"({ratio:.1f}x). Generation will use ranked truncation."
+                                    ),
+                                    phase="warning",
+                                )
+                            )
+                            logger.warning(
+                                "Context pressure ratio %.2fx for %s", ratio, request.repo_url,
+                            )
+
+        try:
+            await asyncio.gather(_pump_stdout(), proc.wait())
+        except asyncio.CancelledError:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+            raise
+
+        try:
+            with open(output_path, encoding="utf-8") as f:
+                result = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Wiki runner produced no result file (exit={proc.returncode}): {exc}"
+            ) from exc
+
+        # Decode base64-wrapped artifact bytes back to ``bytes``.
+        for art in result.get("artifacts") or []:
+            if art.pop("_b64", False) and isinstance(art.get("data"), str):
+                art["data"] = base64.b64decode(art["data"])
+
+        return result
+
+    async def _finalize_generation(
+        self,
+        invocation: Invocation,
+        result: dict[str, Any],
+        *,
+        request: Any = None,
+    ) -> None:
+        """Upload artifacts, register the wiki, and mark the invocation complete.
+
+        Extracted from :meth:`_run_generation` so that
+        :meth:`_recover_completed_generation` can reuse this path when a
+        completed subprocess output file is found on server restart.
+
+        ``request`` is the original :class:`GenerateWikiRequest` and is only
+        needed for the ``wiki_management.register_wiki`` call.  When called
+        from the recovery path it will be ``None``; in that case the registry
+        update is skipped (the pre-generation call already registered the wiki,
+        and the status will be reconciled by the ``finally`` block in
+        ``_run_generation`` / the recovery helper).
+        """
+        # Save pages incrementally as they're generated
+        await self._emit_progress(invocation, "storing", 0.9, "Storing wiki pages")
+
+        generated_pages = result.get("generated_pages", {})
+        invocation.pages_total = len(generated_pages)
+        invocation.pages_completed = 0
+
+        for page_id, content in generated_pages.items():
+            try:
+                data = content.encode("utf-8") if isinstance(content, str) else content
+                await self.storage.upload("wiki_artifacts", f"{invocation.wiki_id}/{page_id}.md", data)
+                invocation.pages_completed += 1
+                await invocation.emit(events.page_complete(invocation.id, page_id, page_id))
+            except Exception as e:
+                logger.warning(f"Failed to save page {page_id}: {e}")
+
+        # Index pages into PostgreSQL for full-text search
+        if self.wiki_management and generated_pages:
+            try:
+                await self.wiki_management.index_wiki_pages(
+                    invocation.wiki_id, generated_pages,
+                )
+            except Exception as e:
+                logger.warning("Failed to index pages for FTS: %s", e)
+
+        # Store export artifacts (index, summary, etc.)
+        artifacts = result.get("artifacts", [])
+        for artifact in artifacts:
+            name = artifact.get("name", "unknown")
+            data = artifact.get("data", b"")
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            await self.storage.upload("wiki_artifacts", f"{invocation.wiki_id}/{name}", data)
+
+        page_count = invocation.pages_completed
+        if self.wiki_management and request is not None:
+            from app.core.local_repo_provider import is_local_path as _is_local
+            from app.core.repo_providers.factory import RepoProviderFactory
+
+            # For local repos: store remote URL (if any) for source links, else local path
+            registry_url = request.repo_url
+            registry_branch = request.branch
+            if _is_local(request.repo_url):
+                clone_cfg = RepoProviderFactory.from_url(url=request.repo_url, branch=request.branch)
+                from app.core.repo_providers import LocalPathConfig as _LPC
+
+                if isinstance(clone_cfg, _LPC) and clone_cfg.remote_url:
+                    registry_url = clone_cfg.remote_url
+                registry_branch = clone_cfg.branch or request.branch
+            _reg_title = request.wiki_title or (
+                f"Wiki for {request.repo_url}"
+                if request.source_type == "git"
+                else f"Wiki from {request.source_type.capitalize()} ({request.scope.get('base_url', '')})"
+            )
+            await self.wiki_management.register_wiki(
+                wiki_id=invocation.wiki_id,
+                repo_url=registry_url,
+                branch=registry_branch,
+                title=_reg_title,
+                page_count=page_count,
+                owner_id=invocation.owner_id,
+                visibility=getattr(request, "visibility", "personal"),
+                commit_hash=result.get("commit_hash"),
+                indexed_at=datetime.now(),
+                status="complete",
+                requires_token=bool(request.access_token),
+                source_type=request.source_type,
+                source_scope=request.scope or None,
             )
 
-            async def _pump_stdout() -> None:
-                assert proc.stdout is not None
-                while True:
-                    line = await proc.stdout.readline()
-                    if not line:
-                        return
-                    try:
-                        ev = json.loads(line.decode("utf-8", errors="replace"))
-                    except json.JSONDecodeError:
-                        # Stray non-JSON line — ignore, it'll show up in docker logs via stderr.
-                        continue
-                    kind = ev.get("t")
-                    if kind == "progress":
-                        await self._emit_progress(
-                            invocation,
-                            ev.get("phase") or "",
-                            float(ev.get("progress") or 0.0),
-                            ev.get("message") or "",
-                        )
-                    elif kind == "token_estimate":
-                        invocation.estimated_tokens = ev.get("estimated_tokens")
-                        invocation.model_context_limit = ev.get("model_context_limit")
-                        if invocation.estimated_tokens and invocation.model_context_limit:
-                            ratio = invocation.estimated_tokens / invocation.model_context_limit
-                            if ratio > 0.8:
-                                await invocation.emit(
-                                    events.progress(
-                                        invocation.id,
-                                        int(invocation.progress * 100) or 20,
-                                        100,
-                                        (
-                                            f"Large repo: ~{invocation.estimated_tokens:,} estimated tokens "
-                                            f"vs {invocation.model_context_limit:,} context limit "
-                                            f"({ratio:.1f}x). Generation will use ranked truncation."
-                                        ),
-                                        phase="warning",
-                                    )
-                                )
-                                logger.warning(
-                                    "Context pressure ratio %.2fx for %s", ratio, request.repo_url,
-                                )
+        # Mark every project containing this wiki as stale so PR-15 can
+        # decide to enqueue a project recompute. Best-effort, never raises.
+        try:
+            await self._mark_owning_projects_stale(invocation.wiki_id)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "mark_owning_projects_stale failed for %s",
+                invocation.wiki_id,
+                exc_info=True,
+            )
 
-            try:
-                await asyncio.gather(_pump_stdout(), proc.wait())
-            except asyncio.CancelledError:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-                raise
+        invocation.status = "complete"
+        invocation.progress = 1.0
+        invocation.current_phase = "done"
+        invocation.message = "Wiki generation complete"
+        invocation.completed_at = datetime.now()
 
-            try:
-                with open(output_path, encoding="utf-8") as f:
-                    result = json.load(f)
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError(
-                    f"Wiki runner produced no result file (exit={proc.returncode}): {exc}"
-                ) from exc
+        elapsed = (invocation.completed_at - invocation.created_at).total_seconds()
+        await invocation.emit(
+            events.task_status(
+                invocation.id,
+                "completed",
+                "Wiki generation complete",
+                wiki_id=invocation.wiki_id,
+                page_count=page_count,
+                execution_time=elapsed,
+            )
+        )
+        logger.info(f"Wiki generation complete: {invocation.wiki_id}")
 
-            # Decode base64-wrapped artifact bytes back to ``bytes``.
+    async def _recover_completed_generation(self, invocation: Invocation, output_path: str) -> None:
+        """Process a completed subprocess output file found on startup.
+
+        Called when :meth:`load_persisted_invocations` discovers that
+        the wiki_runner subprocess has already finished and written
+        ``output.json`` to the persistent run directory.  Parses the
+        result, delegates to :meth:`_finalize_generation`, then removes
+        the run directory.
+        """
+        run_dir = Path(output_path).parent
+        try:
+            with open(output_path, encoding="utf-8") as f:
+                result = json.load(f)
+            # Decode base64-wrapped artifact bytes back to bytes.
             for art in result.get("artifacts") or []:
                 if art.pop("_b64", False) and isinstance(art.get("data"), str):
-                    art["data"] = base64.b64decode(art["data"])
+                    import base64 as _b64
 
-            return result
+                    art["data"] = _b64.b64decode(art["data"])
+            if not result.get("success"):
+                err = result.get("error") or "Wiki runner reported failure"
+                raise RuntimeError(err)
+            await self._finalize_generation(invocation, result)
+            if invocation.wiki_id and self.wiki_management:
+                try:
+                    _marked = await self.wiki_management.mark_status(invocation.wiki_id, "complete", error=None)
+                    if not _marked:
+                        logger.warning(
+                            "mark_status returned False for wiki %s after recovery — "
+                            "wiki record may not exist; attempting register_wiki fallback",
+                            invocation.wiki_id,
+                        )
+                        try:
+                            await self.wiki_management.register_wiki(
+                                wiki_id=invocation.wiki_id,
+                                repo_url=getattr(invocation, "repo_url", "") or "",
+                                branch=getattr(invocation, "branch", "") or "",
+                                title=f"Wiki for {getattr(invocation, 'repo_url', invocation.wiki_id) or invocation.wiki_id}",
+                                page_count=invocation.pages_completed,
+                                owner_id=getattr(invocation, "owner_id", None),
+                                status="complete",
+                                indexed_at=datetime.now(),
+                            )
+                        except Exception as _reg_err:
+                            logger.warning(
+                                "register_wiki fallback also failed for wiki %s: %s",
+                                invocation.wiki_id,
+                                _reg_err,
+                            )
+                except Exception as _db_err:
+                    logger.warning(
+                        "Recovered generation finalized for wiki %s, but failed to mark it complete: %s",
+                        invocation.wiki_id,
+                        _db_err,
+                    )
+        except Exception as exc:
+            logger.error("Recovery failed for wiki %s: %s", invocation.wiki_id, exc)
+            invocation.status = "failed"
+            invocation.error = str(exc)
+            invocation.completed_at = datetime.now()
+            if invocation.wiki_id and self.wiki_management:
+                try:
+                    await self.wiki_management.mark_status(invocation.wiki_id, "failed", str(exc))
+                except Exception as _db_err:
+                    logger.warning("Failed to mark wiki %s failed after recovery error: %s", invocation.wiki_id, _db_err)
+        finally:
+            self._cleanup_run_dir(str(run_dir))
+            await self._persist_invocations()
+
+    async def _watch_for_generation_output(
+        self, invocation: Invocation, output_path: str, max_wait: int = 4 * 3600
+    ) -> None:
+        """Poll for output.json from a still-running subprocess after server restart.
+
+        Called when :meth:`load_persisted_invocations` detects that the
+        wiki_runner subprocess PID is still alive (or when the PID was never
+        persisted but run_dir exists).  Polls every 10 s for ``output.json``;
+        also checks that the PID remains alive after each sleep so we don't
+        wait the full timeout when the process has already exited.
+
+        When ``invocation.subprocess_pid`` is None the PID liveness check is
+        skipped — the poll continues until ``output.json`` appears or
+        ``max_wait`` seconds elapse.
+
+        Args:
+            invocation: The invocation being watched.
+            output_path: Path to the expected ``output.json`` file.
+            max_wait: Maximum seconds to wait before marking the invocation
+                failed.  Defaults to 4 hours; callers may pass a shorter
+                timeout (e.g. 1800 s) when no PID is available.
+        """
+        poll_interval = 10  # seconds
+        waited = 0
+        path = Path(output_path)
+
+        # Eager check before first sleep: output.json may already exist if the
+        # subprocess finished in the tiny window between startup detection and now.
+        if path.exists():
+            logger.info("Recovery: output.json already present for wiki %s", invocation.wiki_id)
+            await self._recover_completed_generation(invocation, output_path)
+            return
+
+        # Fail fast when a PID is present but invalid — corrupted persisted data.
+        # A non-None but out-of-range/non-int PID means the record cannot be trusted;
+        # keep polling for the full timeout would be misleading.
+        pid = invocation.subprocess_pid
+        if pid is not None:
+            if not (isinstance(pid, int) and 0 < pid < 2**31):
+                logger.warning(
+                    "[WATCH] invalid subprocess_pid %r for wiki %s — failing",
+                    pid,
+                    invocation.wiki_id,
+                )
+                invocation.status = "failed"
+                invocation.error = "Invalid subprocess_pid in persisted data"
+                invocation.completed_at = datetime.now()
+                self._cleanup_run_dir(invocation.run_dir)
+                if self.wiki_management and invocation.wiki_id:
+                    try:
+                        await self.wiki_management.mark_status(
+                            invocation.wiki_id, "failed", invocation.error
+                        )
+                    except Exception as _db_err:
+                        logger.warning(
+                            "Failed to mark wiki %s failed after invalid PID: %s",
+                            invocation.wiki_id,
+                            _db_err,
+                        )
+                await self._persist_invocations()
+                return
+
+        while waited < max_wait:
+            await asyncio.sleep(poll_interval)
+            waited += poll_interval
+
+            if path.exists():
+                logger.info(
+                    "Recovery: output.json appeared for wiki %s after %ds",
+                    invocation.wiki_id,
+                    waited,
+                )
+                await self._recover_completed_generation(invocation, output_path)
+                return
+
+            # Check if process is still alive — skip when PID is unknown.
+            _pid = invocation.subprocess_pid
+            if invocation.subprocess_pid is None:
+                # No PID recorded — can only poll for the output file.
+                continue
+            if _pid and isinstance(_pid, int) and 0 < _pid < 2**31:
+                try:
+                    os.kill(_pid, 0)
+                    # process alive — keep waiting
+                except PermissionError:
+                    # EPERM: PID exists but we lack signal permission — process is alive.
+                    pass
+                except ProcessLookupError:
+                    # Process died — one last check for output file
+                    await asyncio.sleep(2)
+                    if path.exists():
+                        await self._recover_completed_generation(invocation, output_path)
+                    else:
+                        invocation.status = "failed"
+                        invocation.error = "Subprocess exited without producing output"
+                        invocation.completed_at = datetime.now()
+                        # Clean up run_dir — may contain input.json with secrets
+                        self._cleanup_run_dir(invocation.run_dir)
+                        if invocation.wiki_id and self.wiki_management:
+                            try:
+                                await self.wiki_management.mark_status(
+                                    invocation.wiki_id, "failed", invocation.error
+                                )
+                            except Exception as _db_err:
+                                logger.warning(
+                                    "Failed to mark wiki %s failed after subprocess exited: %s",
+                                    invocation.wiki_id,
+                                    _db_err,
+                                )
+                        await self._persist_invocations()
+                    return
+                except (OverflowError, ValueError, OSError):
+                    # Corrupted PID — treat as dead
+                    invocation.status = "failed"
+                    invocation.error = "Subprocess PID invalid after restart recovery"
+                    invocation.completed_at = datetime.now()
+                    # Clean up run_dir — may contain input.json with secrets
+                    self._cleanup_run_dir(invocation.run_dir)
+                    if invocation.wiki_id and self.wiki_management:
+                        try:
+                            await self.wiki_management.mark_status(
+                                invocation.wiki_id, "failed", invocation.error
+                            )
+                        except Exception as _db_err:
+                            logger.warning(
+                                "Failed to mark wiki %s failed after corrupted PID: %s",
+                                invocation.wiki_id,
+                                _db_err,
+                            )
+                    await self._persist_invocations()
+                    return
+
+        # Timed out
+        invocation.status = "failed"
+        invocation.error = "Generation timed out after restart recovery"
+        invocation.completed_at = datetime.now()
+        # Clean up run_dir — may contain input.json with secrets
+        self._cleanup_run_dir(invocation.run_dir)
+        if invocation.wiki_id and self.wiki_management:
+            try:
+                await self.wiki_management.mark_status(
+                    invocation.wiki_id, "failed", invocation.error
+                )
+            except Exception as _db_err:
+                logger.warning(
+                    "Failed to mark wiki %s failed after watch timeout: %s",
+                    invocation.wiki_id,
+                    _db_err,
+                )
+        await self._persist_invocations()
+
+    def _cleanup_run_dir(self, run_dir: str | None) -> None:
+        """Remove a persistent run_dir after terminal failure.
+
+        Only deletes the directory when it resolves to a path under
+        ``cache_dir/wiki-runs/`` to prevent accidental deletion of
+        unrelated directories from a manipulated invocation record.
+        Rejects symlinks before resolving to prevent out-of-tree deletion
+        via symlink traversal.
+        """
+        if not run_dir:
+            return
+        try:
+            candidate = Path(run_dir)
+            allowed_root = Path(self.settings.cache_dir) / "wiki-runs"
+            # Reject symlinks to prevent out-of-tree deletion via symlink traversal
+            if candidate.is_symlink() or allowed_root.is_symlink():
+                logger.warning("run_dir or wiki-runs is a symlink — skipping cleanup: %s", run_dir)
+                return
+            resolved = candidate.resolve()
+            allowed = allowed_root.resolve()
+            if not resolved.is_relative_to(allowed):
+                logger.warning("run_dir outside allowed area — skipping cleanup: %s", run_dir)
+                return
+            shutil.rmtree(resolved, ignore_errors=True)
+        except Exception as _e:
+            logger.debug("run_dir cleanup skipped: %s", _e)
 
     @staticmethod
     async def _emit_progress(invocation: Invocation, phase: str, progress: float, message: str) -> None:

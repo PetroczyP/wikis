@@ -72,6 +72,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with open(args.input, encoding="utf-8") as f:
             payload = json.load(f)
+        # Delete input.json immediately after loading — it contains secrets
+        # and the parent has already started us; no need to keep it on disk.
+        import os as _os
+        try:
+            _os.unlink(args.input)
+        except Exception:
+            pass
 
         from app.config import get_settings
         from app.core.hybrid_wiki_toolkit_wrapper import HybridWikiToolkitWrapper

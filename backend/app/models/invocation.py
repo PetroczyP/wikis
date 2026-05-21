@@ -44,6 +44,8 @@ class Invocation(BaseModel):
     pages_total: int | None = None
     estimated_tokens: int | None = None
     model_context_limit: int | None = None
+    run_dir: str | None = Field(default=None, exclude=True)          # persistent run directory path
+    subprocess_pid: int | None = Field(default=None, exclude=True)   # PID of the wiki_runner subprocess
 
     # --- Broadcast event store (excluded from serialization) ---
     _event_log: list = []
