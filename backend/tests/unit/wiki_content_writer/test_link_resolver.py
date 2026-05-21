@@ -384,3 +384,110 @@ class TestMissingAnchorReplacement:
         rewritten = report.pages["My Page"].rewritten
         assert "the gone page" in rewritten
         assert "#section" not in rewritten
+
+
+# ── TestChapteredPages (#287) ─────────────────────────────────────────────────
+
+
+class TestChapteredPages:
+    """Tests for chaptered wiki support: resolved_path field + path-based links."""
+
+    def test_matched_link_resolves_subpage_path(self):
+        """When chaptered_paths maps a title to a path, resolved_path is populated."""
+        pages = {"Chapter": "See [[Test Launch REST API]] for details."}
+        page_index = ["Test Launch REST API"]
+        chaptered = {"Test Launch REST API": "workers-chapter/test-launch-rest-api"}
+        report = resolve_wikilinks(pages, page_index, chaptered_paths=chaptered)
+
+        link = report.pages["Chapter"].links[0]
+        assert link.action == LinkAction.MATCHED
+        assert link.target == "Test Launch REST API"
+        assert link.resolved_path == "workers-chapter/test-launch-rest-api"
+
+    def test_matched_link_resolves_chapter_index_path(self):
+        """Chapter index pages resolve to <chapter-slug>/_index."""
+        pages = {"Overview": "See [[Workers Chapter]] for an overview."}
+        page_index = ["Workers Chapter"]
+        chaptered = {"Workers Chapter": "workers-chapter/_index"}
+        report = resolve_wikilinks(pages, page_index, chaptered_paths=chaptered)
+
+        link = report.pages["Overview"].links[0]
+        assert link.action == LinkAction.MATCHED
+        assert link.resolved_path == "workers-chapter/_index"
+
+    def test_path_based_wikilink_rewritten_to_canonical_title(self):
+        """[[chapter-slug/page-slug]] is rewritten to [[Canonical Title]] for SPA compat."""
+        pages = {"P": "See [[workers-chapter/test-launch-rest-api]] for details."}
+        page_index = ["Test Launch REST API"]
+        chaptered = {"Test Launch REST API": "workers-chapter/test-launch-rest-api"}
+        report = resolve_wikilinks(pages, page_index, chaptered_paths=chaptered)
+
+        page_report = report.pages["P"]
+        # Path-based link is rewritten to the canonical title form.
+        assert "[[Test Launch REST API]]" in page_report.rewritten
+        assert "[[workers-chapter/test-launch-rest-api]]" not in page_report.rewritten
+
+    def test_path_based_wikilink_action_is_ambiguous_with_score_1(self):
+        """Path-based resolution is classified as AMBIGUOUS (path → title rewrite)."""
+        pages = {"P": "[[workers-chapter/_index]]"}
+        page_index = ["Workers Chapter"]
+        chaptered = {"Workers Chapter": "workers-chapter/_index"}
+        report = resolve_wikilinks(pages, page_index, chaptered_paths=chaptered)
+
+        link = report.pages["P"].links[0]
+        assert link.action == LinkAction.AMBIGUOUS
+        assert link.best_match == "Workers Chapter"
+        assert link.score == 1.0
+        assert link.resolved_path == "workers-chapter/_index"
+
+    def test_no_chaptered_paths_resolved_path_is_none(self):
+        """Without chaptered_paths, resolved_path is None for matched links."""
+        pages = {"P": "See [[Auth Guide]] for details."}
+        page_index = ["Auth Guide"]
+        report = resolve_wikilinks(pages, page_index)  # no chaptered_paths
+
+        link = report.pages["P"].links[0]
+        assert link.action == LinkAction.MATCHED
+        assert link.resolved_path is None
+
+    def test_chaptered_paths_does_not_break_missing_links(self):
+        """Missing links are still stripped when chaptered_paths is provided."""
+        pages = {"P": "See [[Nonexistent Page]] here."}
+        page_index = ["Real Page"]
+        chaptered = {"Real Page": "some-chapter/real-page"}
+        report = resolve_wikilinks(pages, page_index, chaptered_paths=chaptered)
+
+        link = report.pages["P"].links[0]
+        assert link.action == LinkAction.MISSING
+        assert link.resolved_path is None
+        assert "[[" not in report.pages["P"].rewritten
+
+    def test_ambiguous_link_includes_resolved_path(self):
+        """Ambiguous slug-match also picks up the chaptered path."""
+        pages = {"P": "See [[test launch rest api]] for details."}
+        page_index = ["Test Launch REST API"]
+        chaptered = {"Test Launch REST API": "workers-chapter/test-launch-rest-api"}
+        report = resolve_wikilinks(pages, page_index, chaptered_paths=chaptered)
+
+        link = report.pages["P"].links[0]
+        assert link.action == LinkAction.AMBIGUOUS
+        assert link.best_match == "Test Launch REST API"
+        assert link.resolved_path == "workers-chapter/test-launch-rest-api"
+
+    def test_multiple_chapters_different_resolved_paths(self):
+        """Different chapters produce different resolved_path values."""
+        pages = {
+            "Index": (
+                "See [[Test Launch REST API]] and [[Worker Lifecycle]]."
+            )
+        }
+        page_index = ["Test Launch REST API", "Worker Lifecycle"]
+        chaptered = {
+            "Test Launch REST API": "api-chapter/test-launch-rest-api",
+            "Worker Lifecycle": "worker-chapter/worker-lifecycle",
+        }
+        report = resolve_wikilinks(pages, page_index, chaptered_paths=chaptered)
+
+        resolutions = {lr.target: lr for lr in report.pages["Index"].links}
+        assert resolutions["Test Launch REST API"].resolved_path == "api-chapter/test-launch-rest-api"
+        assert resolutions["Worker Lifecycle"].resolved_path == "worker-chapter/worker-lifecycle"

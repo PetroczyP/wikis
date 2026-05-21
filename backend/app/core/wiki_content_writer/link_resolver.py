@@ -44,6 +44,10 @@ class LinkResolution:
     # Slug-similarity score for AMBIGUOUS matches; 0.0 otherwise. Useful
     # for downstream logging when deciding whether a rewrite was confident.
     score: float = 0.0
+    # For chaptered wikis: page path including chapter folder, e.g.
+    # ``"authentication-service/rest-api"`` or ``"workers-chapter/_index"``.
+    # ``None`` for non-chaptered wikis or unresolved links.
+    resolved_path: str | None = None
 
 
 @dataclass
@@ -167,7 +171,11 @@ def _rebuild_inner(target: str, anchor: str | None, display: str | None) -> str:
 
 
 def _rewrite_page(
-    body: str, links: list[Link], index_set: set[str], index: list[str]
+    body: str,
+    links: list[Link],
+    index_set: set[str],
+    index: list[str],
+    title_to_path: dict[str, str] | None = None,
 ) -> tuple[str, list[LinkResolution]]:
     """Rewrite *body* resolving each wikilink; return (rewritten_body, resolutions)."""
     if not links:
@@ -202,6 +210,13 @@ def _rewrite_page(
     positioned: list[tuple[int, LinkResolution]] = []
     splices: list[tuple[int, int, str]] = []  # (start, end, replacement)
 
+    # Build reverse map: page_id_path → title, so path-based targets like
+    # ``[[authentication-service/rest-api]]`` can be resolved to their title.
+    path_to_title: dict[str, str] = {}
+    if title_to_path:
+        for t, p in title_to_path.items():
+            path_to_title[p] = t
+
     for match, link in pairs:
         target = link.target
         anchor = link.anchor
@@ -214,12 +229,38 @@ def _rewrite_page(
         display = link.text if had_display else None
 
         if target in index_set:
-            positioned.append((match.start(), LinkResolution(target=target, action=LinkAction.MATCHED)))
+            # Exact title match — check if it maps to a chaptered path.
+            resolved_path = title_to_path.get(target) if title_to_path else None
+            positioned.append((
+                match.start(),
+                LinkResolution(target=target, action=LinkAction.MATCHED, resolved_path=resolved_path),
+            ))
+            continue
+
+        # Check if the target is a chaptered path (e.g. ``chapter-slug/page-slug``).
+        # This handles the case where the writer emits path-based wikilinks.
+        if "/" in target and target in path_to_title:
+            canonical_title = path_to_title[target]
+            resolved_path = target  # the target IS the path
+            positioned.append((
+                match.start(),
+                LinkResolution(
+                    target=target,
+                    action=LinkAction.AMBIGUOUS,
+                    best_match=canonical_title,
+                    score=1.0,
+                    resolved_path=resolved_path,
+                ),
+            ))
+            # Rewrite path-based link to canonical title for SPA compatibility.
+            new_inner = _rebuild_inner(canonical_title, anchor, display)
+            splices.append((match.start(), match.end(), f"[[{new_inner}]]"))
             continue
 
         best_title, score = _find_best_match(target, index)
 
         if best_title is not None:
+            resolved_path = title_to_path.get(best_title) if title_to_path else None
             positioned.append(
                 (
                     match.start(),
@@ -228,6 +269,7 @@ def _rewrite_page(
                         action=LinkAction.AMBIGUOUS,
                         best_match=best_title,
                         score=score,
+                        resolved_path=resolved_path,
                     ),
                 )
             )
@@ -254,12 +296,23 @@ def _rewrite_page(
 def resolve_wikilinks(
     pages: dict[str, str],
     page_index: list[str],
+    chaptered_paths: dict[str, str] | None = None,
 ) -> ResolverReport:
     """Validate and rewrite ``[[wiki-links]]`` in all generated pages.
 
     Args:
         pages: ``{page_title: markdown_body}`` — the writer's emitted pages.
         page_index: Valid page titles from the planner's ``WikiStructureSpec``.
+        chaptered_paths: Optional mapping of ``{page_title: page_id_path}``
+            for chaptered wikis (#287).  When provided:
+
+            - Each matched/ambiguous :class:`LinkResolution` gains a
+              ``resolved_path`` attribute (e.g. ``"authentication-service/rest-api"``
+              or ``"workers-chapter/_index"``) so callers can generate correct
+              file-system or URL paths without re-deriving the slug.
+            - Path-based wikilinks (``[[chapter-slug/page-slug]]``) are
+              rewritten to the canonical page title so the SPA's title-based
+              navigation continues to work.
 
     Returns:
         A :class:`ResolverReport` with per-page resolution lists and rewritten
@@ -274,7 +327,7 @@ def resolve_wikilinks(
 
     for page_title, body in pages.items():
         links = extract_links(body)
-        rewritten, resolutions = _rewrite_page(body, links, index_set, page_index)
+        rewritten, resolutions = _rewrite_page(body, links, index_set, page_index, chaptered_paths)
         report.pages[page_title] = PageReport(links=resolutions, rewritten=rewritten)
 
     return report
