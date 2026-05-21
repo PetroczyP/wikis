@@ -19,6 +19,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
+import pytest
 from app.core.agents.unified_wiki_pipeline import run_unified_pipeline
 from app.core.wiki_structure_planner.evidence import EvidencePack
 from app.core.wiki_structure_planner.structure_skeleton import (
@@ -26,6 +27,25 @@ from app.core.wiki_structure_planner.structure_skeleton import (
     Cluster,
     StructureSkeleton,
 )
+
+
+@pytest.fixture(autouse=True)
+def _force_flat_pipeline(monkeypatch):
+    """Force the flat pipeline — these tests validate flat PageSpec → GeneratedPage."""
+    monkeypatch.setenv("WIKIS_CHAPTERED_PAGES", "0")
+    try:
+        from app.core.feature_flags import get_feature_flags
+        if hasattr(get_feature_flags, "cache_clear"):
+            get_feature_flags.cache_clear()
+    except Exception:
+        pass
+    yield
+    try:
+        from app.core.feature_flags import get_feature_flags
+        if hasattr(get_feature_flags, "cache_clear"):
+            get_feature_flags.cache_clear()
+    except Exception:
+        pass
 
 
 # ── RoleAwareFakeLLM (same pattern as e2e integration test) ──────────────────
