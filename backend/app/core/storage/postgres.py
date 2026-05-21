@@ -2207,6 +2207,38 @@ class PostgresWikiStorage:
             s = str(emb).strip().lstrip("[").rstrip("]")
             return [float(x) for x in s.split(",") if x]
 
+    def get_embeddings_batch(self, node_ids: list[str]) -> dict[str, list[float]]:
+        """Return embeddings for the given ``node_ids`` as ``{node_id: vector}``.
+
+        Issues a single ``WHERE node_id = ANY(:ids)`` query using pgvector.
+        Nodes with no stored embedding are excluded from the result.
+        Returns an empty dict when the input is empty.
+        """
+        if not node_ids:
+            return {}
+        sql = text(
+            f"SELECT node_id, embedding FROM {self._schema}.repo_vec "
+            "WHERE node_id = ANY(:ids)"
+        )
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(sql, {"ids": node_ids}).fetchall()
+        except Exception as exc:
+            logger.debug("get_embeddings_batch failed: %s", exc)
+            return {}
+        result: dict[str, list[float]] = {}
+        for row in rows:
+            nid = row[0]
+            emb = row[1]
+            if nid is None or emb is None:
+                continue
+            try:
+                result[nid] = [float(x) for x in emb]
+            except TypeError:
+                s = str(emb).strip().lstrip("[").rstrip("]")
+                result[nid] = [float(x) for x in s.split(",") if x]
+        return result
+
     def batch_similarity_search(
         self,
         embeddings: list[tuple[str, list[float]]],

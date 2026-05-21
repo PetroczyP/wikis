@@ -2161,6 +2161,30 @@ class UnifiedWikiDB:
             return None
         return _deserialize_float32_vec(row["embedding"])
 
+    def get_embeddings_batch(self, node_ids: list[str]) -> dict[str, list[float]]:
+        """Return embeddings for the given ``node_ids`` as ``{node_id: vector}``.
+
+        Nodes with no stored embedding are silently excluded from the result.
+        Returns an empty dict when vec is unavailable or the input is empty.
+        """
+        if not node_ids or not self._vec_available:
+            return {}
+        # SQLite placeholders: "?,?,?" for each id.
+        placeholders = ",".join("?" * len(node_ids))
+        sql = f"SELECT node_id, embedding FROM repo_vec WHERE node_id IN ({placeholders})"
+        try:
+            rows = self.conn.execute(sql, node_ids).fetchall()
+        except sqlite3.OperationalError as exc:
+            logger.debug("get_embeddings_batch failed: %s", exc)
+            return {}
+        result: dict[str, list[float]] = {}
+        for row in rows:
+            nid = row["node_id"]
+            raw = row["embedding"]
+            if nid and raw is not None:
+                result[nid] = _deserialize_float32_vec(raw)
+        return result
+
     def batch_similarity_search(
         self,
         embeddings: list[tuple[str, list[float]]],

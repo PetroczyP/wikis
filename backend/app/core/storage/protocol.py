@@ -313,6 +313,17 @@ class WikiStorageProtocol(Protocol):
         """
         ...
 
+    def get_embeddings_batch(self, node_ids: list[str]) -> dict[str, list[float]]:
+        """Return embeddings for the given ``node_ids`` as ``{node_id: vector}``.
+
+        Issues a single bulk query (IN clause for SQLite, ANY for Postgres).
+        Nodes with no stored embedding are excluded from the result.
+        Returns an empty dict when the input is empty or vectors are unavailable.
+
+        Added in issue #312 for the semantic clustering passes.
+        """
+        ...
+
     def batch_similarity_search(
         self,
         embeddings: list[tuple[str, list[float]]],

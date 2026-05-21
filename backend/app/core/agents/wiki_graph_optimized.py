@@ -1948,6 +1948,40 @@ class OptimizedWikiGenerationAgent:
             len(skeleton.doc_clusters),
         )
 
+        # ── Semantic clustering (Pass 2 + Pass 3) — gated by feature flag ─
+        # Runs after structural clustering, before evidence pack construction.
+        # Purely observational: annotates skeleton.semantic_info but does not
+        # reassign symbols.  Gated by WIKIS_SEMANTIC_CLUSTERING (default off).
+        from ..feature_flags import get_feature_flags as _get_flags  # noqa: PLC0415
+
+        _flags = _get_flags()
+        if _flags.wikis_semantic_clustering:
+            # Import inside flag block — avoids import-time failures for users
+            # who don't have numpy or where semantic_clustering.py has issues.
+            from ..semantic_clustering import (  # noqa: PLC0415
+                enrich_clusters_with_semantics as _enrich_semantic,
+            )
+            _all_clusters = skeleton.clusters or list(skeleton.code_clusters)
+            # Note: doc/confluence/jira clusters excluded in legacy-skeleton path
+            # (skeleton.clusters is empty → falls back to code_clusters only).
+            # Observational-only so this is acceptable.
+            _semantic_info = _enrich_semantic(
+                _all_clusters,
+                storage=self._cluster_db,
+            )
+            for _cid, _info in _semantic_info.items():
+                logger.info(
+                    "[SEMANTIC] cluster=%d coherence=%.2f neighbors=%d low_coherence=%d",
+                    _cid,
+                    _info.coherence_score,
+                    len(_info.semantic_neighbors),
+                    len(_info.low_coherence_nodes),
+                )
+            # Monkey-patch onto skeleton for downstream consumers (#312).
+            skeleton.semantic_info = _semantic_info  # type: ignore[attr-defined]
+        else:
+            skeleton.semantic_info = {}  # type: ignore[attr-defined]
+
         # ── Phase 2: build evidence packs ────────────────────────────
         # ``skeleton.clusters`` is the unified source-kind-aware list.  The
         # legacy ``build_skeleton`` path populates ``code_clusters`` (which
