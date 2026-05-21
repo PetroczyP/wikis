@@ -266,17 +266,15 @@ class FeatureFlags:
     cluster_stability_threshold: float = 0.5
 
     # -- Epic #287 -- Chaptered pages -----------------------------------------
-    #: When True, the unified pipeline uses run_planner_chaptered instead of
-    #: run_planner_with_report. Default off until #290 lands writer changes.
-    chaptered_pages: bool = False
+    #: Split each cluster into focused sub-pages. Set WIKIS_CHAPTERED_PAGES=0
+    #: to disable.
+    chaptered_pages: bool = True
 
     # -- Issue #312 -- Semantic clustering (observability pass) --------------
-    #: When True, runs Pass 2 (semantic centroid enrichment) and Pass 3
-    #: (coherence check) after structural Louvain clustering.  Both passes
-    #: are purely observational — they annotate clusters with
-    #: ``semantic_neighbors`` and ``low_coherence_nodes`` but do not
-    #: reassign symbols between clusters.  Default off.
-    wikis_semantic_clustering: bool = False
+    #: Annotates clusters with semantic_neighbors and low_coherence_nodes.
+    #: Purely observational — no symbol reassignment. Set
+    #: WIKIS_SEMANTIC_CLUSTERING=0 to disable.
+    wikis_semantic_clustering: bool = True
 
 
 def get_feature_flags() -> FeatureFlags:
@@ -322,6 +320,6 @@ def get_feature_flags() -> FeatureFlags:
         cluster_stability_threshold=_env_float(
             "WIKIS_CLUSTER_STABILITY_THRESHOLD", 0.5,
         ),
-        chaptered_pages=_env_bool("WIKIS_CHAPTERED_PAGES", False),
-        wikis_semantic_clustering=_env_bool("WIKIS_SEMANTIC_CLUSTERING", False),
+        chaptered_pages=_env_bool("WIKIS_CHAPTERED_PAGES", True),
+        wikis_semantic_clustering=_env_bool("WIKIS_SEMANTIC_CLUSTERING", True),
     )
