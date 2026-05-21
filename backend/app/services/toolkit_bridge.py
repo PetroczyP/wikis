@@ -256,9 +256,21 @@ def _find_repo_clone(
 
 
 def _extract_repo_identifier(repo_url: str, branch: str) -> str:
-    """Extract owner/repo:branch from a repo URL."""
-    # https://github.com/owner/repo → owner/repo
+    """Extract a cache lookup key from repo_url + branch.
+
+    For remote URLs (https://, git+ssh://, etc.) takes the last two path
+    components as ``owner/repo:branch``.  For local filesystem paths
+    (starts with ``/`` or ``file:///``) preserves the full path so it can
+    match the cache_index.json key written during indexing.
+    """
     url = repo_url.rstrip("/")
+    # Local filesystem path — preserve it intact so the key matches
+    # the entry written by _register_unified_db_cache at index time.
+    if url.startswith("file:///"):
+        url = url[len("file://"):]
+    if url.startswith("/"):
+        return f"{url}:{branch}"
+    # Remote URL: strip .git suffix and take owner/repo
     if url.endswith(".git"):
         url = url[:-4]
     parts = url.split("/")
@@ -306,6 +318,23 @@ def _load_cached_artifacts(
                     if k.startswith(repo_identifier) or repo_identifier.startswith(k.rsplit(":", 1)[0]):
                         cache_key = v
                         break
+
+            # Fallback for local-path wikis: container path ≠ host path.
+            # wiki_id format is "local--{dir_name}--{branch}"; match any
+            # cache_index entry whose path ends with "/{dir_name}".
+            if not cache_key and wiki_id.startswith("local--"):
+                parts_id = wiki_id.split("--", 2)
+                if len(parts_id) >= 2:
+                    dir_name = parts_id[1]
+                    for k, v in udb_section.items():
+                        repo_path = k.split(":")[0]
+                        if repo_path == dir_name or repo_path.endswith(f"/{dir_name}"):
+                            cache_key = v
+                            logger.info(
+                                "Cache index local-wiki fallback: matched %r via dir_name %r",
+                                k, dir_name,
+                            )
+                            break
 
             logger.info(
                 "Cache index lookup: repo=%s resolved=%s unified_db=%s",
