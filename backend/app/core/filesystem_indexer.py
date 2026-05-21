@@ -904,7 +904,7 @@ class FilesystemRepositoryIndexer:
                             for doc in (self.all_documents or [])
                             if doc.metadata.get("file_path") or doc.metadata.get("source")
                         ))
-                        _explore_budget = max(20, min(len(_all_files) // 40, 500))
+                        _explore_budget = max(30, min(len(_all_files) // 10, 500))
                         _repo_name = os.path.basename(_repo_root.rstrip("/"))
                         # Build tree + README from already-indexed file list
                         _repo_tree = "\n".join(_all_files[:2000])

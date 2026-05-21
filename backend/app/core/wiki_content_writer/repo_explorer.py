@@ -345,10 +345,11 @@ class RepoExplorer:
                     break
 
             if not content:
-                # Budget exhausted — force a write.
+                # Budget exhausted — force a write. Must use llm_with_tools so
+                # Bedrock sees toolConfig matching the ToolMessage history.
                 messages.append(HumanMessage(content=_BUDGET_EXHAUSTED_PROMPT))
                 try:
-                    response = self.llm_client.invoke(messages)
+                    response = llm_with_tools.invoke(messages)
                     raw = response.content
                     content = raw if isinstance(raw, str) else str(raw)
                 except Exception as exc:

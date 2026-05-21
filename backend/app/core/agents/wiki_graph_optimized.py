@@ -330,7 +330,7 @@ class OptimizedWikiGenerationAgent:
                     except Exception:
                         pass
             else:
-                _explore_budget = max(20, min(len(repository_files) // 40, 500))
+                _explore_budget = max(30, min(len(repository_files) // 10, 500))
                 logger.info(
                     "[EXPLORE] no cached analysis — running RepoExplorer (budget=%d, files=%d)",
                     _explore_budget, len(repository_files),
