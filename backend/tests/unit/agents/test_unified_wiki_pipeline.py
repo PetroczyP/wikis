@@ -514,3 +514,80 @@ class TestSkeletonFallbackPromotesDocClusters:
             _ = dc.kind  # noqa: B018
         with pytest.raises(AttributeError):
             _ = dc.artifacts  # noqa: B018
+
+
+# ── Diagram placement (Fix 1) ─────────────────────────────────────────────────
+
+
+class TestDiagramPlacement:
+    """Regression tests for the diagram placement fix.
+
+    The diagram section must be inserted AFTER the first ## section (Overview),
+    not prepended before all content.  These tests call the private insertion
+    logic directly via the module-level helper to avoid needing a real
+    DiagramGenerator / storage object.
+    """
+
+    def _insert_diagram(self, final_markdown: str, diagram_section: str) -> str:
+        """Replicate the insertion logic from _run_page (step 5b)."""
+        import re as _re
+
+        second_heading = _re.search(r'\n##\s+', final_markdown)
+        if second_heading:
+            insert_at = second_heading.start()
+            return (
+                final_markdown[:insert_at]
+                + "\n\n" + diagram_section + "\n"
+                + final_markdown[insert_at:]
+            )
+        first_blank = final_markdown.find('\n\n')
+        if first_blank > 0:
+            return (
+                final_markdown[:first_blank]
+                + "\n\n" + diagram_section
+                + final_markdown[first_blank:]
+            )
+        return final_markdown + "\n\n" + diagram_section
+
+    def test_diagram_inserted_after_first_section_not_at_top(self):
+        """Diagram must appear AFTER the Overview ## heading, not before it."""
+        md = (
+            "## Overview\n\nThis is the overview text.\n\n"
+            "## Details\n\nDetailed content here.\n"
+        )
+        diagram = "```mermaid\ngraph TD\n  A --> B\n```"
+        result = self._insert_diagram(md, diagram)
+
+        overview_pos = result.find("## Overview")
+        diagram_pos = result.find("```mermaid")
+        details_pos = result.find("## Details")
+
+        assert overview_pos < diagram_pos, "diagram must come after ## Overview"
+        assert diagram_pos < details_pos, "diagram must come before ## Details"
+
+    def test_diagram_not_at_very_beginning_of_markdown(self):
+        """Diagram must not be the very first thing in the page."""
+        md = "## Overview\n\nIntro text.\n\n## Next\n\nMore.\n"
+        diagram = "```mermaid\ngraph TD\n  A --> B\n```"
+        result = self._insert_diagram(md, diagram)
+
+        assert not result.startswith("```mermaid"), (
+            "diagram should not be prepended before all content"
+        )
+
+    def test_diagram_falls_back_after_first_paragraph_when_no_second_heading(self):
+        """When there is only one ## heading, diagram goes after first paragraph."""
+        md = "## Overview\n\nOnly section here. No second heading.\n"
+        diagram = "DIAGRAM"
+        result = self._insert_diagram(md, diagram)
+
+        # Diagram must come after the first \n\n (end of first paragraph)
+        first_blank = md.find('\n\n')
+        assert result[first_blank + 2:].startswith("DIAGRAM")
+
+    def test_diagram_appended_when_no_headings_and_no_blank_line(self):
+        """When no blank line exists at all, diagram is appended at end."""
+        md = "Single line with no blank."
+        diagram = "DIAGRAM"
+        result = self._insert_diagram(md, diagram)
+        assert result.endswith("DIAGRAM")

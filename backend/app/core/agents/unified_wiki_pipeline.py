@@ -241,14 +241,39 @@ def _run_page(
     # ── 5. Reconstruct final markdown from kept paragraphs ────────────
     final_markdown = _claims_to_markdown(kept_after_verify)
 
-    # ── 5b. Prepend architecture diagram with LLM-written context ─────
+    # ── 5b. Insert architecture diagram after the Overview section ────
+    # The Overview paragraph (first ## section) should come first;
+    # the diagram follows it so readers get context before the visual.
     if storage is not None:
+        import re as _re  # noqa: PLC0415
+
         from app.core.wiki_content_writer.diagram_generator import DiagramGenerator  # noqa: PLC0415
         # Use verifier_llm (low-tier) for the diagram explanation — cheap call.
         dg = DiagramGenerator(storage, llm_client=verifier_llm)
         diagram_section = dg.generate_cluster_diagram(page_id, spec)
         if diagram_section:
-            final_markdown = diagram_section + "\n\n" + final_markdown
+            # Find the second ## heading — that marks the end of the first
+            # (Overview) section.  Insert the diagram just before it.
+            second_heading = _re.search(r'\n##\s+', final_markdown)
+            if second_heading:
+                insert_at = second_heading.start()
+                final_markdown = (
+                    final_markdown[:insert_at]
+                    + "\n\n" + diagram_section + "\n"
+                    + final_markdown[insert_at:]
+                )
+            else:
+                # No second heading — insert after the first blank-line gap
+                # so the opening paragraph stays on top.
+                first_blank = final_markdown.find('\n\n')
+                if first_blank > 0:
+                    final_markdown = (
+                        final_markdown[:first_blank]
+                        + "\n\n" + diagram_section
+                        + final_markdown[first_blank:]
+                    )
+                else:
+                    final_markdown = final_markdown + "\n\n" + diagram_section
 
     # ── 7. Format for human readability ───────────────────────────────
     try:
