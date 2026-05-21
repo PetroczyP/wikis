@@ -188,6 +188,7 @@ class HybridWikiToolkitWrapper:
             embeddings=self.embeddings,
             progress_callback=self.progress_callback,
             extractor_registry=extractor_registry,
+            llm=self.llm_low or self.llm,  # low-tier preferred for summarisation cost
         )
 
         # Build repository index using filesystem approach

@@ -62,6 +62,7 @@ class FilesystemRepositoryIndexer:
         # Callers build via ``build_default_registry(llm=...)`` and pass
         # in the project-configured LLM for vision extractors.
         extractor_registry: Any | None = None,
+        llm: Any | None = None,
     ):
         """
         Initialize filesystem-based indexer with multi-provider support
@@ -109,6 +110,8 @@ class FilesystemRepositoryIndexer:
 
         # Embeddings instance for unified DB population
         self.embeddings = embeddings
+        # LLM for node summarisation (#309)
+        self.llm = llm
 
         # State containers
         self.text_documents = []
