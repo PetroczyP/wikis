@@ -267,14 +267,44 @@ class ArtifactExporter:
         if wiki_structure.sections and len(wiki_structure.sections) > 0:
             pages_by_id = {page.page_id: page for page in wiki_pages}
 
+            # Build lookup: section title → LLM-generated chapter index page (if any)
+            chapter_index_by_title = {
+                page.title: page
+                for page in wiki_pages
+                if page.metadata.get("is_chapter_index")
+            }
+
             for section_idx, section in enumerate(wiki_structure.sections):
                 section_dir = markdown_dir / self._create_safe_filename(section.section_name)
                 section_dir.mkdir(exist_ok=True)
 
-                # Section MOC
-                self._create_section_moc(
-                    section, wiki_structure, page_title_map, section_dir, repo_metadata
-                )
+                # Prefer the LLM-generated chapter index content when available;
+                # fall back to the template-based section MOC otherwise.
+                chapter_index_page = chapter_index_by_title.get(section.section_name)
+                if chapter_index_page and chapter_index_page.content and chapter_index_page.content.strip() not in ("", f"# {section.section_name}"):
+                    frontmatter_fields = {
+                        "title": section.section_name,
+                        "aliases": [section.section_name, f"{section.section_name} Overview"],
+                        "tags": [
+                            f"wiki/{self._normalize_tag(wiki_structure.wiki_title or 'Wiki')}",
+                            f"section/{self._normalize_tag(section.section_name)}",
+                            "type/moc",
+                            "type/section-index",
+                        ],
+                        "type": "section-moc",
+                        "wiki": wiki_structure.wiki_title or "Wiki",
+                        "section": section.section_name,
+                        "section_order": getattr(section, "section_order", section_idx + 1),
+                        "repository": (repo_metadata or {}).get("repository_url", ""),
+                        "branch": (repo_metadata or {}).get("branch", "main"),
+                        "created": datetime.now().strftime("%Y-%m-%d"),
+                    }
+                    content = self._generate_frontmatter(frontmatter_fields) + "\n" + chapter_index_page.content
+                    (section_dir / "_index.md").write_text(content, encoding="utf-8")
+                else:
+                    self._create_section_moc(
+                        section, wiki_structure, page_title_map, section_dir, repo_metadata
+                    )
 
                 for page_idx, page_spec in enumerate(section.pages):
                     expected_page_id = f"{section_idx}#{page_idx}"
@@ -451,9 +481,16 @@ class ArtifactExporter:
             }
         )
 
+        overview_raw = getattr(wiki_structure, "overview", "") or "Generated wiki documentation"
+        # Strip a leading h1 that duplicates the wiki title (LLM sometimes starts
+        # the overview with "# <wiki_title>").
+        overview_lines = overview_raw.lstrip("\n").splitlines()
+        if overview_lines and overview_lines[0].startswith("# "):
+            overview_raw = "\n".join(overview_lines[1:]).lstrip("\n")
+
         content = frontmatter
         content += f"# {wiki_title}\n\n"
-        content += f"{getattr(wiki_structure, 'overview', 'Generated wiki documentation')}\n\n"
+        content += f"{overview_raw}\n\n"
         content += "## Wiki Structure\n\n"
 
         if wiki_structure.sections and len(wiki_structure.sections) > 0:

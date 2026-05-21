@@ -389,6 +389,10 @@ export function ProjectPage() {
       (event.callId as string | undefined);
     updateLastTurn((prev) => {
       if (stepKind === 'tool_call') {
+        // Dedupe streaming chunks: same tool_call_id can arrive multiple times.
+        if (callId && prev.toolCalls.some((tc) => tc.tool_call_id === callId)) {
+          return prev;
+        }
         const record: ToolCallRecord = {
           tool_name: event.tool as string,
           tool_input: (event.input as string) ?? '',

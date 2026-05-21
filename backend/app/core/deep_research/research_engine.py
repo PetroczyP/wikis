@@ -332,8 +332,15 @@ class DeepResearchEngine:
 
                         # Final content (no tool calls = answer tokens streaming)
                         if message.content and not message.tool_calls:
-                            self.final_report += message.content
-                            _evt = _events.answer_chunk(self.session_id, message.content)
+                            # Bedrock may return content as a list of blocks rather than a plain str.
+                            _content = message.content
+                            if not isinstance(_content, str):
+                                _content = "".join(
+                                    c if isinstance(c, str) else (c.get("text", "") if isinstance(c, dict) else str(c))
+                                    for c in _content
+                                )
+                            self.final_report += _content
+                            _evt = _events.answer_chunk(self.session_id, _content)
                             yield {"event_type": _evt.event, "data": _evt.params}
 
                     # Tool response message

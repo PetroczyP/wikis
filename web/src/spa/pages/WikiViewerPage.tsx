@@ -109,6 +109,12 @@ function mergeThinkingStep(
   const stepKind = e.step_type ?? e.stepType;
   const callId = e.tool_call_id ?? e.toolCallId ?? e.call_id ?? e.callId;
   if (stepKind === 'tool_call') {
+    // LangGraph streams AIMessageChunks incrementally — the same tool call can
+    // arrive as multiple consecutive chunks, each with tool_calls set.  Dedupe
+    // by tool_call_id so we don't create N "running" records that never resolve.
+    if (callId && prev.some((tc) => tc.tool_call_id === callId)) {
+      return prev; // already have this call — ignore the duplicate chunk
+    }
     const record: ToolCallRecord = {
       tool_name: e.tool,
       tool_input: e.input ?? '',
