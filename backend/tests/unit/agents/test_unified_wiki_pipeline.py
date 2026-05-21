@@ -36,6 +36,30 @@ from app.core.agents.unified_wiki_pipeline import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _force_flat_pipeline(monkeypatch):
+    """Force the flat (non-chaptered) pipeline for all tests in this module.
+
+    These tests test the flat PageSpec → GeneratedPage path. Chaptered pages
+    now default to True; override to keep the tests valid for the flat path.
+    """
+    monkeypatch.setenv("WIKIS_CHAPTERED_PAGES", "0")
+    # Also clear the lru_cache on get_feature_flags if it exists
+    try:
+        from app.core.feature_flags import get_feature_flags
+        if hasattr(get_feature_flags, "cache_clear"):
+            get_feature_flags.cache_clear()
+    except Exception:
+        pass
+    yield
+    try:
+        from app.core.feature_flags import get_feature_flags
+        if hasattr(get_feature_flags, "cache_clear"):
+            get_feature_flags.cache_clear()
+    except Exception:
+        pass
+
+
 # ── FakeLLM ────────────────────────────────────────────────────────────────────
 
 

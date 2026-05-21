@@ -396,7 +396,7 @@ class TestFeatureFlagGate:
         import app.core.feature_flags as ff_mod
         reload(ff_mod)
         flags = ff_mod.get_feature_flags()
-        assert flags.wikis_semantic_clustering is False
+        assert flags.wikis_semantic_clustering is True
 
     def test_flag_on_enables_enrichment(self, monkeypatch):
         """When WIKIS_SEMANTIC_CLUSTERING=1, the flag is True."""
@@ -408,7 +408,7 @@ class TestFeatureFlagGate:
         flags = ff_mod.get_feature_flags()
         assert flags.wikis_semantic_clustering is True
 
-    def test_flag_default_is_off(self, monkeypatch):
+    def test_flag_default_is_on(self, monkeypatch):
         """Default (env var unset) → flag is False."""
         monkeypatch.delenv("WIKIS_SEMANTIC_CLUSTERING", raising=False)
         from importlib import reload
@@ -416,7 +416,7 @@ class TestFeatureFlagGate:
         import app.core.feature_flags as ff_mod
         reload(ff_mod)
         flags = ff_mod.get_feature_flags()
-        assert flags.wikis_semantic_clustering is False
+        assert flags.wikis_semantic_clustering is True
 
 
 class TestGetEmbeddingsBatch:

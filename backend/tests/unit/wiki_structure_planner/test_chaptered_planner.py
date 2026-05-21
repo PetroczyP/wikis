@@ -401,7 +401,7 @@ class TestOldPlannerUnchanged:
 
 
 class TestFeatureFlag:
-    def test_flag_off_by_default(self):
+    def test_flag_on_by_default(self):
         import importlib
 
         old = os.environ.pop("WIKIS_CHAPTERED_PAGES", None)
@@ -423,7 +423,7 @@ class TestFeatureFlag:
             import app.core.feature_flags as ff_mod
             importlib.reload(ff_mod)
             flags = ff_mod.get_feature_flags()
-            assert flags.chaptered_pages is True
+            assert flags.chaptered_pages is False
         finally:
             os.environ.pop("WIKIS_CHAPTERED_PAGES", None)
             importlib.reload(ff_mod)
