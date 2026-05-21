@@ -120,13 +120,14 @@ class Settings(BaseSettings):
     hub_z_threshold: float = 3.0
     vec_distance_threshold: float = 0.15
 
-    # #309 LLM node summaries
+    # #309 LLM node summaries — on by default, set WIKI_SUMMARISE_NODES=0 to disable
     wiki_summarise_nodes: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Generate LLM summaries for architectural nodes during indexing. "
-            "Set WIKI_SUMMARISE_NODES=1 to enable. Off by default so existing "
-            "deployments are unaffected."
+            "Summaries are injected into evidence packs so the planner and writer "
+            "have semantic context without burning tool-call budget on reads. "
+            "Set WIKI_SUMMARISE_NODES=0 to disable."
         ),
     )
 
