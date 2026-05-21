@@ -126,6 +126,7 @@ def _run_page(
     gate_mode: dict[str, str],
     stream_callback: Callable[[dict], None] | None,
     storage: Any = None,
+    verifier_llm: "BaseChatModel | None" = None,
 ) -> tuple[GeneratedPage, GateReport]:
     """Run the writer → gate pipeline for one ``PageSpec``.
 
@@ -239,6 +240,23 @@ def _run_page(
         if diagram:
             final_markdown = diagram + "\n\n" + final_markdown
 
+    # ── 7. Format for human readability ───────────────────────────────
+    try:
+        from app.core.wiki_content_writer.page_formatter import PageFormatter  # noqa: PLC0415
+        formatter = PageFormatter(llm_client=verifier_llm)
+        formatted = formatter.format_page(final_markdown, page_spec=spec)
+        if formatted and formatted.strip():
+            final_markdown = formatted
+    except Exception as fmt_exc:
+        logger.warning("[UNIFIED] formatter failed: %s", fmt_exc)
+        # Keep unformatted markdown — formatter is enhancement, not required
+
+    if stream_callback:
+        try:
+            stream_callback({"event": "formatter.page_done", "page_id": page_id})
+        except Exception:
+            pass
+
     page = GeneratedPage(
         page_id=page_id,
         title=spec.title,
@@ -301,7 +319,7 @@ def run_unified_pipeline(
     evidence_packs: dict[int, EvidencePack],
     *,
     llm: BaseChatModel,
-    verifier_llm: BaseChatModel | None = None,  # kept for back-compat; unused since #318
+    verifier_llm: BaseChatModel | None = None,  # used by PageFormatter (Pass 2) since #320
     repo_root: str,
     storage: Any | None = None,
     name_index: set[str] | None = None,
@@ -327,8 +345,8 @@ def run_unified_pipeline(
         Primary LangChain ``BaseChatModel`` used for both the planner and the
         writer content generation.
     verifier_llm :
-        Accepted for backwards compatibility but unused since #318 (citation
-        verifier removed).  Pass ``None`` or omit entirely.
+        Low-tier LLM used by ``PageFormatter`` (Pass 2 section reorganisation).
+        Pass ``None`` to skip the LLM formatting pass.
     repo_root :
         Absolute path to the checked-out repository root.  Passed to the
         planner (tool IO) and the gate (identifier grounding).
@@ -561,6 +579,7 @@ def run_unified_pipeline(
                 gate_mode=effective_gate_mode,
                 stream_callback=stream_callback,
                 storage=storage,
+                verifier_llm=verifier_llm,
             )
             pages.append(page)
             gate_reports[spec.cluster_id] = gate_report
