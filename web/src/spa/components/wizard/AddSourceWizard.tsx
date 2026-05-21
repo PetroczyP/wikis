@@ -163,9 +163,6 @@ export function AddSourceWizard({
       }
       if (formData.localFsMode) return !pathError;
       if (urlError) return false;
-      if (formData.git.patSource === 'paste' && !formData.git.pastedPat.trim()) {
-        return false;
-      }
       return true;
     }
     if (formData.source_type === 'confluence') return !spaceKeysError;

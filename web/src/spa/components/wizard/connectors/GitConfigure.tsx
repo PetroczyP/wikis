@@ -1,13 +1,13 @@
 /**
  * Git connector form for the wizard's Configure step.
  *
- * Same field semantics as the old GenerateForm's GitTab (repo URL, branch,
- * PAT source select). Lifted into the wizard with the shared form-state
- * shape from ``../types.ts`` so the Confirm step can replay user input
- * without re-fetching anything.
+ * Authentication is simplified: a single optional PAT field.
+ * Empty = public/anonymous (patSource='none'), filled = PAT auth (patSource='paste').
+ * The dropdown selector was removed — the token field presence is the only
+ * signal needed.
  */
 
-import { Box, FormControl, InputLabel, MenuItem, Select, TextField } from '@mui/material';
+import { Box, TextField } from '@mui/material';
 import type { GitFormState } from '../types';
 
 interface GitConfigureProps {
@@ -20,6 +20,15 @@ interface GitConfigureProps {
 export function GitConfigure({ data, onChange, urlError, disabled }: GitConfigureProps) {
   const set = <K extends keyof GitFormState>(key: K, value: GitFormState[K]) =>
     onChange({ ...data, [key]: value });
+
+  const handlePatChange = (value: string) => {
+    onChange({
+      ...data,
+      pastedPat: value,
+      // Derive patSource from whether the field is filled — no dropdown needed.
+      patSource: value.trim() ? 'paste' : 'none',
+    });
+  };
 
   return (
     <Box>
@@ -47,39 +56,18 @@ export function GitConfigure({ data, onChange, urlError, disabled }: GitConfigur
         inputProps={{ 'data-testid': 'git-branch' }}
       />
 
-      <FormControl fullWidth margin="normal" disabled={disabled}>
-        <InputLabel id="pat-source-label">Authentication</InputLabel>
-        <Select
-          labelId="pat-source-label"
-          value={data.patSource}
-          label="Authentication"
-          onChange={(e) => set('patSource', e.target.value as GitFormState['patSource'])}
-          inputProps={{ 'data-testid': 'pat-source-select' }}
-        >
-          <MenuItem value="none">No auth (public repo)</MenuItem>
-          <MenuItem value="paste">Paste token once (not stored)</MenuItem>
-        </Select>
-      </FormControl>
-
-      {data.patSource === 'paste' && (
-        <TextField
-          label="Personal Access Token"
-          value={data.pastedPat}
-          onChange={(e) => set('pastedPat', e.target.value)}
-          required
-          fullWidth
-          margin="normal"
-          type="password"
-          disabled={disabled}
-          error={!data.pastedPat.trim()}
-          helperText={
-            !data.pastedPat.trim()
-              ? 'Token is required for the "Paste token once" option'
-              : 'Token will not be stored'
-          }
-          inputProps={{ 'data-testid': 'pasted-pat-input' }}
-        />
-      )}
+      <TextField
+        label="Personal Access Token"
+        placeholder="Leave empty for public repos"
+        value={data.pastedPat}
+        onChange={(e) => handlePatChange(e.target.value)}
+        fullWidth
+        margin="normal"
+        type="password"
+        disabled={disabled}
+        helperText={data.pastedPat.trim() ? 'Token will not be stored' : 'Leave empty for public repositories'}
+        inputProps={{ 'data-testid': 'pasted-pat-input' }}
+      />
     </Box>
   );
 }
