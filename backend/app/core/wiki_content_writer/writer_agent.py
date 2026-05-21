@@ -1,4 +1,4 @@
-"""Wiki Content Writer — per-page writer agent (#285).
+"""Wiki Content Writer — per-page writer agent (#285, #314).
 
 This module provides:
 
@@ -10,15 +10,19 @@ This module provides:
     Class wired to a ``WriterTools`` instance.  Runs the per-page agentic
     write loop: budget calculation → tool-augmented LLM call → markdown.
 
-Budget formula
---------------
+Budget formula (#314)
+---------------------
 budget = base
-       + 2 * count(target_symbols where layer in {entry_point, public_api})
-       + 1 * count(target_symbols where layer in {core_type, infrastructure})
-       + 1 * count(target_folders)
-       + 1 * count(target_docs)
+       + 2   * count(target_symbols where layer in {entry_point, public_api})
+       + 1.5 * count(target_symbols where layer in {core_type, infrastructure})
+       + 1   * count(target_folders)
+       + 1   * count(target_docs)
 
-Soft target: 15-30 calls.  Hard cap: 80 calls.
+Soft target: 20-40 calls.  Hard cap: 80 calls.  Default base: 8.
+
+Since #309 landed LLM summaries in evidence packs the writer uses tool calls
+primarily for line-number precision rather than symbol discovery, so budgets
+can be higher without proportionally more cost.
 """
 
 from __future__ import annotations
@@ -46,15 +50,24 @@ logger = logging.getLogger(__name__)
 
 # ── Budget constants ──────────────────────────────────────────────────────────
 
-BUDGET_SOFT_MIN: int = 15
-BUDGET_SOFT_MAX: int = 30
+BUDGET_SOFT_MIN: int = 20   # #314: raised from 15
+BUDGET_SOFT_MAX: int = 40   # #314: raised from 30
 BUDGET_HARD_CAP: int = 80
 
-# Symbol layers weighted at 2× (high-importance surface)
+# Default base budget — reads LLM_WRITER_BASE_BUDGET from Settings so the value
+# is consistent with the rest of the app config. Falls back to 8 when Settings
+# is unavailable (test isolation, import order issues).
+try:
+    from app.config import get_settings as _get_settings  # noqa: PLC0415
+    _DEFAULT_BASE_BUDGET: int = _get_settings().llm_writer_base_budget
+except Exception:
+    _DEFAULT_BASE_BUDGET = 8
+
+# Symbol layers weighted at 2× (high-importance surface; entry_point / public_api)
 _WEIGHT_2_LAYERS: frozenset[str] = frozenset({"entry_point", "public_api"})
 
-# Symbol layers weighted at 1× (supporting types)
-_WEIGHT_1_LAYERS: frozenset[str] = frozenset({"core_type", "infrastructure"})
+# Symbol layers weighted at 1.5× (#314: raised from 1; supporting architectural types)
+_WEIGHT_1_5_LAYERS: frozenset[str] = frozenset({"core_type", "infrastructure"})
 
 
 # ── Budget formula ────────────────────────────────────────────────────────────
@@ -64,7 +77,7 @@ def compute_page_budget(
     target_symbols: list[tuple[str, str]],
     target_folders: list[str],
     target_docs: list[str],
-    base: int = 5,
+    base: int = _DEFAULT_BASE_BUDGET,
 ) -> int:
     """Compute the tool-call budget for a single wiki page.
 
@@ -79,7 +92,8 @@ def compute_page_budget(
     target_docs : list[str]
         Documentation files referenced by the page.
     base : int
-        Baseline budget (default 5) before any scaling.
+        Baseline budget (default 8, #314) before any scaling.  Override via
+        ``LLM_WRITER_BASE_BUDGET`` env var or the ``base`` field in a PageSpec.
 
     Returns
     -------
@@ -87,9 +101,9 @@ def compute_page_budget(
         Tool-call budget, clamped to ``BUDGET_HARD_CAP``.
     """
     weight_2 = sum(1 for _, layer in target_symbols if layer in _WEIGHT_2_LAYERS)
-    weight_1 = sum(1 for _, layer in target_symbols if layer in _WEIGHT_1_LAYERS)
+    weight_1_5 = sum(1 for _, layer in target_symbols if layer in _WEIGHT_1_5_LAYERS)
 
-    budget = base + 2 * weight_2 + 1 * weight_1 + len(target_folders) + len(target_docs)
+    budget = base + 2 * weight_2 + int(1.5 * weight_1_5) + len(target_folders) + len(target_docs)
     return min(budget, BUDGET_HARD_CAP)
 
 
@@ -281,7 +295,7 @@ class WikiContentWriter:
           (bare names; layer defaults to ``""``).
         - ``target_folders``: list of folder paths.
         - ``target_docs``: list of doc file paths.
-        - ``base``: baseline budget (optional, default 5).
+        - ``base``: baseline budget (optional, default 8 per #314).
 
         Returns
         -------
@@ -303,7 +317,7 @@ class WikiContentWriter:
             target_symbols=symbols,
             target_folders=list(page_spec.get("target_folders", [])),
             target_docs=list(page_spec.get("target_docs", [])),
-            base=int(page_spec.get("base", 5)),
+            base=int(page_spec.get("base", _DEFAULT_BASE_BUDGET)),
         )
 
     # ── generate_page ─────────────────────────────────────────────────────
@@ -355,6 +369,7 @@ class WikiContentWriter:
                 "target_symbols": getattr(page_spec, "target_symbols", []),
                 "target_folders": getattr(page_spec, "target_folders", []),
                 "target_docs": getattr(page_spec, "target_docs", []),
+                "base": getattr(page_spec, "base", _DEFAULT_BASE_BUDGET),
             }
 
         title = spec.get("title", "")

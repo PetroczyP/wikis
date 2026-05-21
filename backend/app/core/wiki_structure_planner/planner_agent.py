@@ -95,6 +95,9 @@ class PageSpec:
         Directory paths injected deterministically from the skeleton.
     target_docs : list[str]
         Documentation file paths injected deterministically from the skeleton.
+    base : int
+        Baseline writer tool-call budget for this page (default 8, #314).
+        The writer agent may override this via ``LLM_WRITER_BASE_BUDGET``.
     """
 
     cluster_id: int
@@ -104,6 +107,7 @@ class PageSpec:
     target_symbols: list[str] = field(default_factory=list)
     target_folders: list[str] = field(default_factory=list)
     target_docs: list[str] = field(default_factory=list)
+    base: int = 8  # #314: baseline tool-call budget; raised from 5
 
 
 # ── PlanReport ────────────────────────────────────────────────────────────────

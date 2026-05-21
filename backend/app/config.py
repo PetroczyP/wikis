@@ -130,6 +130,17 @@ class Settings(BaseSettings):
         ),
     )
 
+    # #314 Writer budget
+    llm_writer_base_budget: int = Field(
+        default=8,
+        description=(
+            "Base tool-call budget for the writer agent per page. "
+            "Since #309 landed LLM summaries in evidence packs the writer uses "
+            "tool calls primarily for line-number precision rather than symbol "
+            "discovery — budgets can be higher without proportionally more cost."
+        ),
+    )
+
     # App
     log_level: str = "INFO"
 
