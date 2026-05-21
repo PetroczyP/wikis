@@ -315,22 +315,42 @@ class OptimizedWikiGenerationAgent:
             if not code_samples or code_samples == "No representative code samples available":
                 code_samples = self._extract_representative_code_samples(all_documents)
 
-            # Use RepoExplorer (agentic tool-augmented loop) to analyse the repo.
-            if self.progress_callback:
-                try:
-                    self.progress_callback("indexing", 0.18, f"Exploring repository with agentic analysis — {len(repository_files)} files...")
-                except Exception:
-                    pass
-            repo_analysis_text = self._explore_repository(
-                repository_tree, readme_content, repo_name=os.path.basename(self.repository_url or "repo")
-            )
-
-            # Store rich context in state (not configuration parameters)
-            if self.progress_callback:
-                try:
-                    self.progress_callback("indexing", 0.25, f"Repository analysis complete — {len(repo_analysis_text)} chars of context extracted")
-                except Exception:
-                    pass
+            # Reuse the RepoExplorer result produced during indexing (before
+            # populate_summaries).  If the cached value is absent (e.g. the index
+            # was loaded from disk cache) fall back to a fresh call.
+            repo_analysis_text = getattr(self.indexer, "_repo_analysis_text", "") or ""
+            if repo_analysis_text:
+                logger.info(
+                    "[EXPLORE] reusing cached repo analysis from indexer (%d chars)",
+                    len(repo_analysis_text),
+                )
+                if self.progress_callback:
+                    try:
+                        self.progress_callback("indexing", 0.25, f"Repository analysis ready — {len(repo_analysis_text)} chars of architectural context")
+                    except Exception:
+                        pass
+            else:
+                _explore_budget = max(20, min(len(repository_files) // 40, 500))
+                logger.info(
+                    "[EXPLORE] no cached analysis — running RepoExplorer (budget=%d, files=%d)",
+                    _explore_budget, len(repository_files),
+                )
+                if self.progress_callback:
+                    try:
+                        self.progress_callback("indexing", 0.18, f"Exploring repository with agentic analysis — {len(repository_files)} files, budget={_explore_budget}...")
+                    except Exception:
+                        pass
+                repo_analysis_text = self._explore_repository(
+                    repository_tree,
+                    readme_content,
+                    repo_name=os.path.basename(self.repository_url or "repo"),
+                    budget=_explore_budget,
+                )
+                if self.progress_callback:
+                    try:
+                        self.progress_callback("indexing", 0.25, f"Repository analysis complete — {len(repo_analysis_text)} chars of context extracted")
+                    except Exception:
+                        pass
             if this and getattr(this, "module", None):
                 this.module.invocation_thinking(
                     "I am on phase repository_analysis\nRepository analysis complete\nReasoning: Conceptual model established.\nNext: Invoke structure planning to map pages & sections."
@@ -1898,34 +1918,7 @@ class OptimizedWikiGenerationAgent:
 
         repo_name = os.path.basename(repo_root.rstrip("/"))
 
-        # ── Agentic repo analysis (RepoExplorer) ─────────────────────
-        # Run HERE after indexing so repo_root, WriterTools, and the code
-        # graph are all available. The analyze_repository state runs too
-        # early (before cloning) and always falls back to the blind LLM call.
-        _readme = state.get("readme_content", "")
-        _repo_tree = state.get("repository_tree", "")
-        # Scale explorer budget with repo size — small repos need fewer reads,
-        # large repos need more to cover entry points, routes, services, models.
-        _explore_budget = max(20, min(len(repository_files) // 40, 500))
-        logger.info("[UNIFIED] running agentic repo analysis (post-index, budget=%d, files=%d)", _explore_budget, len(repository_files))
-        if self.progress_callback:
-            try:
-                self.progress_callback("planning", 0.27, f"Exploring repository with agent ({len(repository_files)} files, budget={_explore_budget} tool calls)...")
-            except Exception:
-                pass
-        fresh_repo_analysis = self._explore_repository(
-            _repo_tree, _readme, repo_name=repo_name, budget=_explore_budget
-        )
-        if fresh_repo_analysis:
-            repo_analysis = fresh_repo_analysis
-            logger.info("[UNIFIED] agentic repo analysis complete: %d chars", len(repo_analysis))
-            if self.progress_callback:
-                try:
-                    self.progress_callback("planning", 0.35, f"Repository explored — {len(repo_analysis)} chars of architectural context")
-                except Exception:
-                    pass
-        else:
-            logger.warning("[UNIFIED] agentic repo analysis failed — using state value (%d chars)", len(repo_analysis))
+        logger.info("[UNIFIED] using repo analysis from analyze_repository node (%d chars)", len(repo_analysis))
 
         # ── Compute page budget (same formula as graph-first path) ────
         file_count = len(repository_files)

@@ -149,11 +149,12 @@ def _agentic_summary(
                 break
 
         if not content:
-            # Budget exhausted — force a write
+            # Budget exhausted — force a write. Must use llm_with_tools so Bedrock
+            # sees toolConfig matching the ToolMessage history in messages.
             messages.append(HumanMessage(content=(
                 "Write the 3-4 sentence summary now. Do NOT call any more tools."
             )))
-            response = llm.invoke(messages)
+            response = llm_with_tools.invoke(messages)
             raw = response.content
             content = raw if isinstance(raw, str) else str(raw)
 
@@ -876,6 +877,78 @@ class FilesystemRepositoryIndexer:
             except Exception as exc:
                 logger.warning("compute_god_nodes failed (non-fatal): %s", exc)
 
+            # ── Agentic repo analysis (RepoExplorer) ────────────────────────
+            # Run here — after hubs/clusters are known, before populate_summaries —
+            # so the architectural overview can enrich node summary prompts.
+            # Result is cached on self._repo_analysis_text for reuse by the
+            # LangGraph analyze_repository node (avoids a second LLM pass).
+            _repo_analysis_text = ""
+            _summary_tools = None
+            try:
+                from .wiki_content_writer.writer_tools import WriterTools  # noqa: PLC0415
+                from .wiki_content_writer.repo_explorer import RepoExplorer  # noqa: PLC0415
+
+                _repo_root = getattr(self, "_repo_root", None)
+                if _repo_root and os.path.isdir(_repo_root):
+                    _summary_tools = WriterTools(
+                        repo_root=_repo_root,
+                        storage=udb,
+                        graph_text_index=getattr(
+                            getattr(self, "graph_manager", None), "fts_index", None
+                        ),
+                    )
+                    _explorer_llm = getattr(self, "_llm", None) or getattr(self, "llm", None)
+                    if _explorer_llm:
+                        _all_files = sorted(set(
+                            doc.metadata.get("file_path") or doc.metadata.get("source", "")
+                            for doc in (self.all_documents or [])
+                            if doc.metadata.get("file_path") or doc.metadata.get("source")
+                        ))
+                        _explore_budget = max(20, min(len(_all_files) // 40, 500))
+                        _repo_name = os.path.basename(_repo_root.rstrip("/"))
+                        # Build tree + README from already-indexed file list
+                        _repo_tree = "\n".join(_all_files[:2000])
+                        _readme = ""
+                        for _fp in _all_files:
+                            if os.path.basename(_fp).lower() in ("readme.md", "readme.rst", "readme.txt", "readme"):
+                                _candidate = os.path.join(_repo_root, _fp) if not os.path.isabs(_fp) else _fp
+                                if os.path.isfile(_candidate):
+                                    try:
+                                        with open(_candidate, encoding="utf-8", errors="ignore") as _fh:
+                                            _readme = _fh.read(8000)
+                                    except Exception:
+                                        pass
+                                    break
+                        self._emit_progress(0.244, f"Exploring repository with agent ({len(_all_files)} files, budget={_explore_budget})...")
+                        logger.info(
+                            "[EXPLORE] running agentic repo analysis before node summaries (budget=%d, files=%d)",
+                            _explore_budget, len(_all_files),
+                        )
+                        _explorer = RepoExplorer(
+                            tools=_summary_tools,
+                            llm_client=_explorer_llm,
+                            storage=udb,
+                        )
+                        _repo_analysis_text = _explorer.explore(
+                            file_tree=_repo_tree,
+                            readme=_readme,
+                            repo_name=_repo_name,
+                            budget=_explore_budget,
+                        )
+                        logger.info(
+                            "[EXPLORE] agentic repo analysis complete: %d chars", len(_repo_analysis_text)
+                        )
+                    else:
+                        logger.debug("[EXPLORE] no LLM available — skipping pre-summary repo analysis")
+                else:
+                    logger.debug("[EXPLORE] repo_root not available — skipping pre-summary repo analysis")
+            except Exception as _exc:
+                logger.warning("[EXPLORE] pre-summary repo analysis failed (non-fatal): %s", _exc)
+
+            # Cache on the indexer so the LangGraph analyze_repository node can
+            # read it without running RepoExplorer a second time.
+            self._repo_analysis_text = _repo_analysis_text
+
             # #309 — LLM node summaries (opt-in via WIKI_SUMMARISE_NODES=1)
             try:
                 from app.config import get_settings as _get_settings
@@ -884,7 +957,12 @@ class FilesystemRepositoryIndexer:
                 if _settings.wiki_summarise_nodes:
                     self._emit_progress(0.245, "Generating LLM node summaries...")
                     _llm = getattr(self, "_llm", None) or getattr(self, "llm", None)
-                    n_summarised = self.populate_summaries(llm=_llm, _db=udb)
+                    n_summarised = self.populate_summaries(
+                        llm=_llm,
+                        _db=udb,
+                        repo_analysis_text=_repo_analysis_text,
+                        tools=_summary_tools,
+                    )
                     logger.info(
                         "Unified DB: %d node summaries generated (#309)", n_summarised
                     )
