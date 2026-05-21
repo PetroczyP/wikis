@@ -29,6 +29,55 @@ def _safe_id(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", name)
 
 
+def _sanitize_label(name: str) -> str:
+    """Sanitize a symbol name for use as a Mermaid double-quoted node label.
+
+    Mermaid double-quoted labels break on `"`, `#`, unmatched `<`/`>`, and
+    raw HTML entities.  Strip or replace these before embedding in the diagram.
+    """
+    # Replace double quotes (would close the label string early)
+    s = name.replace('"', "'")
+    # Remove characters that confuse Mermaid's label parser
+    s = re.sub(r"[<>{}|\\]", "", s)
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or _safe_id(name)
+
+
+def _validate_mermaid(diagram: str) -> tuple[bool, str]:
+    """Lightweight structural validation for a Mermaid diagram block.
+
+    Returns (is_valid, error_reason).  Checks:
+    - Fenced code block with mermaid tag
+    - Valid graph/flowchart header
+    - All node-declaration lines use quoted labels
+    - No obvious unclosed quotes
+    """
+    lines = diagram.strip().splitlines()
+    if not lines or lines[0].strip() != "```mermaid":
+        return False, "missing ```mermaid fence"
+    if lines[-1].strip() != "```":
+        return False, "unclosed code fence"
+
+    body = [l for l in lines[1:-1] if l.strip()]
+    if not body:
+        return False, "empty diagram body"
+
+    first = body[0].strip()
+    if not re.match(r"^(graph|flowchart)\s+(LR|TD|TB|RL|BT)$", first):
+        return False, f"invalid header: {first!r}"
+
+    for line in body[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Count unescaped double-quotes: should be even
+        if stripped.count('"') % 2 != 0:
+            return False, f"unmatched quote in: {stripped!r}"
+
+    return True, ""
+
+
 def _node_name(node: dict) -> str:
     """Extract display name from a node dict.
 
@@ -65,6 +114,17 @@ class DiagramGenerator:
         if not mermaid:
             return ""
 
+        # Validate Mermaid syntax; ask LLM to fix if invalid.
+        valid, reason = _validate_mermaid(mermaid)
+        if not valid:
+            logger.warning(
+                "[DIAGRAM] cluster_id=%d invalid Mermaid (%s); attempting LLM fix",
+                cluster_id, reason,
+            )
+            mermaid = self._fix_mermaid(mermaid, reason)
+            if not mermaid:
+                return ""
+
         # Build context: symbol names visible in the diagram
         try:
             nodes = self.storage.get_nodes_by_cluster(cluster_id)
@@ -76,6 +136,34 @@ class DiagramGenerator:
         if explanation:
             return f"## Architecture\n\n{explanation}\n\n{mermaid}"
         return f"## Architecture\n\n{mermaid}"
+
+    def _fix_mermaid(self, mermaid: str, reason: str) -> str:
+        """Ask the LLM to fix invalid Mermaid syntax. Returns fixed diagram or ''."""
+        if self._llm is None:
+            return ""
+        try:
+            from langchain_core.messages import HumanMessage  # noqa: PLC0415
+            prompt = (
+                f"The following Mermaid diagram has a syntax error: {reason}\n\n"
+                f"{mermaid}\n\n"
+                f"Fix the Mermaid syntax so it renders correctly. "
+                f"Return ONLY the corrected ```mermaid...``` block, nothing else. "
+                f"Keep the same nodes and edges — only fix syntax issues."
+            )
+            response = self._llm.invoke([HumanMessage(content=prompt)])
+            fixed = response.content if hasattr(response, "content") else str(response)
+            # Extract the mermaid block from the response
+            m = re.search(r"```mermaid\n.*?```", fixed, re.DOTALL)
+            if m:
+                candidate = m.group(0)
+                ok, _ = _validate_mermaid(candidate)
+                if ok:
+                    return candidate
+            logger.debug("[DIAGRAM] LLM fix did not produce valid Mermaid")
+            return ""
+        except Exception as exc:
+            logger.debug("[DIAGRAM] LLM fix call failed: %s", exc)
+            return ""
 
     def _explain(self, mermaid: str, node_names: list[str], page_spec: Any) -> str:
         """Ask the LLM for a 2-3 sentence explanation of the diagram."""
@@ -151,10 +239,11 @@ def _render(id_to_name: dict[str, str], edges: list[tuple[str, str]]) -> str:
     """Build a Mermaid graph LR block from node names and edge pairs."""
     lines: list[str] = ["```mermaid", "graph LR"]
 
-    # Emit node declarations (label in quotes handles spaces/specials).
+    # Emit node declarations — labels sanitized to prevent Mermaid parse errors.
     for nid, name in id_to_name.items():
         safe = _safe_id(name)
-        lines.append(f'    {safe}["{name}"]')
+        label = _sanitize_label(name)
+        lines.append(f'    {safe}["{label}"]')
 
     # Emit edges.
     for src_id, tgt_id in edges:
