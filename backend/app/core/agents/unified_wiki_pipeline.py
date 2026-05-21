@@ -124,6 +124,7 @@ def _run_page(
     repo_root: str,
     name_index: set[str] | None,
     name_to_signatures: dict[str, set[str]] | None = None,
+    cluster_file_map: dict[str, int] | None = None,
     gate_mode: dict[str, str],
     stream_callback: Callable[[dict], None] | None,
     storage: Any = None,
@@ -138,6 +139,8 @@ def _run_page(
         name_index: Set of known symbol names for identifier grounding.
         name_to_signatures: Optional class → {method names} mapping for dotted
             method/attribute grounding (Rule 3 extension, #315).
+        cluster_file_map: Optional file path → cluster_id mapping for cross-
+            cluster reference detection (Rule 4, #316).
         gate_mode: Per-rule gate actions (passed through to ``apply_gate``).
         stream_callback: Optional SSE event emitter.
 
@@ -199,6 +202,8 @@ def _run_page(
         tool_trace,
         known_symbols=name_index,
         name_to_signatures=name_to_signatures,
+        cluster_file_map=cluster_file_map,
+        current_cluster_id=spec.cluster_id,
         mode=gate_mode,
     )
 
@@ -328,6 +333,7 @@ def run_unified_pipeline(
     storage: Any | None = None,
     name_index: set[str] | None = None,
     name_to_signatures: dict[str, set[str]] | None = None,
+    cluster_file_map: dict[str, int] | None = None,
     gate_mode: dict[str, str] | None = None,
     stream_callback: Callable[[dict], None] | None = None,
 ) -> UnifiedPipelineResult:
@@ -364,6 +370,12 @@ def run_unified_pipeline(
         ``repo_nodes.parent_symbol``.  Enables the gate Rule 3 extension
         (#315) which flags invented method calls on real classes.  Pass
         ``None`` (default) to skip dotted-method grounding.
+    cluster_file_map :
+        Optional mapping of repo-relative file path → cluster_id.  When
+        provided, enables gate Rule 4 (``cross_cluster_reference``, #316):
+        paragraphs citing files from a different cluster than the page being
+        written are flagged.  Default action is ``"warn"`` (non-destructive).
+        Pass ``None`` (default) to skip cross-cluster detection.
     gate_mode :
         Per-rule action override for :func:`apply_gate`.  Defaults to
         ``{"readme": "strip", "sql": "strip", "identifier": "flag"}``.
@@ -587,6 +599,7 @@ def run_unified_pipeline(
                 repo_root=repo_root,
                 name_index=name_index,
                 name_to_signatures=name_to_signatures,
+                cluster_file_map=cluster_file_map,
                 gate_mode=effective_gate_mode,
                 stream_callback=stream_callback,
                 storage=storage,

@@ -758,3 +758,270 @@ class TestMethodGrounding:
         flagged_methods = {f.detail for f in method_flags}
         assert "method 'JobQueue.process' not found in code graph" in flagged_methods
         assert "method 'JobQueue.flush' not found in code graph" in flagged_methods
+
+
+# ── Rule 4: Cross-cluster reference (#316) ────────────────────────────────────
+
+
+class TestCrossClusterRule:
+    """Rule 4: cross_cluster_reference.
+
+    When ``cluster_file_map`` maps file paths to cluster IDs and
+    ``current_cluster_id`` identifies the page being written, paragraphs
+    citing files from a *different* cluster are flagged with rule
+    ``"cross_cluster_reference"``.  Default action: ``"warn"`` (keep,
+    flag only).
+    """
+
+    # ── Happy path: same cluster → no flag ───────────────────────────
+
+    def test_same_cluster_citation_no_flag(self):
+        """Paragraph citing a file in the same cluster must not be flagged."""
+        cluster_file_map = {
+            "workers/queue.py": 1,
+            "workers/handler.py": 1,
+        }
+        claims = [_claim("The queue module handles dispatching.", paths=["workers/queue.py"])]
+        kept, report = apply_gate(
+            claims,
+            [],
+            cluster_file_map=cluster_file_map,
+            current_cluster_id=1,
+        )
+
+        cross_flags = [f for f in report.flags if f.rule == "cross_cluster_reference"]
+        assert cross_flags == []
+        assert len(kept) == 1
+
+    # ── Detection: different cluster → flag ───────────────────────────
+
+    def test_different_cluster_citation_flagged(self):
+        """Paragraph citing a file in a different cluster is flagged."""
+        cluster_file_map = {
+            "workers/queue.py": 1,
+            "db/repository.py": 2,
+        }
+        claims = [
+            _claim(
+                "LaunchRepository persists records to the database.",
+                paths=["db/repository.py"],
+            )
+        ]
+        kept, report = apply_gate(
+            claims,
+            [],
+            cluster_file_map=cluster_file_map,
+            current_cluster_id=1,  # workers cluster
+        )
+
+        cross_flags = [f for f in report.flags if f.rule == "cross_cluster_reference"]
+        assert len(cross_flags) == 1
+        assert cross_flags[0].rule == "cross_cluster_reference"
+
+    def test_cross_cluster_flag_detail_contains_paths_and_ids(self):
+        """The flag detail mentions the cited file path, other cluster id, and current cluster id."""
+        cluster_file_map = {
+            "workers/queue.py": 1,
+            "db/repository.py": 2,
+        }
+        claims = [_claim("Claims about the DB layer.", paths=["db/repository.py"])]
+        kept, report = apply_gate(
+            claims,
+            [],
+            cluster_file_map=cluster_file_map,
+            current_cluster_id=1,
+        )
+
+        cross_flags = [f for f in report.flags if f.rule == "cross_cluster_reference"]
+        assert len(cross_flags) == 1
+        detail = cross_flags[0].detail
+        assert "db/repository.py" in detail
+        assert "2" in detail  # other cluster id
+        assert "1" in detail  # current cluster id
+
+    # ── Default action: warn (non-destructive) ─────────────────────────
+
+    def test_default_action_is_warn(self):
+        """Default mode is 'warn' — paragraph is kept, not stripped."""
+        cluster_file_map = {
+            "workers/queue.py": 1,
+            "db/repository.py": 2,
+        }
+        claims = [_claim("Cross-cluster claim.", paths=["db/repository.py"])]
+        kept, report = apply_gate(
+            claims,
+            [],
+            cluster_file_map=cluster_file_map,
+            current_cluster_id=1,
+        )
+
+        cross_flags = [f for f in report.flags if f.rule == "cross_cluster_reference"]
+        assert len(cross_flags) == 1
+        assert cross_flags[0].action == "warn"
+        # Paragraph is kept (warn = non-destructive)
+        assert len(kept) == 1
+        assert 0 not in report.stripped_paragraphs
+
+    # ── Strip mode ─────────────────────────────────────────────────────
+
+    def test_strip_mode_removes_cross_cluster_paragraph(self):
+        """mode['cross_cluster'] = 'strip' causes cross-cluster paragraphs to be removed."""
+        cluster_file_map = {
+            "workers/queue.py": 1,
+            "db/repository.py": 2,
+        }
+        claims = [_claim("Cross-cluster claim.", paths=["db/repository.py"])]
+        kept, report = apply_gate(
+            claims,
+            [],
+            cluster_file_map=cluster_file_map,
+            current_cluster_id=1,
+            mode={"cross_cluster": "strip"},
+        )
+
+        assert len(kept) == 0
+        assert 0 in report.stripped_paragraphs
+
+    # ── cluster_file_map=None → skip entirely ──────────────────────────
+
+    def test_cluster_file_map_none_skips_rule(self):
+        """When cluster_file_map is None, the rule is skipped regardless of current_cluster_id."""
+        claims = [_claim("Some cross-cluster content.", paths=["db/repository.py"])]
+        kept, report = apply_gate(
+            claims,
+            [],
+            cluster_file_map=None,
+            current_cluster_id=1,
+        )
+
+        cross_flags = [f for f in report.flags if f.rule == "cross_cluster_reference"]
+        assert cross_flags == []
+        assert len(kept) == 1
+
+    def test_current_cluster_id_none_skips_rule(self):
+        """When current_cluster_id is None, the rule is skipped."""
+        cluster_file_map = {"db/repository.py": 2}
+        claims = [_claim("Some content.", paths=["db/repository.py"])]
+        kept, report = apply_gate(
+            claims,
+            [],
+            cluster_file_map=cluster_file_map,
+            current_cluster_id=None,
+        )
+
+        cross_flags = [f for f in report.flags if f.rule == "cross_cluster_reference"]
+        assert cross_flags == []
+
+    def test_both_none_skips_rule(self):
+        """Both None → rule skipped; existing behaviour unchanged."""
+        claims = [_claim("Normal content.", paths=["workers/queue.py"])]
+        kept, report = apply_gate(claims, [])
+
+        cross_flags = [f for f in report.flags if f.rule == "cross_cluster_reference"]
+        assert cross_flags == []
+
+    # ── Unknown path (benefit of the doubt) ───────────────────────────
+
+    def test_unknown_file_path_not_flagged(self):
+        """File not present in cluster_file_map → benefit of the doubt, no flag."""
+        cluster_file_map = {
+            "workers/queue.py": 1,
+        }
+        claims = [
+            _claim(
+                "Unknown file content.",
+                paths=["some/unknown/path.py"],
+            )
+        ]
+        kept, report = apply_gate(
+            claims,
+            [],
+            cluster_file_map=cluster_file_map,
+            current_cluster_id=1,
+        )
+
+        cross_flags = [f for f in report.flags if f.rule == "cross_cluster_reference"]
+        assert cross_flags == []
+
+    # ── Multiple citations in one paragraph ────────────────────────────
+
+    def test_one_cross_cluster_among_multiple_citations_flags_once(self):
+        """A paragraph with mixed same-cluster and cross-cluster citations is flagged once."""
+        cluster_file_map = {
+            "workers/queue.py": 1,
+            "workers/handler.py": 1,
+            "db/repository.py": 2,
+        }
+        claims = [
+            _claim(
+                "Workers dispatch via queue; also persisted via repository.",
+                paths=["workers/queue.py", "db/repository.py"],
+            )
+        ]
+        kept, report = apply_gate(
+            claims,
+            [],
+            cluster_file_map=cluster_file_map,
+            current_cluster_id=1,
+        )
+
+        cross_flags = [f for f in report.flags if f.rule == "cross_cluster_reference"]
+        # Only one flag per flagged path (db/repository.py)
+        assert len(cross_flags) == 1
+
+    # ── Existing rules unaffected ──────────────────────────────────────
+
+    def test_existing_rules_still_run_alongside_cross_cluster(self):
+        """Existing rules (readme, sql, identifier) are unaffected by cross_cluster params."""
+        cluster_file_map = {"workers/queue.py": 1}
+        claims = [_claim("See README for README details.")]
+        kept, report = apply_gate(
+            claims,
+            [],
+            cluster_file_map=cluster_file_map,
+            current_cluster_id=1,
+        )
+
+        readme_flags = [f for f in report.flags if f.rule == "readme_claim_without_read"]
+        assert len(readme_flags) == 1
+
+    # ── Mode validation ────────────────────────────────────────────────
+
+    def test_cross_cluster_valid_mode_strip_accepted(self):
+        """mode={'cross_cluster': 'strip'} is accepted without ValueError."""
+        claims = [_claim("Plain text.")]
+        kept, report = apply_gate(
+            claims,
+            [],
+            mode={"cross_cluster": "strip"},
+        )
+        assert isinstance(kept, list)
+
+    def test_cross_cluster_invalid_action_raises(self):
+        """Invalid action for cross_cluster raises ValueError."""
+        import pytest
+
+        claims = [_claim("Some claim.")]
+        with pytest.raises(ValueError, match="Invalid gate action"):
+            apply_gate(claims, [], mode={"cross_cluster": "verifier"})
+
+    def test_cross_cluster_flag_paragraph_index_correct(self):
+        """The flag records the correct paragraph_index."""
+        cluster_file_map = {
+            "workers/queue.py": 1,
+            "db/repository.py": 2,
+        }
+        claims = [
+            _claim("Safe content, same cluster.", paragraph_index=0, paths=["workers/queue.py"]),
+            _claim("Cross-cluster content.", paragraph_index=1, paths=["db/repository.py"]),
+        ]
+        kept, report = apply_gate(
+            claims,
+            [],
+            cluster_file_map=cluster_file_map,
+            current_cluster_id=1,
+        )
+
+        cross_flags = [f for f in report.flags if f.rule == "cross_cluster_reference"]
+        assert len(cross_flags) == 1
+        assert cross_flags[0].paragraph_index == 1

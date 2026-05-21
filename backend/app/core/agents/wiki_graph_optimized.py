@@ -2051,6 +2051,31 @@ class OptimizedWikiGenerationAgent:
             except Exception as exc:
                 logger.debug("[UNIFIED] name_to_signatures build failed: %s", exc)
 
+        # ── Build cluster_file_map (file path → cluster_id) (#316) ────
+        # Maps every repo-relative file path to the cluster_id of the cluster
+        # whose ``dirs`` cover that path.  Used by the source-kind gate Rule 4
+        # (cross_cluster_reference) to detect content displacement.
+        cluster_file_map: dict[str, int] = {}
+        try:
+            for cluster in clusters:
+                cid = cluster.cluster_id
+                for dir_path in cluster.dirs:
+                    for file_path in repository_files:
+                        # Match file paths under this directory (or exact match)
+                        if file_path == dir_path or file_path.startswith(
+                            dir_path if dir_path.endswith("/") else dir_path + "/"
+                        ):
+                            cluster_file_map[file_path] = cid
+        except Exception as exc:
+            logger.warning("[UNIFIED] cluster_file_map build failed: %s", exc)
+            cluster_file_map = {}
+
+        logger.info(
+            "[UNIFIED] cluster_file_map: %d files mapped across %d clusters",
+            len(cluster_file_map),
+            len(clusters),
+        )
+
         if self.progress_callback:
             try:
                 self.progress_callback(
@@ -2120,6 +2145,7 @@ class OptimizedWikiGenerationAgent:
                 storage=getattr(self, "_cluster_db", None),
                 name_index=name_index or None,
                 name_to_signatures=name_to_signatures if name_to_signatures else None,
+                cluster_file_map=cluster_file_map,
                 stream_callback=_stream_callback,
             )
         except Exception as exc:

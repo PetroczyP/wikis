@@ -3,8 +3,8 @@
 Deterministic pre-filter that catches obvious hallucination classes
 without an LLM call.
 
-Three rules
------------
+Four rules
+----------
 1. **readme_claim_without_read** — paragraph mentions "README" but no
    ``read_file`` of a README file appears in the agent's tool trace.
 
@@ -18,17 +18,25 @@ Three rules
    (``known_symbols`` set) *and* are not present in the text of any
    ``read_file`` or ``grep`` result in the tool trace.
 
+4. **cross_cluster_reference** — paragraph cites a file path that belongs
+   to a *different* cluster than the page being written.  Requires
+   ``cluster_file_map`` (file path → cluster_id) and ``current_cluster_id``
+   to be provided; otherwise the rule is skipped.  Default action: ``"warn"``
+   (flag, keep) — non-destructive.  Set ``mode["cross_cluster"] = "strip"``
+   to enforce content isolation.
+
 Per-rule modes (configurable via the ``mode`` dict)
 ----------------------------------------------------
 ``"flag"`` (default) — emit GateFlag, keep the paragraph.
 ``"strip"``           — emit GateFlag, remove paragraph from output.
+``"warn"``            — emit GateFlag, keep the paragraph (alias for flag).
 
 Public API
 ----------
 ToolCall       — tool name + args + result_text from the agent trace.
 GateFlag       — per-paragraph flag record.
 GateReport     — aggregate of all flags + stripped indices.
-apply_gate()   — runs all three rules, returns filtered claims + report.
+apply_gate()   — runs all four rules, returns filtered claims + report.
 
 Dependency on #238
 ------------------
@@ -242,9 +250,10 @@ _DEFAULT_MODE: dict[str, str] = {
     "readme": "flag",
     "sql": "flag",
     "identifier": "flag",
+    "cross_cluster": "warn",
 }
 
-_VALID_ACTIONS: frozenset[str] = frozenset({"flag", "strip"})
+_VALID_ACTIONS: frozenset[str] = frozenset({"flag", "strip", "warn"})
 _VALID_RULES: frozenset[str] = frozenset(_DEFAULT_MODE.keys())
 
 
@@ -254,9 +263,11 @@ def apply_gate(
     *,
     known_symbols: set[str] | None = None,
     name_to_signatures: dict[str, set[str]] | None = None,
+    cluster_file_map: dict[str, int] | None = None,
+    current_cluster_id: int | None = None,
     mode: dict[str, str] | None = None,
 ) -> tuple[list[CitedClaim], GateReport]:
-    """Run the three source-kind pre-filter rules over *cited_claims*.
+    """Run the four source-kind pre-filter rules over *cited_claims*.
 
     Parameters
     ----------
@@ -289,10 +300,21 @@ def apply_gate(
         detail ``"method 'ClassName.method_name' not found in code graph"``.
         Pass ``None`` (default) to skip this check entirely — fully backward-
         compatible with existing callers.
+    cluster_file_map :
+        Optional mapping of repo-relative file paths to cluster IDs.  When
+        provided together with ``current_cluster_id``, enables Rule 4
+        (``cross_cluster_reference``): paragraphs citing files from a
+        different cluster than ``current_cluster_id`` are flagged.
+        Pass ``None`` to skip Rule 4 entirely.
+    current_cluster_id :
+        Cluster ID of the page being generated.  Required for Rule 4.
+        Pass ``None`` to skip Rule 4.
     mode :
         Per-rule action override.  Keys: ``"readme"``, ``"sql"``,
-        ``"identifier"``.  Values: ``"flag"`` (default), ``"strip"``.
-        Unspecified rules default to ``"flag"``.
+        ``"identifier"``, ``"cross_cluster"``.  Values: ``"flag"``,
+        ``"strip"``, ``"warn"`` (warn is non-destructive like flag).
+        Unspecified rules use their defaults (``"flag"`` for rules 1-3,
+        ``"warn"`` for cross_cluster).
 
     Returns
     -------
@@ -315,6 +337,10 @@ def apply_gate(
     readme_mode = effective_mode["readme"]
     sql_mode = effective_mode["sql"]
     identifier_mode = effective_mode["identifier"]
+    cross_cluster_mode = effective_mode["cross_cluster"]
+
+    # Rule 4 requires both parameters; skip silently if either is missing.
+    _run_cross_cluster = cluster_file_map is not None and current_cluster_id is not None
 
     # Pre-compute expensive trace queries once
     has_readme_read = _trace_has_readme_read(tool_trace)
@@ -380,6 +406,34 @@ def apply_gate(
             if identifier_mode == "strip":
                 stripped_this = True
                 break  # one strip per paragraph is enough
+
+        # ── Rule 4: Cross-cluster reference (#316) ────────────────────────
+        # Only runs when cluster_file_map and current_cluster_id are provided.
+        if _run_cross_cluster and not stripped_this:
+            for citation in claim.citations:
+                cited_path = citation.path
+                other_cluster = cluster_file_map.get(cited_path)  # type: ignore[union-attr]
+                if other_cluster is None:
+                    # Unknown path → benefit of the doubt, skip
+                    continue
+                if other_cluster == current_cluster_id:
+                    # Same cluster → fine
+                    continue
+                flag = GateFlag(
+                    paragraph_index=para_idx,
+                    paragraph_text=text,
+                    rule="cross_cluster_reference",
+                    detail=(
+                        f"file '{cited_path}' belongs to cluster {other_cluster}, "
+                        f"not this page's cluster {current_cluster_id}"
+                    ),
+                    action=cross_cluster_mode,
+                )
+                flags_this.append(flag)
+                if cross_cluster_mode == "strip":
+                    stripped_this = True
+                # One flag per cross-cluster path is sufficient
+                break
 
         # ── Rule 3 extension: dotted method/attribute grounding (#315) ─
         # Only runs when name_to_signatures is provided.
