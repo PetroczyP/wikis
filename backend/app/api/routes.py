@@ -486,16 +486,24 @@ async def list_wikis(
     return result
 
 
-def _extract_frontmatter_title_section(content: str) -> tuple[str, str]:
-    """Parse YAML frontmatter and return (title, section) from it, or ('', '') if absent."""
+def _extract_frontmatter_title_section(content: str) -> tuple[str, str, int]:
+    """Parse YAML frontmatter and return (title, section, page_order).
+
+    ``section`` is read from ``section:`` first; if absent, falls back to
+    ``chapter:`` so chaptered sub-pages (#287) are grouped correctly.
+    ``page_order`` comes from ``page_order:``; defaults to 0.
+    Returns ('', '', 0) when no frontmatter is present.
+    """
     if not content.startswith("---"):
-        return "", ""
+        return "", "", 0
     end = content.find("\n---", 3)
     if end == -1:
-        return "", ""
+        return "", "", 0
     yaml_block = content[4:end]
     title = ""
     section = ""
+    chapter = ""
+    page_order = 0
     for line in yaml_block.splitlines():
         if not title:
             m = re.match(r'^title\s*:\s*["\']?(.+?)["\']?\s*$', line)
@@ -505,9 +513,17 @@ def _extract_frontmatter_title_section(content: str) -> tuple[str, str]:
             m = re.match(r'^section\s*:\s*["\']?(.+?)["\']?\s*$', line)
             if m:
                 section = m.group(1).strip()
-        if title and section:
-            break
-    return title, section
+        if not chapter:
+            m = re.match(r'^chapter\s*:\s*["\']?(.+?)["\']?\s*$', line)
+            if m:
+                chapter = m.group(1).strip()
+        if not page_order:
+            m = re.match(r'^page_order\s*:\s*(\d+)\s*$', line)
+            if m:
+                page_order = int(m.group(1))
+    # Prefer explicit section; fall back to chapter slug humanised as display name.
+    effective_section = section or (chapter.replace("-", " ").replace("_", " ").title() if chapter else "")
+    return title, effective_section, page_order
 
 
 @router.get("/wikis/{wiki_id}")
@@ -648,17 +664,22 @@ async def get_wiki(
         except Exception:
             content_str = ""
 
-        # Prefer frontmatter title/section over filename-derived values
-        fm_title, fm_section = _extract_frontmatter_title_section(content_str)
+        # Prefer frontmatter title/section over filename-derived values.
+        # _extract_frontmatter_title_section also reads ``chapter:`` (chaptered
+        # sub-pages, #287) and ``page_order:`` for intra-chapter ordering.
+        fm_title, fm_section, fm_page_order = _extract_frontmatter_title_section(content_str)
         display_title = fm_title or page_name.replace("-", " ").replace("_", " ").title().strip()
         display_section = fm_section or section_name.replace("-", " ").replace("_", " ").title().strip()
+        # Within a chapter, use frontmatter page_order if available; otherwise
+        # fall back to the global enumeration index so ordering is always defined.
+        order = fm_page_order if fm_page_order else i
 
         pages.append(
             {
                 "id": page_id,
                 "title": display_title,
                 "section": display_section,
-                "order": i,
+                "order": order,
                 "content": content_str,
             }
         )

@@ -62,6 +62,8 @@ interface PageData {
   order: number;
   content: string;
   section?: string;
+  /** Raw chapter slug from frontmatter ``chapter:`` field (chaptered pages #287). */
+  chapter?: string;
 }
 
 const thinScrollbar = {

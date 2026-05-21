@@ -223,7 +223,14 @@ export interface WikiPage {
   id: string;
   title: string;
   order: number;
+  /** Section grouping derived from path or frontmatter ``section:`` field. */
   section?: string;
+  /**
+   * Chaptered pages (#287): slug of the chapter this sub-page belongs to,
+   * from frontmatter ``chapter:`` field. Populated only for chaptered wikis.
+   * The sidebar uses ``section`` for display; ``chapter`` carries the raw slug.
+   */
+  chapter?: string;
   content: string;
 }
 
