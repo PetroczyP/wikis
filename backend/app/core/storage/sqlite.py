@@ -1512,14 +1512,52 @@ class UnifiedWikiDB:
         )
         self.conn.commit()
 
+    def count_file_nodes(self) -> int:
+        """Return the number of file-level nodes (parent_symbol IS NULL) with source text."""
+        _ws = " ' ' || char(9) || char(10) || char(13) "
+        row = self.conn.execute(
+            f"SELECT count(*) FROM repo_nodes "  # noqa: S608
+            f"WHERE parent_symbol IS NULL"
+            f" AND llm_summary IS NULL"
+            f" AND source_text IS NOT NULL"
+            f" AND length(trim(source_text, {_ws})) > 0"
+        ).fetchone()
+        return row[0] if row else 0
+
+    def get_node_summary(self, symbol: str) -> str:
+        """Return the LLM summary for *symbol* by name.
+
+        Falls back to the parent file node's summary when the symbol itself
+        has no summary (file-level summarisation is the default).
+        """
+        row = self.conn.execute(
+            "SELECT llm_summary, parent_symbol FROM repo_nodes WHERE symbol_name = ? LIMIT 1",
+            (symbol,),
+        ).fetchone()
+        if row is None:
+            return ""
+        summary, parent_id = row
+        if summary:
+            return summary
+        if parent_id:
+            parent_row = self.conn.execute(
+                "SELECT llm_summary FROM repo_nodes WHERE node_id = ? LIMIT 1",
+                (parent_id,),
+            ).fetchone()
+            if parent_row and parent_row[0]:
+                return parent_row[0]
+        return ""
+
     def populate_summaries(
         self,
         summary_fn: Callable[[list[str]], list[str | None]],
         model_name: str = "",
         batch_size: int = 20,
         architectural_only: bool = True,
+        files_only: bool = False,
+        progress_fn: Callable[[int, int, int], None] | None = None,
     ) -> int:
-        """Generate LLM summaries for architectural nodes that lack one.
+        """Generate LLM summaries for nodes that lack one.
 
         Skips nodes where ``llm_summary IS NOT NULL`` (already summarised).
         Returns the count of summaries written.
@@ -1537,9 +1575,15 @@ class UnifiedWikiDB:
             Number of nodes per LLM call (default 20).
         architectural_only : bool
             When True (default), restrict to ``is_architectural = 1`` nodes.
+        files_only : bool
+            When True, restrict to file-level nodes (``parent_symbol IS NULL``).
+            Overrides ``architectural_only`` for the parent-symbol filter.
+        progress_fn : callable, optional
+            Called after each batch as ``progress_fn(batch_idx, total_batches, n_written)``.
         """
         _ws = " ' ' || char(9) || char(10) || char(13) "
-        arch_filter = " AND is_architectural = 1" if architectural_only else ""
+        arch_filter = " AND is_architectural = 1" if architectural_only and not files_only else ""
+        files_filter = " AND parent_symbol IS NULL" if files_only else ""
         rows = self.conn.execute(
             "SELECT node_id, source_text, signature, docstring, symbol_name "  # noqa: S608
             "FROM repo_nodes "
@@ -1547,6 +1591,7 @@ class UnifiedWikiDB:
             f" AND source_text IS NOT NULL"
             f" AND length(trim(source_text, {_ws})) > 0"
             f"{arch_filter}"
+            f"{files_filter}"
         ).fetchall()
 
         if not rows:
@@ -1555,14 +1600,14 @@ class UnifiedWikiDB:
 
         total = 0
         t_start = time.time()
+        n_batches = (len(rows) + batch_size - 1) // batch_size
         logger.info(
             "populate_summaries: starting — %d nodes in %d batches "
-            "(batch_size=%d, arch_only=%s)",
-            len(rows), (len(rows) + batch_size - 1) // batch_size,
-            batch_size, architectural_only,
+            "(batch_size=%d, arch_only=%s, files_only=%s)",
+            len(rows), n_batches, batch_size, architectural_only, files_only,
         )
 
-        for i in range(0, len(rows), batch_size):
+        for batch_idx, i in enumerate(range(0, len(rows), batch_size), start=1):
             batch = rows[i : i + batch_size]
             node_ids = [r[0] for r in batch]
             texts = [r[1] for r in batch]
@@ -1597,6 +1642,11 @@ class UnifiedWikiDB:
                 update_params,
             )
             total += sum(1 for s in summaries if s)
+            if progress_fn is not None:
+                try:
+                    progress_fn(batch_idx, n_batches, total)
+                except Exception:
+                    pass
 
         self.conn.commit()
         elapsed = time.time() - t_start

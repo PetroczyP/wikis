@@ -756,10 +756,11 @@ class EnhancedUnifiedGraphBuilder:
         """
         pass
     
-    def analyze_repository(self, repo_path: str, 
+    def analyze_repository(self, repo_path: str,
                           include_patterns: Optional[List[str]] = None,
                           exclude_patterns: Optional[List[str]] = None,
-                          stream_documents: bool = False) -> UnifiedAnalysis:
+                          stream_documents: bool = False,
+                          progress_callback: Optional[callable] = None) -> UnifiedAnalysis:
         """
         Single pass analysis: parse once, generate chunks + multi-tier code_graph
         
@@ -782,21 +783,40 @@ class EnhancedUnifiedGraphBuilder:
         # Phase 1: Discover files by language
         with resource_monitor("graph_builder.discover_files", logger):
             files_by_language = self._discover_files_by_language(repo_path, include_patterns, exclude_patterns)
-        
+
+        if progress_callback is not None:
+            lang_summary = ", ".join(
+                f"{n} {lang}" for lang, files in files_by_language.items()
+                if lang != "unknown" and (n := len(files)) > 0
+            )
+            try:
+                progress_callback(f"Parsing {lang_summary}...")
+            except Exception:
+                pass
+
         # Phase 2: Single parse with appropriate parser tier
         parse_results = {}
-        
+
+        _parsed_langs: list[str] = []
         with resource_monitor("graph_builder.parse_by_language", logger):
             for language, file_paths in files_by_language.items():
                 if language == 'unknown':
                     continue
                 logger.info(f"Parsing {len(file_paths)} {language} files")
+                if progress_callback is not None:
+                    _parsed_langs.append(language)
+                    try:
+                        progress_callback(
+                            f"Parsing {language} ({len(file_paths)} files)..."
+                        )
+                    except Exception:
+                        pass
                 if this and getattr(this, 'module', None):
                     tier = 'rich' if language in self.rich_parsers else ('basic' if language in self.basic_languages else 'unsupported')
                     this.module.invocation_thinking(
                         f"I am on phase parsing\nParsing {len(file_paths)} {language} files using {tier} parser\nReasoning: Extract symbols + relationships to feed unified multi-tier graph.\nNext: Aggregate language results then construct composite graph."
                     )
-                
+
                 if language == 'documentation':
                     # Process documentation files with text chunking
                     doc_results = self._parse_documentation_files(file_paths, repo_path)
@@ -815,8 +835,13 @@ class EnhancedUnifiedGraphBuilder:
                     logger.warning(f"Language {language} has tree-sitter parser but no symbol extraction implementation yet")
                     logger.info(f"Files will be skipped: {file_paths}")
                     # These files would fall back to regex-based processing in the original code splitter
-        
+
         # Phase 3: Build multi-tier unified code_graph
+        if progress_callback is not None:
+            try:
+                progress_callback("Building code graph...")
+            except Exception:
+                pass
         with resource_monitor("graph_builder.build_graph", logger):
             unified_graph = self._build_multi_tier_graph(parse_results)
         

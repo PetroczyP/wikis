@@ -254,8 +254,8 @@ def _batch_summarise(llm: Any, texts: list[str], batch_size: int = 20) -> list[s
             f"{j + 1}. {t[:1500]}" for j, t in enumerate(chunk)
         )
         prompt = (
-            f"Summarise each of the following {len(chunk)} code symbols in 2-3 sentences. "
-            "Focus on: role in the system, key behaviour, what callers need to know. "
+            f"Summarise each of the following {len(chunk)} source files in 2-3 sentences. "
+            "Focus on: purpose of the file, what it exports or defines, and how it fits in the system. "
             f"Return exactly {len(chunk)} numbered items (1. 2. 3. ...) matching input order. "
             "Write only the summaries — no headings, no extra commentary.\n\n"
             f"{numbered}"
@@ -618,7 +618,7 @@ class FilesystemRepositoryIndexer:
             logger.warning("No files discovered for indexing")
             return self._generate_empty_stats(repo_identifier)
 
-        self._emit_progress(0.16, f"Discovered {len(all_files)} files — building code graph...")
+        self._emit_progress(0.16, f"Discovered {len(all_files)} files — parsing code graph (this can take several minutes)...")
         logger.info(f"Processing {len(all_files)} files with Enhanced Unified Graph Builder")
         if this and getattr(this, "module", None):
             this.module.invocation_thinking(
@@ -630,8 +630,21 @@ class FilesystemRepositoryIndexer:
             # Stream documents by default for memory efficiency
             # Set WIKIS_DISABLE_STREAM_DOCS=1 to materialize all documents at once
             stream_documents = os.getenv("WIKIS_DISABLE_STREAM_DOCS") != "1"
+
+            _parse_progress = [0.16]
+
+            def _graph_progress(message: str) -> None:
+                # Advance from 0.16 toward 0.19 with each callback so the
+                # user sees movement while parsing languages one by one.
+                _parse_progress[0] = min(_parse_progress[0] + 0.005, 0.19)
+                self._emit_progress(_parse_progress[0], message)
+
             with resource_monitor("index.graph_analysis", logger):
-                analysis = self.graph_builder.analyze_repository(repo_path, stream_documents=stream_documents)
+                analysis = self.graph_builder.analyze_repository(
+                    repo_path,
+                    stream_documents=stream_documents,
+                    progress_callback=_graph_progress,
+                )
 
             # Extract results
             documents_iter = getattr(analysis, "documents_iter", None)
@@ -691,7 +704,11 @@ class FilesystemRepositoryIndexer:
             )
 
         # Step 3: Write unified DB (replaces FAISS + graph pickle + BM25)
-        self._emit_progress(0.20, "Building unified wiki database...")
+        self._emit_progress(
+            0.20,
+            f"Code graph built — {self.relationship_graph.number_of_nodes()} nodes, "
+            f"{self.relationship_graph.number_of_edges()} edges. Building unified wiki database...",
+        )
         logger.info("Writing unified wiki DB (graph + embeddings + clusters)...")
         if this and getattr(this, "module", None):
             this.module.invocation_thinking(
@@ -848,7 +865,12 @@ class FilesystemRepositoryIndexer:
                 logger.warning("Phase 1c enrichment failed (non-fatal): %s", exc)
 
             # Phase 1a — Populate graph (nodes + edges)
-            self._emit_progress(0.21, "Importing graph into unified DB...")
+            n_graph_nodes = self.relationship_graph.number_of_nodes()
+            n_graph_edges = self.relationship_graph.number_of_edges()
+            self._emit_progress(
+                0.21,
+                f"Importing graph into unified DB ({n_graph_nodes} nodes, {n_graph_edges} edges)...",
+            )
             udb.from_networkx(self.relationship_graph)
 
             # Phase 1b — Initial vector embeddings (before Phase 2)
@@ -1045,16 +1067,37 @@ class FilesystemRepositoryIndexer:
 
                 _settings = _get_settings()
                 if _settings.wiki_summarise_nodes:
-                    self._emit_progress(0.245, "Generating LLM node summaries...")
                     _llm = getattr(self, "_llm", None) or getattr(self, "llm", None)
+
+                    # Count file-level nodes upfront so we can show N/total progress.
+                    _file_node_count = udb.count_file_nodes() if hasattr(udb, "count_file_nodes") else 0
+                    _file_batch_total = max(1, (_file_node_count + batch_size - 1) // batch_size)
+                    self._emit_progress(
+                        0.245,
+                        f"Generating file summaries ({_file_node_count} files, "
+                        f"~{_file_batch_total} batches)...",
+                    )
+
+                    _summary_batch = [0]
+
+                    def _summary_progress(batch_idx: int, total_batches: int, n_written: int) -> None:
+                        _summary_batch[0] = batch_idx
+                        pct = 0.245 + 0.003 * batch_idx / max(1, total_batches)
+                        self._emit_progress(
+                            pct,
+                            f"Summarising files: {batch_idx}/{total_batches} batches, "
+                            f"{n_written} written...",
+                        )
+
                     n_summarised = self.populate_summaries(
                         llm=_llm,
                         _db=udb,
                         repo_analysis_text=_repo_analysis_text,
                         tools=_summary_tools,
+                        progress_fn=_summary_progress,
                     )
                     logger.info(
-                        "Unified DB: %d node summaries generated (#309)", n_summarised
+                        "Unified DB: %d file summaries generated (#309)", n_summarised
                     )
                 else:
                     logger.debug(
@@ -1119,13 +1162,18 @@ class FilesystemRepositoryIndexer:
         _db: Any = None,
         repo_analysis_text: str = "",
         tools: Any = None,
+        progress_fn: Any = None,
     ) -> int:
-        """Summarise architectural nodes using the provided LLM.
+        """Summarise file-level nodes using the provided LLM.
 
-        Hub nodes and nodes in ``entry_point`` / ``public_api`` layers use an
-        agentic tool loop (``_agentic_summary``) that can call ``read_file``
-        and ``get_callers`` before writing the summary.  All other nodes use
-        the existing batch single-call approach.
+        Only file-level nodes (parent_symbol IS NULL) are summarised — one
+        summary per source file rather than per symbol, which reduces LLM
+        calls by ~10× while giving the planner equally useful context.
+
+        Hub nodes and nodes in ``entry_point`` / ``public_api`` layers still
+        use an agentic tool loop (``_agentic_summary``) that can call
+        ``read_file`` and ``get_callers`` before writing the summary.  All
+        other file nodes use the batch single-call approach.
 
         Parameters
         ----------
@@ -1245,7 +1293,11 @@ class FilesystemRepositoryIndexer:
                 return _batch_summarise(llm, texts, batch_size=len(texts))
 
             batch_count = db.populate_summaries(
-                _summary_fn, model_name=model_name, batch_size=batch_size
+                _summary_fn,
+                model_name=model_name,
+                batch_size=batch_size,
+                files_only=True,
+                progress_fn=progress_fn,
             )
             return agentic_count + batch_count
         finally:
