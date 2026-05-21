@@ -1906,7 +1906,7 @@ class OptimizedWikiGenerationAgent:
         _repo_tree = state.get("repository_tree", "")
         # Scale explorer budget with repo size — small repos need fewer reads,
         # large repos need more to cover entry points, routes, services, models.
-        _explore_budget = max(20, min(len(repository_files) // 40, 100))
+        _explore_budget = max(20, min(len(repository_files) // 40, 500))
         logger.info("[UNIFIED] running agentic repo analysis (post-index, budget=%d, files=%d)", _explore_budget, len(repository_files))
         if self.progress_callback:
             try:
