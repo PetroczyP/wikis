@@ -2,6 +2,7 @@ name: Build & Push Docker Images
 
 on:
   push:
+    branches: ['main']
     tags: ['v*']
   workflow_dispatch:
 
@@ -43,9 +44,14 @@ jobs:
         with:
           images: ${{ env[matrix.image_env] }}
           tags: |
+            # semver tags: v1.2.3 → 1.2.3, 1.2, 1
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=semver,pattern={{major}}
+            # non-semver tags (e.g. v1): use tag name as-is
+            type=ref,event=tag
+            # main branch → latest
+            type=raw,value=latest,enable={{is_default_branch}}
 
       - uses: docker/setup-qemu-action@v3
 
