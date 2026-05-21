@@ -585,6 +585,19 @@ class WikiStorageProtocol(Protocol):
         """
         ...
 
+    def get_child_symbols(self, limit: int = 5000) -> list[dict]:
+        """Return all child symbols (methods, attributes) with their parent.
+
+        Each dict contains at minimum ``symbol_name`` and ``parent_symbol``.
+        Rows with a NULL or empty ``parent_symbol`` are excluded.  Used by
+        the source-kind gate (#315) to build the ``name_to_signatures`` index
+        (class → {method/attribute names}).
+
+        Older DBs that have no ``parent_symbol`` data return an empty list
+        gracefully.
+        """
+        ...
+
     # ── Language detection ───────────────────────────────────────────
 
     def detect_dominant_language(self, node_ids: list[str]) -> str | None:

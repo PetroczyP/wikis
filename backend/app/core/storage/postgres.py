@@ -2458,6 +2458,29 @@ class PostgresWikiStorage:
         _warn_if_truncated(result, limit, "get_all_edges")
         return result
 
+    def get_child_symbols(self, limit: int = 5000) -> list[dict]:
+        """Return child symbols (methods, attributes) with their parent_symbol.
+
+        Rows where ``parent_symbol`` is NULL or empty, or where the node is a
+        class itself, are excluded.  Older DBs that have no ``parent_symbol``
+        data return an empty list gracefully.
+        """
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        f"SELECT symbol_name, parent_symbol FROM {self._nodes} "
+                        f"WHERE parent_symbol IS NOT NULL AND parent_symbol != '' "
+                        f"AND symbol_type != 'class' "
+                        f"LIMIT :limit"
+                    ),
+                    {"limit": limit},
+                ).fetchall()
+            return [{"symbol_name": r[0], "parent_symbol": r[1]} for r in rows]
+        except Exception as exc:
+            logger.debug("get_child_symbols failed: %s", exc)
+            return []
+
     # ── Language detection ───────────────────────────────────────────
 
     def detect_dominant_language(self, node_ids: list[str]) -> str | None:

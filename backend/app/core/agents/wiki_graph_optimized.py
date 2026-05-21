@@ -2034,6 +2034,23 @@ class OptimizedWikiGenerationAgent:
         except Exception as exc:
             logger.warning("[UNIFIED] name_index build failed: %s", exc)
 
+        # ── Build name_to_signatures (class → {method names}) ─────────
+        # Used by the source-kind gate Rule 3 extension (#315) to detect
+        # invented method calls on real classes (e.g. JobQueue.process()).
+        # Requires the cluster DB to have parent_symbol populated; older DBs
+        # with no child rows return an empty dict gracefully.
+        name_to_signatures: dict[str, set[str]] = {}
+        if self._cluster_db is not None:
+            try:
+                rows = self._cluster_db.get_child_symbols(limit=5000)
+                for row in rows:
+                    parent = row.get("parent_symbol", "")
+                    child = row.get("symbol_name", "")
+                    if parent and child:
+                        name_to_signatures.setdefault(parent, set()).add(child)
+            except Exception as exc:
+                logger.debug("[UNIFIED] name_to_signatures build failed: %s", exc)
+
         if self.progress_callback:
             try:
                 self.progress_callback(
@@ -2102,6 +2119,7 @@ class OptimizedWikiGenerationAgent:
                 repo_root=repo_root,
                 storage=getattr(self, "_cluster_db", None),
                 name_index=name_index or None,
+                name_to_signatures=name_to_signatures if name_to_signatures else None,
                 stream_callback=_stream_callback,
             )
         except Exception as exc:

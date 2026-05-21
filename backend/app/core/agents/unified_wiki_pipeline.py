@@ -123,6 +123,7 @@ def _run_page(
     writer: WikiContentWriter,
     repo_root: str,
     name_index: set[str] | None,
+    name_to_signatures: dict[str, set[str]] | None = None,
     gate_mode: dict[str, str],
     stream_callback: Callable[[dict], None] | None,
     storage: Any = None,
@@ -135,6 +136,8 @@ def _run_page(
         writer: Pre-constructed WikiContentWriter (shared across pages).
         repo_root: Absolute path to the checked-out repository root.
         name_index: Set of known symbol names for identifier grounding.
+        name_to_signatures: Optional class → {method names} mapping for dotted
+            method/attribute grounding (Rule 3 extension, #315).
         gate_mode: Per-rule gate actions (passed through to ``apply_gate``).
         stream_callback: Optional SSE event emitter.
 
@@ -195,6 +198,7 @@ def _run_page(
         cited_claims_raw,
         tool_trace,
         known_symbols=name_index,
+        name_to_signatures=name_to_signatures,
         mode=gate_mode,
     )
 
@@ -323,6 +327,7 @@ def run_unified_pipeline(
     repo_root: str,
     storage: Any | None = None,
     name_index: set[str] | None = None,
+    name_to_signatures: dict[str, set[str]] | None = None,
     gate_mode: dict[str, str] | None = None,
     stream_callback: Callable[[dict], None] | None = None,
 ) -> UnifiedPipelineResult:
@@ -354,6 +359,11 @@ def run_unified_pipeline(
         Set of known symbol names from the code graph.  Used by the source-
         kind gate (rule 3 — identifier grounding).  Pass ``None`` to rely
         solely on the tool trace for grounding.
+    name_to_signatures :
+        Optional class → {method/attribute names} mapping built from
+        ``repo_nodes.parent_symbol``.  Enables the gate Rule 3 extension
+        (#315) which flags invented method calls on real classes.  Pass
+        ``None`` (default) to skip dotted-method grounding.
     gate_mode :
         Per-rule action override for :func:`apply_gate`.  Defaults to
         ``{"readme": "strip", "sql": "strip", "identifier": "flag"}``.
@@ -576,6 +586,7 @@ def run_unified_pipeline(
                 writer=writer,
                 repo_root=repo_root,
                 name_index=name_index,
+                name_to_signatures=name_to_signatures,
                 gate_mode=effective_gate_mode,
                 stream_callback=stream_callback,
                 storage=storage,

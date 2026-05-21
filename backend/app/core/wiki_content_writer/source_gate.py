@@ -155,6 +155,11 @@ _SQL_EXT_RE = re.compile(r"\.sql$", re.IGNORECASE)
 # capitalised words (English proper nouns, sentence starts).
 _CAMEL_CASE_RE = re.compile(r"\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b")
 
+# Dotted method/attribute pattern for Rule 3 extension (#315).
+# Matches ``ClassName.method_name`` where the class part is CamelCase
+# (starts with uppercase) and the method part is snake_case / lowercase.
+_DOTTED_IDENT_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]*)\.([a-z_][A-Za-z0-9_]*)\b")
+
 # snake_case function/variable: contains at least one underscore and
 # consists of lowercase letters, digits, and underscores only.  Each
 # underscore-delimited segment must be non-empty (so ``a_`` doesn't match).
@@ -248,6 +253,7 @@ def apply_gate(
     tool_trace: list[ToolCall],
     *,
     known_symbols: set[str] | None = None,
+    name_to_signatures: dict[str, set[str]] | None = None,
     mode: dict[str, str] | None = None,
 ) -> tuple[list[CitedClaim], GateReport]:
     """Run the three source-kind pre-filter rules over *cited_claims*.
@@ -274,6 +280,15 @@ def apply_gate(
         common proper-noun CamelCase tokens such as ``GitHub``, ``JavaScript``,
         ``TypeScript`` — the ``_CAMEL_CASE_RE`` pattern matches those by
         design (two title-case segments) and they will otherwise be flagged.
+    name_to_signatures :
+        Optional mapping of class/type name → set of known child symbol names
+        (methods, attributes).  When provided, ``ClassName.method_name``
+        patterns are checked: if ``ClassName`` is in ``known_symbols`` but
+        ``method_name`` is NOT in ``name_to_signatures.get(ClassName, set())``,
+        the paragraph is flagged with rule ``"identifier_not_grounded"`` and
+        detail ``"method 'ClassName.method_name' not found in code graph"``.
+        Pass ``None`` (default) to skip this check entirely — fully backward-
+        compatible with existing callers.
     mode :
         Per-rule action override.  Keys: ``"readme"``, ``"sql"``,
         ``"identifier"``.  Values: ``"flag"`` (default), ``"strip"``.
@@ -365,6 +380,34 @@ def apply_gate(
             if identifier_mode == "strip":
                 stripped_this = True
                 break  # one strip per paragraph is enough
+
+        # ── Rule 3 extension: dotted method/attribute grounding (#315) ─
+        # Only runs when name_to_signatures is provided.
+        if name_to_signatures is not None and not stripped_this:
+            for m in _DOTTED_IDENT_RE.finditer(text):
+                class_name = m.group(1)
+                method_name = m.group(2)
+                dotted = f"{class_name}.{method_name}"
+                # Only flag when the class itself is a known symbol
+                if known_symbols is None or class_name not in known_symbols:
+                    continue
+                # Grounded if the dotted form or method name appears in trace
+                if dotted in trace_text or method_name in trace_text:
+                    continue
+                # Grounded if method is listed in the signatures
+                if method_name in name_to_signatures.get(class_name, set()):
+                    continue
+                flag = GateFlag(
+                    paragraph_index=para_idx,
+                    paragraph_text=text,
+                    rule="identifier_not_grounded",
+                    detail=f"method '{dotted}' not found in code graph",
+                    action=identifier_mode,
+                )
+                flags_this.append(flag)
+                if identifier_mode == "strip":
+                    stripped_this = True
+                    break
 
         report.flags.extend(flags_this)
 

@@ -592,3 +592,169 @@ class TestUpperCaseTrailingUnderscore:
         assert "GATEWAY_URL_" not in flagged_idents, (
             f"GATEWAY_URL_ should not be a flagged identifier; flags: {flagged_idents}"
         )
+
+
+# ── Rule 3 extension: dotted method/attribute grounding (#315) ───────────────
+
+
+class TestMethodGrounding:
+    """Extend Rule 3 to catch invented method calls on real classes.
+
+    When ``name_to_signatures`` is provided, ``ClassName.method_name``
+    patterns are checked: if ``ClassName`` is in ``known_symbols`` but
+    ``method_name`` is NOT in ``name_to_signatures.get(ClassName, set())``,
+    the paragraph is flagged with ``"identifier_not_grounded"`` and a detail
+    of ``"method 'ClassName.method_name' not found in code graph"``.
+    """
+
+    def test_real_class_with_real_method_passes(self):
+        """JobQueue.enqueue where enqueue is known → no flag."""
+        claims = [_claim("Call JobQueue.enqueue to submit work items.")]
+        kept, report = apply_gate(
+            claims,
+            [],
+            known_symbols={"JobQueue"},
+            name_to_signatures={"JobQueue": {"enqueue", "dequeue"}},
+        )
+
+        method_flags = [
+            f for f in report.flags
+            if f.rule == "identifier_not_grounded" and "method" in f.detail
+        ]
+        assert method_flags == []
+
+    def test_real_class_with_fake_method_flagged(self):
+        """JobQueue.process where process is NOT in signatures → flagged."""
+        claims = [_claim("Call JobQueue.process to run the job.")]
+        kept, report = apply_gate(
+            claims,
+            [],
+            known_symbols={"JobQueue"},
+            name_to_signatures={"JobQueue": {"enqueue", "dequeue"}},
+        )
+
+        method_flags = [
+            f for f in report.flags
+            if f.rule == "identifier_not_grounded" and "method" in f.detail
+        ]
+        assert len(method_flags) == 1
+        assert "JobQueue.process" in method_flags[0].detail
+
+    def test_fake_class_with_method_still_caught_by_existing_check(self):
+        """UnknownClass.method where UnknownClass is not in known_symbols.
+
+        The existing identifier check catches the class name; the new dotted-
+        method check is skipped because the class is not known.
+        """
+        claims = [_claim("Call UnknownClass.do_something to process data.")]
+        kept, report = apply_gate(
+            claims,
+            [],
+            known_symbols={"JobQueue"},
+            name_to_signatures={"JobQueue": {"enqueue"}},
+        )
+
+        grounded_flags = [f for f in report.flags if f.rule == "identifier_not_grounded"]
+        flagged_details = {f.detail for f in grounded_flags}
+        # UnknownClass is caught by the existing check (not in known_symbols)
+        assert "UnknownClass" in flagged_details
+
+    def test_name_to_signatures_none_preserves_existing_behaviour(self):
+        """When name_to_signatures is None, no dotted-method check is done."""
+        claims = [_claim("Call JobQueue.invented to run things.")]
+        kept, report = apply_gate(
+            claims,
+            [],
+            known_symbols={"JobQueue"},
+            name_to_signatures=None,
+        )
+
+        # The existing check sees JobQueue in known_symbols → no class-level flag.
+        # The new method check is skipped because name_to_signatures is None.
+        method_flags = [
+            f for f in report.flags
+            if f.rule == "identifier_not_grounded" and "method" in f.detail
+        ]
+        assert method_flags == []
+
+    def test_method_flag_detail_format(self):
+        """Detail string must be ``"method 'ClassName.method_name' not found in code graph"``."""
+        claims = [_claim("Use WorkerPool.shutdown to stop all workers.")]
+        kept, report = apply_gate(
+            claims,
+            [],
+            known_symbols={"WorkerPool"},
+            name_to_signatures={"WorkerPool": {"start", "join"}},
+        )
+
+        method_flags = [
+            f for f in report.flags
+            if f.rule == "identifier_not_grounded" and "method" in f.detail
+        ]
+        assert len(method_flags) == 1
+        assert method_flags[0].detail == "method 'WorkerPool.shutdown' not found in code graph"
+
+    def test_method_flag_action_follows_identifier_mode(self):
+        """``mode["identifier"]`` still controls action for method flags."""
+        claims = [_claim("Use WorkerPool.shutdown to stop all workers.")]
+        kept, report = apply_gate(
+            claims,
+            [],
+            known_symbols={"WorkerPool"},
+            name_to_signatures={"WorkerPool": {"start"}},
+            mode={"identifier": "strip"},
+        )
+
+        assert len(kept) == 0
+        assert report.stripped_paragraphs == [0]
+
+    def test_lowercase_class_dotted_pattern_not_checked(self):
+        """Only CamelCase class patterns (starting uppercase) are checked."""
+        claims = [_claim("Call queue.process to handle the item.")]
+        kept, report = apply_gate(
+            claims,
+            [],
+            known_symbols={"queue"},
+            name_to_signatures={"queue": {"enqueue"}},
+        )
+
+        method_flags = [
+            f for f in report.flags
+            if f.rule == "identifier_not_grounded" and "method" in f.detail
+        ]
+        assert method_flags == []
+
+    def test_class_in_known_symbols_no_signatures_entry_flags(self):
+        """Class is known but has no entry in name_to_signatures → fake method flagged."""
+        claims = [_claim("Call EventBus.publish to emit events.")]
+        kept, report = apply_gate(
+            claims,
+            [],
+            known_symbols={"EventBus"},
+            name_to_signatures={},  # EventBus not in here
+        )
+
+        method_flags = [
+            f for f in report.flags
+            if f.rule == "identifier_not_grounded" and "method" in f.detail
+        ]
+        assert len(method_flags) == 1
+        assert "EventBus.publish" in method_flags[0].detail
+
+    def test_multiple_dotted_patterns_multiple_flags(self):
+        """Two fake method calls in the same paragraph both flagged."""
+        claims = [_claim("Call JobQueue.process and JobQueue.flush to clean up.")]
+        kept, report = apply_gate(
+            claims,
+            [],
+            known_symbols={"JobQueue"},
+            name_to_signatures={"JobQueue": {"enqueue"}},
+        )
+
+        method_flags = [
+            f for f in report.flags
+            if f.rule == "identifier_not_grounded" and "method" in f.detail
+        ]
+        flagged_methods = {f.detail for f in method_flags}
+        assert "method 'JobQueue.process' not found in code graph" in flagged_methods
+        assert "method 'JobQueue.flush' not found in code graph" in flagged_methods
