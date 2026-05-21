@@ -446,17 +446,15 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
           // Keep isGenerating=true so GenerationProgress stays visible with retry button
         }
       },
+      // onError: terminal failures (401 auth expired, 404 invocation gone)
+      // exit the generating state so the UI doesn't hang forever.
+      // #191: transient drops are recovered silently by subscribeSSE's
+      // reconnect loop — only HTTP 4xx surfaces as a terminal Error here.
       (err) => {
-        // #191: terminal connection errors only. Transient drops are
-        // recovered silently by subscribeSSE's reconnect loop; surfacing
-        // them in the activity log creates false "failed" UI for what is
-        // really just a sleep/wake cycle. HTTP 4xx (auth/missing) is
-        // surfaced from sse.ts as a terminal Error — show that.
         const msg = (err as Error)?.message ?? '';
         if (/HTTP (401|403|404)/.test(msg)) {
           setGenEvents((prev) => [
             ...prev,
-            // Keep legacy shape so GenerationProgress recognises it as an error event
             {
               type: 'error',
               event: 'error',
@@ -468,15 +466,10 @@ export function WikiViewerPage({ mode = 'dark' }: WikiViewerPageProps) {
             },
           ]);
         }
-      },
-      // onError: terminal failures (401 auth expired, 404 invocation gone)
-      // exit the generating state so the UI doesn't hang forever.
-      (err) => {
         source.close();
         setIsGenerating(false);
         setActiveInvocationId(null);
         setSearchParams({}, { replace: true });
-        // Reload wiki — it may already be complete from a prior run.
         if (wikiId) void loadAndReconcile({ isInitial: false });
       },
     );
