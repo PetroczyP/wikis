@@ -15,9 +15,10 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from app.core.deep_research.research_engine import DeepResearchEngine
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+
+from app.core.deep_research.research_engine import DeepResearchEngine
 
 # ---------------------------------------------------------------------------
 # DeepResearchEngine._get_repo_context tests
@@ -309,7 +310,8 @@ async def test_get_wiki_override_clears_stale_error_when_refresh_is_live(
             staticmethod(lambda record, user_id: wiki_summary),
         )
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test",
+            transport=ASGITransport(app=app),
+            base_url="http://test",
         ) as client:
             resp = await client.get("/api/v1/wikis/wiki-1")
 
@@ -344,12 +346,15 @@ async def test_get_wiki_override_fires_for_running_incremental_refresh(
     mock_service.invocations = {
         # Stale terminal invocation comes first in iteration order.
         "inv-old-failed": _make_inflight_invocation(
-            status="failed", invocation_id="inv-old-failed",
+            status="failed",
+            invocation_id="inv-old-failed",
         ),
         # The live in-progress run is second — the loop must still
         # prefer it.
         "inv-r": _make_inflight_invocation(
-            status="running", progress=0.3, invocation_id="inv-r",
+            status="running",
+            progress=0.3,
+            invocation_id="inv-r",
         ),
     }
 
@@ -362,7 +367,8 @@ async def test_get_wiki_override_fires_for_running_incremental_refresh(
             staticmethod(lambda record, user_id: wiki_summary),
         )
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test",
+            transport=ASGITransport(app=app),
+            base_url="http://test",
         ) as client:
             resp = await client.get("/api/v1/wikis/wiki-1")
 
@@ -399,7 +405,8 @@ async def test_get_wiki_terminal_invocation_does_not_override(app_with_mocks):
             staticmethod(lambda record, user_id: wiki_summary),
         )
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test",
+            transport=ASGITransport(app=app),
+            base_url="http://test",
         ) as client:
             resp = await client.get("/api/v1/wikis/wiki-1")
 
@@ -434,7 +441,8 @@ async def test_list_wikis_override_clears_stale_error_when_refresh_is_live(
     app, mock_management, mock_service = app_with_mocks
 
     wiki_summary = _make_serializable_wiki_summary(
-        status="failed", is_owner=True,
+        status="failed",
+        is_owner=True,
         error="Git clone failed (from prior attempt)",
     )
 
@@ -448,7 +456,8 @@ async def test_list_wikis_override_clears_stale_error_when_refresh_is_live(
     }
 
     async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test",
+        transport=ASGITransport(app=app),
+        base_url="http://test",
     ) as client:
         resp = await client.get("/api/v1/wikis")
 
@@ -468,7 +477,8 @@ async def test_list_wikis_override_fires_for_running_incremental_refresh(
     app, mock_management, mock_service = app_with_mocks
 
     wiki_summary = _make_serializable_wiki_summary(
-        status="complete", is_owner=True,
+        status="complete",
+        is_owner=True,
     )
 
     wiki_list = MagicMock()
@@ -481,9 +491,83 @@ async def test_list_wikis_override_fires_for_running_incremental_refresh(
     }
 
     async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test",
+        transport=ASGITransport(app=app),
+        base_url="http://test",
     ) as client:
         resp = await client.get("/api/v1/wikis")
 
     assert resp.json()["wikis"][0]["status"] == "running"
     assert resp.json()["wikis"][0]["progress"] == 0.3
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/wikis — in-memory invocation ownership filter
+# ---------------------------------------------------------------------------
+
+
+def _make_foreign_invocation(wiki_id: str, owner_id: str, status: str = "generating") -> MagicMock:
+    inv = MagicMock()
+    inv.id = f"inv-{wiki_id}"
+    inv.wiki_id = wiki_id
+    inv.repo_url = f"https://github.com/example/{wiki_id}"
+    inv.branch = "main"
+    inv.status = status
+    inv.progress = 0.5
+    inv.error = None
+    inv.pages_completed = 0
+    inv.created_at = datetime(2024, 1, 3)
+    inv.owner_id = owner_id
+    return inv
+
+
+@pytest.mark.asyncio
+async def test_list_wikis_hides_other_users_in_progress_invocations(app_with_mocks):
+    """Invocations owned by other users must not appear in the caller's list."""
+    app, mock_management, mock_service = app_with_mocks
+
+    wiki_list = MagicMock()
+    wiki_list.wikis = []
+    mock_management.list_wikis = AsyncMock(return_value=wiki_list)
+    mock_management.storage.list_artifacts = AsyncMock(return_value=[])
+
+    mock_service.invocations = {
+        "own": _make_foreign_invocation("wiki-own", owner_id="user-1"),
+        "other": _make_foreign_invocation("wiki-other", owner_id="user-2"),
+        "legacy": _make_foreign_invocation("wiki-legacy", owner_id=""),
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/api/v1/wikis")
+
+    returned_ids = {w["wiki_id"] for w in resp.json()["wikis"]}
+    assert "wiki-own" in returned_ids, "caller's own invocation must be included"
+    assert "wiki-legacy" in returned_ids, "legacy unowned invocation must be included"
+    assert "wiki-other" not in returned_ids, "other user's invocation must be excluded"
+
+
+@pytest.mark.asyncio
+async def test_list_wikis_empty_string_user_id_does_not_leak_owned_invocations(app_with_mocks):
+    """user_id normalised to None when user.id is '' so the filter still runs."""
+    app, mock_management, mock_service = app_with_mocks
+
+    # Override the user dependency to return an empty-string id
+    from app.auth import get_current_user
+
+    app.dependency_overrides[get_current_user] = lambda: MagicMock(id="")
+
+    wiki_list = MagicMock()
+    wiki_list.wikis = []
+    mock_management.list_wikis = AsyncMock(return_value=wiki_list)
+    mock_management.storage.list_artifacts = AsyncMock(return_value=[])
+
+    mock_service.invocations = {
+        "other": _make_foreign_invocation("wiki-other", owner_id="user-2"),
+        "legacy": _make_foreign_invocation("wiki-legacy", owner_id=""),
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/api/v1/wikis")
+
+    returned_ids = {w["wiki_id"] for w in resp.json()["wikis"]}
+    assert "wiki-other" not in returned_ids, "owned invocations must not leak when caller has empty user id"
+    assert "wiki-legacy" in returned_ids, "legacy unowned invocations still visible"
