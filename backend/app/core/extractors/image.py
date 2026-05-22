@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from app.core.extractors.protocol import ExtractedDocument
+from app.prompts import load_prompt
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
@@ -35,16 +36,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_DESCRIBE_PROMPT = (
-    "You are indexing this image for a technical documentation wiki. "
-    "Describe what the image contains in detail — visible text, diagrams, "
-    "charts, code snippets, UI elements, architecture, data flow. "
-    "Include any text you can read verbatim. Aim for a complete textual "
-    "representation that a search engine can match against natural-"
-    "language queries. Do not add commentary about the image's quality "
-    "or style; describe content only. If the image is blank or contains "
-    "no useful content, respond with exactly: EMPTY_IMAGE."
-)
+_DESCRIBE_PROMPT: str = load_prompt("extractors/image_describe.md")
 
 
 _MIME_BY_SUFFIX = {

@@ -21,6 +21,7 @@ from typing import Any
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.prompts import load_prompt
 from app.services.llm_factory import is_bedrock_llm, make_cached_system_message
 
 from .repository_analysis_store import (
@@ -65,113 +66,14 @@ class AskResponse:
 
 
 # System prompt for query optimization (uses repository context like wiki structure generation)
-QUERY_OPTIMIZATION_SYSTEM_PROMPT = """You are a search query optimizer for code repositories.
-
-Your task is to transform user questions into optimized retrieval queries that will find the most relevant code and documentation in a vector store.
-
-**QUERY OPTIMIZATION STRATEGY:**
-- Identify key technical terms, component names, and concepts from the repository context
-- Include specific file names, folder paths, and symbol names when relevant
-- Combine topic keywords with implementation-specific terms
-- Add related functionality and patterns that may appear in code
-- Use both high-level concepts and low-level implementation details
-
-**OUTPUT FORMAT:**
-Return ONLY the optimized search query - a space-separated list of relevant terms.
-Do NOT include explanations, quotes, or any other text."""
-
-QUERY_OPTIMIZATION_USER_PROMPT = """## Repository Context
-{repository_context}
-
-## User Question
-"{question}"
-
-**TASK:** Generate an optimized retrieval query that will find the most relevant code and documentation.
-
-**QUERY OPTIMIZATION EXAMPLE:**
-For a question about "How does authentication work?":
-Generated Query: "authentication login logout session token JWT user validation security middleware auth_manager password hashing access control authorization user_service security_config"
-
-This query combines topic keywords with file-specific terms and related functionality.
-
-**Return ONLY the optimized query (space-separated terms), nothing else:**"""
-
+QUERY_OPTIMIZATION_SYSTEM_PROMPT: str = load_prompt("ask/query_optimization_system.md")
+QUERY_OPTIMIZATION_USER_PROMPT: str = load_prompt("ask/query_optimization_user.md")
 
 # System prompt for answer generation with natural code citations
-ANSWER_SYSTEM_PROMPT = """You are a helpful assistant answering questions about a code repository.
-
-You have access to the repository's documentation, code, and architecture analysis.
-Use the provided context to answer questions accurately and comprehensively.
-
-## CITATION STYLE (NATURAL FILE REFERENCES)
-
-**Reference code naturally by file path and symbol name - do NOT use [N] numeric citations.**
-
-### In Prose:
-- "The `authenticate()` function in `auth/auth_manager.py` handles token validation"
-- "Session management is implemented via `SessionStore` class in `services/session.py`"
-- "The configuration is loaded from `config/settings.py`"
-
-### In Code Blocks:
-Always include the file path as a comment header:
-```python
-# auth/auth_manager.py
-def authenticate(token: str) -> bool:
-    ...
-```
-
-### Multiple File References:
-- "The authentication flow spans `auth/login.py` → `auth/auth_manager.py` → `services/session.py`"
-- "Both `UserModel` in `models/user.py` and `UserService` in `services/user.py` are involved"
-
-## RESPONSE GUIDELINES
-
-1. **Be Accurate**: Only state facts supported by the provided context
-2. **Be Specific**: Reference actual file paths, function names, and class names naturally in text
-3. **Be Structured**: Use headers, bullet points, and code blocks for clarity
-4. **Acknowledge Gaps**: If context is insufficient, say so clearly
-5. **Show Code**: Include relevant code snippets with file path headers
-
-## FORMAT
-
-Use clear markdown:
-- Headers (##) for major sections
-- Code blocks with language tags and file path comments
-- Bullet points for lists
-- `backticks` for inline code/file references
-- Natural file path mentions (not [N] citations)
-
-## SOURCES SUMMARY
-
-At the end of your response, include a brief summary:
----
-**📁 Files Referenced:**
-- `path/to/file.py` — Brief description of what was used from this file
-"""
+ANSWER_SYSTEM_PROMPT: str = load_prompt("ask/answer_system.md")
 
 
-ANSWER_USER_PROMPT = """## Retrieved Code Context
-
-{context}
-
-## Available Sources
-{sources_reference}
-
-## User Question
-
-{question}
-
----
-
-**INSTRUCTIONS:**
-1. Answer the question comprehensively based on the code context above
-2. Reference files naturally by path (e.g., "in `path/to/file.py`") - do NOT use [N] citations
-3. Include relevant code snippets with file path headers as comments
-4. Reference specific symbol names (classes, functions, methods)
-5. End with a "📁 Files Referenced" summary
-6. If the context doesn't contain enough information, state this clearly
-
-**Provide your answer:**"""
+ANSWER_USER_PROMPT: str = load_prompt("ask/answer_user.md")
 
 
 class AskTool:

@@ -4,6 +4,8 @@ Enhanced Wiki Toolkit Prompts for Enterprise-Grade Documentation
 Updated prompts for creating comprehensive, diagram-rich, location-aware documentation.
 """
 
+from app.prompts import load_prompt as _load_prompt
+
 # Enhanced Creative Content Generation Prompt with Technical Excellence
 ENHANCED_CONTENT_GENERATION_PROMPT = """
 You are an expert technical writer and architect known for creating exceptionally clear, scannable, and engaging documentation. Your hallmark is **structural variety**; you masterfully break down complex topics to prevent "walls of text" and guide the reader's eye, exercising creative freedom through thoughtful organization.
@@ -3853,3 +3855,16 @@ Before finishing, verify:
 - [ ] Code citations included for all referenced files
 - [ ] Content serves both technical and non-technical audiences
 """
+
+# ── Override actively-used prompts with MD-file-backed versions ───────────────
+# The inline definitions above are kept for historical reference and any callers
+# that import the old variant names. The four constants imported by
+# wiki_graph_optimized.py are now loaded from MD files so prompt text has a
+# single source of truth.
+
+ENHANCED_CONTENT_GENERATION_PROMPT_V3_TONE_ADJUSTED = _load_prompt(
+    "wiki/content_generation_v3_tone.md"
+)
+STRUCTURED_REPO_ANALYSIS_PROMPT = _load_prompt("wiki/repo_analysis_structured.md")
+ENHANCED_REPO_ANALYSIS_PROMPT = _load_prompt("wiki/repo_analysis_enhanced.md")
+ENHANCED_WIKI_STRUCTURE_PROMPT = _load_prompt("wiki/wiki_structure.md")

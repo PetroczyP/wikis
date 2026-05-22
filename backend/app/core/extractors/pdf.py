@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 from app.core.extractors.image import _extract_text, _token_usage
 from app.core.extractors.protocol import ExtractedDocument
+from app.prompts import load_prompt
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
@@ -36,15 +37,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_PER_PAGE_PROMPT = (
-    "You are indexing this page of a PDF for a technical documentation "
-    "wiki. Describe everything on the page in detail — body text "
-    "verbatim where readable, tables row by row, diagrams, charts, "
-    "figures, code blocks, footnotes. Preserve the document's logical "
-    "structure (headings, lists, table rows) using markdown. Do not "
-    "add commentary about the page's quality or style. If the page is "
-    "blank, respond with exactly: BLANK_PAGE."
-)
+_PER_PAGE_PROMPT: str = load_prompt("extractors/pdf_page_describe.md")
 
 
 # pypdfium2 returns pixels per inch via a scale factor; 2.0 gives ~144 DPI

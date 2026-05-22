@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
 
+from app.prompts import load_prompt
+
 logger = logging.getLogger(__name__)
 
 # Maximum number of pages whose markdown is read in Step 1
@@ -27,40 +29,7 @@ _MAX_PAGES_TO_READ = 5
 # Maximum characters of markdown per page (context budget)
 _MAX_CHARS_PER_PAGE = 2000
 
-_OVERVIEW_SYSTEM_PROMPT = """\
-You are a technical writer creating a concise, engaging repository overview page for a software wiki.
-
-You will be given:
-1. An architectural analysis of the codebase (background context).
-2. Excerpts from up to {max_pages} generated wiki pages (the actual content).
-
-Your task: synthesise this into a well-structured overview page with ALL of the following sections:
-
-## Purpose
-What does this software do? What problem does it solve? (2-3 sentences)
-
-## How It Works
-Step-by-step narrative of the main data flow or request lifecycle. (3-5 sentences)
-
-## Key Capabilities
-Bullet list of 5-8 key features or capabilities.
-
-## Architecture
-Brief description of the main components and how they relate. (3-5 sentences)
-
-## Getting Started
-Pointers to the most important wiki pages for a new engineer.
-Use [[Page Title]] wikilinks (e.g. [[Authentication]], [[API Reference]]).
-
-## Wiki Pages
-List every page as a wikilink bullet with a one-sentence description.
-Format: - [[Page Title]] — description
-
-Rules:
-- Do NOT fabricate claims about the codebase.
-- Be concise. Aim for 500-800 words total.
-- Output raw markdown only — no code fences, no preamble.
-"""
+_OVERVIEW_SYSTEM_PROMPT_TEMPLATE = load_prompt("repo/overview_system.md")
 
 
 def _get_page_attr(page: Any, attr: str, default: str = "") -> str:
@@ -173,7 +142,7 @@ def generate_repo_overview(
         for p in pages
     )
 
-    system_prompt = _OVERVIEW_SYSTEM_PROMPT.format(max_pages=_MAX_PAGES_TO_READ)
+    system_prompt = _OVERVIEW_SYSTEM_PROMPT_TEMPLATE.format(max_pages=_MAX_PAGES_TO_READ)
 
     # Prepend the architectural analysis to the system prompt for caching.
     if repo_analysis:

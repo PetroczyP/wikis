@@ -928,6 +928,21 @@ class WikiService:
         invocation.pages_total = len(generated_pages)
         invocation.pages_completed = 0
 
+        # Snapshot existing wiki_pages/*.md artifact keys BEFORE any uploads
+        # so we can remove stale ones after the new generation is fully written.
+        # Must happen before any writes so the set reflects the prior state only.
+        try:
+            existing_artifacts = await self.storage.list_artifacts(
+                "wiki_artifacts", prefix=invocation.wiki_id
+            )
+            existing_wiki_page_files: set[str] = {
+                a for a in existing_artifacts
+                if a.endswith(".md") and "wiki_pages" in a
+            }
+        except Exception as _e:
+            logger.warning("Could not list existing artifacts for stale cleanup: %s", _e)
+            existing_wiki_page_files = set()
+
         for page_id, content in generated_pages.items():
             try:
                 data = content.encode("utf-8") if isinstance(content, str) else content
@@ -946,14 +961,35 @@ class WikiService:
             except Exception as e:
                 logger.warning("Failed to index pages for FTS: %s", e)
 
-        # Store export artifacts (index, summary, etc.)
+        # Store export artifacts (index, summary, etc.).  The ArtifactExporter
+        # produces the wiki_pages/*.md files that the viewer actually reads; collect
+        # their keys so we know which files the new generation owns.
         artifacts = result.get("artifacts", [])
+        new_wiki_page_keys: set[str] = set()
         for artifact in artifacts:
             name = artifact.get("name", "unknown")
             data = artifact.get("data", b"")
             if isinstance(data, str):
                 data = data.encode("utf-8")
-            await self.storage.upload("wiki_artifacts", f"{invocation.wiki_id}/{name}", data)
+            key = f"{invocation.wiki_id}/{name}"
+            await self.storage.upload("wiki_artifacts", key, data)
+            if name.endswith(".md") and "wiki_pages" in name:
+                new_wiki_page_keys.add(key)
+
+        # Remove stale wiki_pages/*.md files — only AFTER all new files are
+        # safely written, so users never see a partially-updated wiki.
+        if existing_wiki_page_files and new_wiki_page_keys:
+            stale_page_files = existing_wiki_page_files - new_wiki_page_keys
+            for stale in stale_page_files:
+                try:
+                    await self.storage.delete("wiki_artifacts", stale)
+                except Exception as _e:
+                    logger.debug("Could not delete stale page file %r: %s", stale, _e)
+            if stale_page_files:
+                logger.info(
+                    "[WIKI] Removed %d stale page file(s) for wiki %s",
+                    len(stale_page_files), invocation.wiki_id,
+                )
 
         page_count = invocation.pages_completed
         if self.wiki_management and request is not None:

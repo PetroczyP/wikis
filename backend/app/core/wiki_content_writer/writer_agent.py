@@ -37,6 +37,9 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from app.core.agent_tools import WIKI_TOOL_SCHEMAS as _WRITER_TOOL_SCHEMAS
 from app.services.llm_factory import is_bedrock_llm, make_cached_system_message, safe_bind_tools
 
+from app.prompts import load_prompt
+
+from .diagram_generator import DiagramGenerator
 from .prompts import CITATION_FORMAT_DESCRIPTION, CITATION_PROMPT_RULES
 from .source_gate import ToolCall
 from .writer_tools import WriterTools
@@ -118,142 +121,30 @@ def compute_page_budget(
 # System prompt prefix — matches the role-detection prefix in integration tests.
 _SYSTEM_PROMPT_PREFIX = "You are a technical documentation writer."
 
-_SYSTEM_PROMPT_TEMPLATE = """{prefix}
+_SYSTEM_PROMPT_TEMPLATE = load_prompt("writer/system.md")
+_USER_PROMPT_TEMPLATE = load_prompt("writer/user_template.md")
 
-Your job is to write a detailed, accurate wiki page in Markdown based on the
-page specification and your tool results.
 
-## Citation contract
+def _extract_llm_text(response: Any) -> str:
+    """Extract plain text from an LLM response regardless of provider format.
 
-{format_description}
-
-Rules:
-{rules}
-
-### Why citations matter
-
-The citation verifier checks every paragraph against the actual source code.
-A paragraph with no citation is treated as ungrounded prose and is discarded
-entirely — it will not appear in the final wiki page. A citation pointing to a
-line range that does not exist in the repository is also discarded. Only
-paragraphs with citations that match real, readable code survive into the
-final output. This means: if you write a sentence without a citation, it will
-be silently removed. If you cite a line range that you did not actually read
-with read_file, the verifier may reject it. The only safe approach is to call
-read_file, observe the line numbers in the returned content, and then cite
-those exact lines. Never guess a line number. Never cite a file you did not
-open with read_file or confirm with get_signature.
-
-### Citation rule details
-
-Rule 1 — Every claim needs a citation. The consequence of omitting a citation
-is that the whole paragraph is stripped. Write claims in the form:
-"The scheduler uses a one-second poll interval [src/scheduler.py:88]."
-Append the citation token immediately after the claim, before the sentence's
-closing punctuation. Do not move it to the end of the paragraph if the
-paragraph covers multiple files — cite each claim individually.
-
-Rule 2 — README content must be verified. If you intend to reference something
-described in a README, you must call read_file on the README first and cite
-the specific lines. Paraphrasing README text without a matching citation is
-treated as an uncited claim and will be stripped.
-
-Rule 3 — Identifiers must appear in your tool trace. Do not name a function,
-class, or environment variable that did not appear in the output of read_file,
-get_signature, get_callers, get_callees, grep, or list_doc_chunks. If you are
-uncertain whether a symbol exists, call get_signature or grep before writing
-about it. Mentioning a non-existent symbol causes the paragraph to be flagged
-and may cause the entire page to fail verification.
-
-## Available tools
-
-**read_file(path, start_line?, end_line?)** — Read lines from a repo-relative file.
-Returns: numbered lines in the form `<N>: <line_content>` (one per line).
-  Example: `47: class JobQueue:\\n48:     def __init__(self, max_size: int = 1000):`
-Use: read files containing the symbols in target_symbols. The line numbers
-in the output are the exact numbers to use in citations: read line 47 → cite
-[path:47] or [path:47-48] for a range.
-Error: `[error] ...` — try a different path or call get_signature first.
-
-**get_signature(symbol)** — Look up a symbol's definition location and signature.
-Returns: `file_path: signature (layer)\\ndocstring`
-  Example: `src/workers/queue.py: class JobQueue (infrastructure)\\nAsyncIO job queue.`
-Use: confirm a class or function exists and find its file path before calling
-read_file. Does NOT return line numbers — use read_file after get_signature
-to get the exact lines for citations.
-Not found: `[not found] symbol` — do not mention this symbol in the page.
-
-**grep(pattern)** — Full-text search across source files.
-Returns: `file_path:line_number: line_text` (up to 20 matches)
-Use: find where a concept or identifier is used across the codebase. Use grep
-to locate configuration values, string literals, or identifiers you know exist
-but whose file path you are unsure of.
-No matches: `[no matches]` — the pattern does not appear in source files.
-
-**get_callers(symbol)** — List symbols that call the given symbol.
-Returns: `file_path: symbol_name` per caller
-Use: document who uses a function or class (integration context). Useful for
-writing the "used by" section of a public API page. Shows the call graph from
-the perspective of dependents.
-
-**get_callees(symbol)** — List symbols the given symbol calls.
-Returns: `file_path: symbol_name` per callee
-Use: document what a function or class depends on (dependency chain). Useful
-for showing what a component orchestrates or delegates to.
-
-**list_doc_chunks(doc_path)** — Return documentation sections for a doc file.
-Returns: `[N] heading\\ntext` per chunk
-Use: incorporate doc context into pages that cover documented modules. Prefer
-this over read_file when you need the logical structure of a markdown document
-rather than raw line content.
-
-## Citation examples
-
-Good — claim immediately followed by a bracketed citation token:
-  "The worker polls with a 1-second timeout [src/workers/worker.py:62-63]."
-  "Default queue size is 1000 items [src/workers/queue.py:57]."
-  "Startup recovery loads pending jobs [src/workers/queue.py:121-133]."
-  "Config is read from environment [config.py:5-12] and merged with file
-  defaults [config.py:40-48]."
-
-Bad — NEVER write these (they are discarded by the verifier):
-  "The worker polls with a 1-second timeout." ← no citation, discarded
-  "See worker.py for the timeout logic." ← path in prose not in brackets, discarded
-  "The worker polls (worker.py:62)." ← parens not brackets, citation not parsed
-  "The queue has configurable size [queue.py:57]." ← missing src/ prefix,
-    may not resolve to a real path — always use the exact path from read_file
-  "The scheduler module handles retries." ← whole paragraph with no citation,
-    discarded in full regardless of how accurate the claim is
-
-## Budget guidance
-
-You have a finite number of tool calls available for this page. Use them to
-read the files and symbols listed in the page spec before writing. Prioritise
-reading symbols from target_symbols first, then explore related callers or
-callees if the budget allows. Once you have read enough to ground every claim,
-write the complete page. Do not call tools after you have started writing.
-
-IMPORTANT: every substantive paragraph MUST end with at least one citation in
-the format shown above. A paragraph with no citation will be stripped by the
-verifier. Start by calling tools to read the relevant files, then write the
-page with inline citations after every claim.
-"""
-
-_USER_PROMPT_TEMPLATE = """\
-## Page to write
-
-**Title:** {title}
-**Description:** {description}
-**Retrieval query:** {retrieval_query}
-
-**Target symbols:** {symbols}
-**Target folders:** {folders}
-**Target docs:** {docs}
-
-First, read the most relevant files from target symbols / folders using the
-available tools.  Then write the complete wiki page in Markdown with inline
-`[path:N]` or `[path:lo-hi]` citations after every claim.
-"""
+    Anthropic/Bedrock returns ``response.content`` as a list of content blocks
+    (``[{'type': 'text', 'text': '...'}, {'type': 'tool_use', ...}]``).
+    Other providers return a plain string.  This helper normalises both.
+    """
+    content = response.content if hasattr(response, "content") else str(response)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+            elif hasattr(block, "type") and getattr(block, "type", None) == "text":
+                parts.append(getattr(block, "text", ""))
+        return "\n".join(parts)
+    return str(content)
 
 
 class WikiContentWriter:
@@ -465,17 +356,10 @@ class WikiContentWriter:
             # Budget exhausted without a final write — explicitly instruct the
             # LLM to write the page and cite every claim using the file paths
             # and line numbers already in the message history (#313).
-            messages.append(HumanMessage(content=(
-                "You have used all available tool calls. Based on the evidence "
-                "you gathered, write the complete wiki page in Markdown now.\n\n"
-                "IMPORTANT: cite every claim using the file path and line numbers "
-                "from your tool results. Format: [path/to/file.py:N] or "
-                "[path/to/file.py:lo-hi]. A paragraph without a citation will be "
-                "discarded. Do NOT call any more tools."
-            )))
+            messages.append(HumanMessage(content=load_prompt("writer/budget_exhausted.md")))
             try:
                 response = effective_llm.invoke(messages)
-                final_content = response.content if isinstance(response.content, str) else str(response.content)
+                final_content = _extract_llm_text(response)
                 # If LLM still returned tool_calls (stubborn), ignore and fall back.
                 final_tool_calls = getattr(response, "tool_calls", None) or []
                 if final_content and not final_tool_calls:
@@ -670,13 +554,7 @@ class WikiContentWriter:
 
                 if tool_calls_made >= self._CHAPTER_INDEX_BUDGET:
                     # Budget exhausted — force final write.
-                    messages.append(HumanMessage(content=(
-                        "You have used all available tool calls. Based on the "
-                        "evidence you gathered, write the complete chapter index "
-                        "in Markdown now. Follow the structure exactly: "
-                        "## Overview, ## Key Components, ## Sub-pages. "
-                        "Do NOT call any more tools."
-                    )))
+                    messages.append(HumanMessage(content=load_prompt("writer/chapter_index_budget_exhausted.md")))
                     response = llm_with_tools.invoke(messages)
                     final_tc = getattr(response, "tool_calls", None) or []
                     if not final_tc:
@@ -833,6 +711,25 @@ class WikiContentWriter:
             ),
         )
 
+        # ── 4. Inject cluster diagrams into the chapter index ─────────
+        # Collect file paths from evidence so _inject can bypass the
+        # skeleton cluster_id → DB macro_cluster mismatch.
+        _evidence_paths: list[str] = []
+        for _sl in evidence_slices:
+            _evidence_paths.extend(getattr(_sl, "file_paths", []))
+
+        # Run in executor: _inject_cluster_diagrams does sync disk IO and LLM
+        # calls that would block the event loop if called directly.
+        chapter_index_md = await loop.run_in_executor(
+            None,
+            lambda: self._inject_cluster_diagrams(
+                chapter_index_md,
+                chapter_spec.cluster_id,
+                chapter_spec.chapter_title,
+                file_hints=_evidence_paths,
+            ),
+        )
+
         logger.info(
             "[WRITER] generate_chapter done: title=%r subpages=%d index_chars=%d",
             chapter_spec.chapter_title,
@@ -840,6 +737,494 @@ class WikiContentWriter:
             len(chapter_index_md),
         )
         return chapter_index_md, subpage_mds
+
+    def _inject_cluster_diagrams(
+        self,
+        chapter_index_md: str,
+        cluster_id: int,
+        chapter_title: str,
+        file_hints: "list[str] | None" = None,
+    ) -> str:
+        """Inject Mermaid diagrams into a chapter _index.md using agentic file reading.
+
+        Flow:
+        1. Deterministic architecture diagram from graph (no LLM needed).
+        2. LLM-based class diagram from actual source files.
+        3. LLM-based data model diagram from actual source files.
+
+        *file_hints* are relative paths from evidence slices — used to resolve
+        the correct DB ``macro_cluster`` when skeleton cluster_ids diverge from
+        stored ``macro_cluster`` values (they use different numbering systems).
+
+        Sections are injected before ``## Key Components`` (or ``## Sub-pages``
+        when Key Components is absent).  Returns original markdown unchanged
+        when no diagrams are generated or on any error.
+        """
+        storage = self.tools.storage
+        if storage is None:
+            return chapter_index_md
+
+        try:
+            effective_llm = self.llm_client
+            sections: list[str] = []
+
+            db_cluster_id = self._resolve_db_cluster(cluster_id, storage, file_hints)
+            logger.debug("[DIAGRAMS] cluster_id=%s → db_cluster_id=%s title=%r", cluster_id, db_cluster_id, chapter_title)
+
+            # All three diagrams are generated by an agentic loop: the LLM
+            # sees the available files and reads whichever it needs before
+            # outputting each diagram type.
+            if effective_llm is not None:
+                available_files = self._list_cluster_files(
+                    db_cluster_id, storage, file_hints=file_hints
+                )
+                if available_files:
+                    arch = self._agentic_diagram(
+                        available_files, chapter_title, "architecture"
+                    )
+                    if arch:
+                        sections.append(f"## Architecture\n\n{arch}")
+
+                    class_diag = self._agentic_diagram(
+                        available_files, chapter_title, "class"
+                    )
+                    if class_diag:
+                        sections.append(f"## Class Structure\n\n{class_diag}")
+
+                    data_diag = self._agentic_diagram(
+                        available_files, chapter_title, "datamodel"
+                    )
+                    if data_diag:
+                        sections.append(f"## Data Model\n\n{data_diag}")
+
+            if not sections:
+                return chapter_index_md
+
+            injected = "\n\n".join(sections)
+            for marker in ("## Key Components", "## Sub-pages"):
+                pos = chapter_index_md.find(marker)
+                if pos >= 0:
+                    return (
+                        chapter_index_md[:pos].rstrip()
+                        + f"\n\n{injected}\n\n"
+                        + chapter_index_md[pos:]
+                    )
+            return chapter_index_md.rstrip() + f"\n\n{injected}"
+
+        except Exception as exc:
+            logger.debug("[WRITER] _inject_cluster_diagrams failed: %s", exc)
+            return chapter_index_md
+
+    def _resolve_db_cluster(
+        self,
+        cluster_id: int,
+        storage: Any,
+        file_hints: "list[str] | None",
+    ) -> int:
+        """Return the DB macro_cluster value that corresponds to this chapter.
+
+        Skeleton cluster_ids (assigned 1-based by enumerate in structure_skeleton.py)
+        differ from the 0-based macro_cluster values stored in the DB by the
+        Leiden clustering step.  Probe using file_hints paths — the first node
+        found for any hint path gives the true macro_cluster.  Falls back to
+        cluster_id unchanged when probing fails or hints are absent.
+        """
+        if not file_hints or storage is None:
+            return cluster_id
+        try:
+            from collections import Counter  # noqa: PLC0415
+            hint_set = set(file_hints[:8])
+            votes: Counter = Counter()
+            # Query by directory but only count nodes whose rel_path is one of
+            # the exact hint paths — avoids sibling subdirectory contamination.
+            seen_dirs: set[str] = set()
+            for path in file_hints[:8]:
+                dir_prefix = path.rsplit("/", 1)[0] if "/" in path else path
+                if dir_prefix in seen_dirs:
+                    continue
+                seen_dirs.add(dir_prefix)
+                try:
+                    nodes = storage.get_nodes_by_path_prefix(dir_prefix, limit=200)
+                except Exception:
+                    continue
+                for n in nodes:
+                    if n.get("rel_path") in hint_set:
+                        mc = n.get("macro_cluster")
+                        if mc is not None:
+                            votes[int(mc)] += 1
+            if votes:
+                return votes.most_common(1)[0][0]
+        except Exception as exc:
+            logger.debug("[DIAGRAMS] _resolve_db_cluster failed: %s", exc)
+        return cluster_id
+
+    def _gather_cluster_source(
+        self,
+        cluster_id: int,
+        storage: Any,
+        max_files: int = 5,
+        chars_per_file: int = 3000,
+        file_hints: "list[str] | None" = None,
+    ) -> str:
+        """Read source files for cluster_id; return concatenated content for LLM context.
+
+        Prefers *file_hints* (paths from evidence slices) over a DB cluster
+        lookup, since skeleton cluster_ids don't always match DB macro_cluster
+        values.  Falls back to cluster node query when hints are absent or
+        produce no readable files.
+        """
+        _DOC_TYPES = {
+            "config_document", "markdown_document", "toml_document",
+            "module_doc", "file_doc", "rst_document", "html_document",
+            "asciidoc_document",
+        }
+
+        def _read_paths(paths: list[str]) -> list[str]:
+            parts: list[str] = []
+            for path in paths[:max_files]:
+                try:
+                    fc = self.tools.read_file(path)
+                    if fc.error or not fc.lines:
+                        continue
+                    content = "\n".join(fc.lines)[:chars_per_file]
+                    parts.append(f"=== {path} ===\n{content}")
+                except Exception:
+                    continue
+            return parts
+
+        # Primary: use evidence file paths directly (avoids cluster_id mismatch).
+        if file_hints:
+            unique_hints = list(dict.fromkeys(p for p in file_hints if p))
+            parts = _read_paths(unique_hints)
+            if parts:
+                return "\n\n".join(parts)
+
+        # Fallback: query DB by cluster_id.
+        try:
+            nodes = storage.get_nodes_by_cluster(cluster_id) if storage else []
+        except Exception:
+            nodes = []
+
+        code_nodes = [n for n in nodes if n.get("symbol_type") not in _DOC_TYPES]
+        path_scores: dict[str, int] = {}
+        for n in code_nodes:
+            p = n.get("rel_path", "")
+            if p:
+                path_scores[p] = path_scores.get(p, 0) + (1 if n.get("is_architectural") else 0)
+
+        sorted_paths = sorted(path_scores, key=lambda p: path_scores[p], reverse=True)
+        return "\n\n".join(_read_paths(sorted_paths))
+
+    def _list_cluster_files(
+        self,
+        db_cluster_id: int,
+        storage: Any,
+        file_hints: "list[str] | None" = None,
+    ) -> list[str]:
+        """Return deduplicated source file paths for this cluster.
+
+        Prefers file_hints (from evidence slices) because they represent
+        exactly what the planner considered relevant.  Falls back to querying
+        the DB by macro_cluster and scoring by architectural node count.
+        """
+        _DOC_TYPES = {
+            "config_document", "markdown_document", "toml_document",
+            "module_doc", "file_doc", "rst_document", "html_document",
+            "asciidoc_document",
+        }
+
+        # Primary: evidence paths are already the right files.
+        if file_hints:
+            unique = list(dict.fromkeys(p for p in file_hints if p))
+            if unique:
+                return unique
+
+        # Fallback: query DB.
+        try:
+            nodes = storage.get_nodes_by_cluster(db_cluster_id) if storage else []
+        except Exception:
+            return []
+        code_nodes = [n for n in nodes if n.get("symbol_type") not in _DOC_TYPES]
+        scores: dict[str, int] = {}
+        for n in code_nodes:
+            p = n.get("rel_path", "")
+            if p:
+                scores[p] = scores.get(p, 0) + (1 if n.get("is_architectural") else 0)
+        return sorted(scores, key=lambda p: scores[p], reverse=True)
+
+    _DIAGRAM_BUDGET = 6  # max tool calls the LLM may make to read files
+
+    _DIAGRAM_PROMPT_FILES: dict[str, str] = {
+        "architecture": "diagrams/architecture.md",
+        "class":        "diagrams/class_structure.md",
+        "datamodel":    "diagrams/data_model.md",
+    }
+
+    _DIAGRAM_EXPECTED_HEADER: dict[str, tuple[str, ...]] = {
+        "architecture": ("stateDiagram",),  # stateDiagram-v2 for functional flows
+        "class": ("classDiagram",),
+        "datamodel": ("erDiagram",),
+    }
+
+    def _agentic_diagram(
+        self,
+        available_files: list[str],
+        chapter_title: str,
+        diagram_type: str,
+    ) -> str:
+        """Run a tool-augmented loop to generate one Mermaid diagram.
+
+        The LLM receives the list of available source files and calls
+        ``read_file`` on whichever it needs (budget: _DIAGRAM_BUDGET calls).
+        After reading it outputs the diagram.  Returns '' on failure/EMPTY.
+        """
+        if self.llm_client is None:
+            return ""
+
+        from langchain_core.messages import (  # noqa: PLC0415
+            HumanMessage as _HM, SystemMessage as _SM, ToolMessage as _TM,
+        )
+        import re as _re  # noqa: PLC0415
+        from .diagram_generator import _validate_mermaid  # noqa: PLC0415
+
+        from app.prompts import load_prompt  # noqa: PLC0415
+        prompt_file = self._DIAGRAM_PROMPT_FILES.get(diagram_type, "")
+        system_prompt = load_prompt(prompt_file) if prompt_file else ""
+        expected_headers = self._DIAGRAM_EXPECTED_HEADER.get(diagram_type, ())
+
+        file_list = "\n".join(f"- {p}" for p in available_files)
+        user_msg = (
+            f"Chapter: {chapter_title}\n\n"
+            f"Available source files:\n{file_list}\n\n"
+            "Read the files you need and then output the diagram."
+        )
+
+        try:
+            llm_with_tools = safe_bind_tools(self.llm_client, _WRITER_TOOL_SCHEMAS)
+            messages: list[Any] = [
+                _SM(content=system_prompt),
+                _HM(content=user_msg),
+            ]
+
+            for _round in range(self._DIAGRAM_BUDGET + 1):
+                response = llm_with_tools.invoke(messages)
+                tool_calls = getattr(response, "tool_calls", None) or []
+
+                if not tool_calls:
+                    # No more tool calls — extract the diagram from the response.
+                    text = _extract_llm_text(response)
+                    if not text or text.strip() == "EMPTY":
+                        return ""
+                    m = _re.search(r"```mermaid\n.*?```", text, _re.DOTALL)
+                    if not m:
+                        return ""
+                    candidate = m.group(0)
+                    ok, _ = _validate_mermaid(candidate)
+                    if not ok:
+                        return ""
+                    second_line = candidate.splitlines()[1] if len(candidate.splitlines()) > 1 else ""
+                    if not any(h in second_line for h in expected_headers):
+                        return ""
+                    return candidate
+
+                if _round >= self._DIAGRAM_BUDGET:
+                    # Budget exhausted — force output now.
+                    messages.append(response)
+                    messages.append(_HM(content=(
+                        "Budget reached. Output the diagram now based on what you have read. "
+                        "Do not call any more tools."
+                    )))
+                    continue
+
+                # Execute tool calls.
+                messages.append(response)
+                for tc in tool_calls:
+                    tc_name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+                    tc_args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+                    tc_id = tc.get("id", str(_round)) if isinstance(tc, dict) else getattr(tc, "id", str(_round))
+                    if isinstance(tc_args, str):
+                        try:
+                            import json as _json; tc_args = _json.loads(tc_args)  # noqa: PLC0415,E702
+                        except Exception:
+                            tc_args = {}
+                    result = self._dispatch_tool(tc_name, tc_args)
+                    messages.append(_TM(content=result, tool_call_id=tc_id, name=tc_name))
+
+        except Exception as exc:
+            logger.debug("[WRITER] _agentic_diagram(%s) failed: %s", diagram_type, exc)
+
+        return ""
+
+    def _diagram_llm_invoke(self, prompt: str) -> str:
+        """Invoke the LLM for diagram generation with tool calls suppressed.
+
+        The writer's llm_client has WIKI_TOOL_SCHEMAS pre-bound so the model
+        tends to call read_file instead of generating.  This helper:
+        1. Tries to bind tool_choice='none' (Anthropic/OpenAI) to stop tool calls.
+        2. Prepends a SystemMessage to reinforce the no-tools constraint.
+        3. Falls back to a plain invoke if binding fails.
+        """
+        from langchain_core.messages import HumanMessage as _HM, SystemMessage as _SM  # noqa: PLC0415
+
+        system_msg = _SM(content=(
+            "You are a diagram generator. Output ONLY the requested Mermaid code block. "
+            "Do not call any tools or functions. Do not request to read any files. "
+            "Use only the source code provided in the user message."
+        ))
+        user_msg = _HM(content=prompt)
+
+        # Try to suppress tool calls at the API level.
+        llm = self.llm_client
+        try:
+            llm = llm.bind(tool_choice="none")
+        except Exception:
+            pass
+
+        response = llm.invoke([system_msg, user_msg])
+        return _extract_llm_text(response)
+
+    def _llm_architecture_diagram(self, source_ctx: str, chapter_title: str) -> str:
+        """Generate a Mermaid flowchart showing the architectural structure of this cluster.
+
+        The LLM reads the source code and identifies meaningful components
+        (services, handlers, repositories, clients, queues — not individual
+        data fields or response model classes) and their relationships.
+        Returns a validated fenced graph TD block, or '' on failure / empty output.
+        """
+        if self.llm_client is None:
+            return ""
+
+        prompt = (
+            "The source code below is complete. Read it directly — do NOT call any tools "
+            "or request additional files. Generate a Mermaid architecture diagram.\n\n"
+            "Rules:\n"
+            "- Show 4-8 meaningful architectural components: services, handlers, "
+            "repositories, clients, queues, workers, routers\n"
+            "- DO NOT include: individual response/request models, data classes, "
+            "enums, constants, or utility functions\n"
+            "- Label each edge with the relationship: calls, reads, writes, publishes, "
+            "subscribes, manages, depends on\n"
+            "- Use graph TD (top-down) layout\n"
+            "- If the code has no meaningful architectural components (e.g. it is purely "
+            "data models or utilities), return the string \"EMPTY\"\n"
+            "- Return ONLY the ```mermaid\\ngraph TD\\n...``` block or the string \"EMPTY\"\n\n"
+            f"Chapter: {chapter_title}\n\n"
+            f"Source code:\n{source_ctx}"
+        )
+
+        try:
+            text = self._diagram_llm_invoke(prompt)
+            if not text or text.strip() == "EMPTY":
+                return ""
+            import re as _re  # noqa: PLC0415
+            m = _re.search(r"```mermaid\n.*?```", text, _re.DOTALL)
+            if not m:
+                return ""
+            from .diagram_generator import _validate_mermaid  # noqa: PLC0415
+            candidate = m.group(0)
+            ok, _ = _validate_mermaid(candidate)
+            # Accept graph or flowchart headers only — reject classDiagram/erDiagram.
+            second_line = candidate.splitlines()[1] if len(candidate.splitlines()) > 1 else ""
+            if ok and not any(kw in second_line for kw in ("graph", "flowchart")):
+                return ""
+            return candidate if ok else ""
+        except Exception as exc:
+            logger.debug("[WRITER] _llm_architecture_diagram failed: %s", exc)
+            return ""
+
+    def _llm_class_diagram(self, source_ctx: str, chapter_title: str) -> str:
+        """Use LLM to generate a Mermaid classDiagram from source code context.
+
+        Returns a validated fenced classDiagram block, or '' on failure / empty output.
+        """
+        if self.llm_client is None:
+            return ""
+
+        prompt = (
+            "The source code below is complete. Read it directly — do NOT call any tools "
+            "or request additional files. Generate a Mermaid classDiagram immediately.\n\n"
+            "Rules:\n"
+            "- Include all significant classes, interfaces, abstract classes, enums, and structs\n"
+            "- Show class members: +publicMethod(param: type): returnType, -_privateField, #protected\n"
+            "- Show inheritance: ChildClass --|> ParentClass\n"
+            "- Show composition: ClassA *-- ClassB (when A contains B as a field)\n"
+            "- Add stereotypes: <<interface>>, <<abstract>>, <<enumeration>>\n"
+            "- Skip test classes, private helpers, and trivial single-method classes\n"
+            "- Cap at 10 classes maximum; prefer the most important ones\n"
+            "- If there are fewer than 2 meaningful classes, return the string \"EMPTY\"\n"
+            "- Return ONLY the ```mermaid classDiagram ... ``` block or the string \"EMPTY\"\n\n"
+            f"Chapter: {chapter_title}\n\n"
+            f"Source code:\n{source_ctx}"
+        )
+
+        try:
+            text = self._diagram_llm_invoke(prompt)
+            if not text or text.strip() == "EMPTY":
+                return ""
+            import re as _re  # noqa: PLC0415
+            m = _re.search(r"```mermaid\n.*?```", text, _re.DOTALL)
+            if not m:
+                return ""
+            from .diagram_generator import _validate_mermaid  # noqa: PLC0415
+            candidate = m.group(0)
+            ok, _ = _validate_mermaid(candidate)
+            if ok and "classDiagram" not in candidate.splitlines()[1]:
+                return ""
+            return candidate if ok else ""
+        except Exception as exc:
+            logger.debug("[WRITER] _llm_class_diagram failed: %s", exc)
+            return ""
+
+    def _llm_data_model_diagram(self, source_ctx: str, chapter_title: str) -> str:
+        """Use LLM to generate a Mermaid erDiagram from source code context.
+
+        Only produces a diagram for real database/persistence models (SQLAlchemy,
+        Django, TypeORM, GORM, etc.) — not Pydantic schemas or plain dataclasses.
+        Returns a validated fenced erDiagram block, or '' on failure / empty output.
+        """
+        if self.llm_client is None:
+            return ""
+
+        prompt = (
+            "The source code below is complete. Read it directly — do NOT call any tools "
+            "or request additional files. Identify ONLY true database/persistence "
+            "models — not API response schemas.\n\n"
+            "Database models include:\n"
+            "- SQLAlchemy ORM models (classes with Column(), relationship(), mapped_column())\n"
+            "- Django models (models.Model subclasses)\n"
+            "- TypeORM entities (@Entity decorator)\n"
+            "- Go GORM structs (gorm: tags)\n"
+            "- Prisma schema definitions\n\n"
+            "DO NOT include: Pydantic response/request models, dataclasses used as DTOs "
+            "or value objects, plain TypeScript interfaces, configuration classes.\n\n"
+            "If you find 2 or more database models, produce a Mermaid erDiagram showing:\n"
+            "- Entity names and their fields with types (int, str, uuid, etc.)\n"
+            "- Mark primary keys with PK, foreign keys with FK\n"
+            "- Relationships between entities (||--o{, }|--|{, etc.)\n\n"
+            "If fewer than 2 database models exist, return the string \"EMPTY\".\n"
+            "Return ONLY the ```mermaid erDiagram ... ``` block or the string \"EMPTY\".\n\n"
+            f"Chapter: {chapter_title}\n\n"
+            f"Source code:\n{source_ctx}"
+        )
+
+        try:
+            text = self._diagram_llm_invoke(prompt)
+            if not text or text.strip() == "EMPTY":
+                return ""
+            import re as _re  # noqa: PLC0415
+            m = _re.search(r"```mermaid\n.*?```", text, _re.DOTALL)
+            if not m:
+                return ""
+            from .diagram_generator import _validate_mermaid  # noqa: PLC0415
+            candidate = m.group(0)
+            ok, _ = _validate_mermaid(candidate)
+            # Enforce erDiagram header — reject graph LR or classDiagram blocks.
+            if ok and "erDiagram" not in candidate.splitlines()[1]:
+                return ""
+            return candidate if ok else ""
+        except Exception as exc:
+            logger.debug("[WRITER] _llm_data_model_diagram failed: %s", exc)
+            return ""
 
     # ── Tool dispatch ─────────────────────────────────────────────────────
 
