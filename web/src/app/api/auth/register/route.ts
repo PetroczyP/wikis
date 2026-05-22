@@ -3,7 +3,7 @@ import { auth } from '@/lib/auth';
 
 export async function POST(request: Request) {
   if (process.env.ALLOW_REGISTRATION === 'false') {
-    return NextResponse.json({ error: 'Registration is disabled', message: 'Registration is disabled' }, { status: 403 });
+    return NextResponse.json({ error: 'Registration is disabled' }, { status: 403 });
   }
 
   let body: { username?: string; password?: string; email?: string };
