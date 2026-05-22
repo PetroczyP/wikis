@@ -1,7 +1,7 @@
 'use client';
 
 import { useSearchParams } from 'next/navigation';
-import { FormEvent, Suspense, useCallback, useState } from 'react';
+import { FormEvent, Suspense, useCallback, useEffect, useState } from 'react';
 import {
   Box,
   Button,
@@ -17,9 +17,6 @@ import GoogleIcon from '@mui/icons-material/Google';
 import { createAppTheme } from '../../spa/theme';
 import { useThemeMode } from '../../spa/hooks/useThemeMode';
 
-const showGithub = process.env.NEXT_PUBLIC_SHOW_GITHUB !== 'false';
-const showGoogle = process.env.NEXT_PUBLIC_SHOW_GOOGLE !== 'false';
-
 function LoginForm() {
   const searchParams = useSearchParams();
   const error = searchParams.get('error');
@@ -31,12 +28,41 @@ function LoginForm() {
       ? rawCallback
       : '/';
 
+  // Optimistic defaults: registration visible immediately (avoid layout shift on load),
+  // OAuth buttons hidden until confirmed (they can't be guessed server-side).
+  const [authConfig, setAuthConfig] = useState({
+    github: false,
+    google: false,
+    registrationEnabled: true,
+  });
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+    fetch('/api/auth/config')
+      .then((r) => {
+        if (!r.ok) return undefined;
+        return r.json();
+      })
+      .then((cfg) => {
+        if (!mounted || !cfg) return;
+        setAuthConfig({
+          github: !!cfg.github,
+          google: !!cfg.google,
+          registrationEnabled: cfg.registrationEnabled !== false,
+        });
+        if (!cfg.registrationEnabled) setMode('login');
+      })
+      .catch(() => {/* keep optimistic defaults on network error */});
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const handleCredentialsLogin = useCallback(
     async (e: FormEvent) => {
@@ -198,19 +224,21 @@ function LoginForm() {
           </Button>
         </Box>
 
-        <Button
-          variant="text"
-          size="small"
-          onClick={() => {
-            setMode(mode === 'login' ? 'register' : 'login');
-            setFormError(null);
-          }}
-          sx={{ textTransform: 'none' }}
-        >
-          {mode === 'login' ? 'Create an account' : 'Already have an account? Sign in'}
-        </Button>
+        {authConfig.registrationEnabled && (
+          <Button
+            variant="text"
+            size="small"
+            onClick={() => {
+              setMode(mode === 'login' ? 'register' : 'login');
+              setFormError(null);
+            }}
+            sx={{ textTransform: 'none' }}
+          >
+            {mode === 'login' ? 'Create an account' : 'Already have an account? Sign in'}
+          </Button>
+        )}
 
-        {(showGithub || showGoogle) && (
+        {(authConfig.github || authConfig.google) && (
           <>
             <Divider sx={{ width: '100%' }}>
               <Typography variant="body2" color="text.secondary">
@@ -218,7 +246,7 @@ function LoginForm() {
               </Typography>
             </Divider>
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, width: '100%' }}>
-              {showGithub && (
+              {authConfig.github && (
                 <Button
                   variant="outlined"
                   size="large"
@@ -235,7 +263,7 @@ function LoginForm() {
                   Sign in with GitHub
                 </Button>
               )}
-              {showGoogle && (
+              {authConfig.google && (
                 <Button
                   variant="outlined"
                   size="large"
