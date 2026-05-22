@@ -15,14 +15,18 @@ function makePost(pathname: string) {
 }
 
 describe('POST /api/auth/[...all] — registration guard', () => {
-  const originalEnv = process.env;
+  const WATCHED = ['ALLOW_REGISTRATION'] as const;
+  const saved: Partial<Record<string, string>> = {};
 
   beforeEach(() => {
-    process.env = { ...originalEnv };
+    for (const key of WATCHED) saved[key] = process.env[key];
   });
 
-  afterAll(() => {
-    process.env = originalEnv;
+  afterEach(() => {
+    for (const key of WATCHED) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
   });
 
   it('blocks /sign-up/email with 403 when ALLOW_REGISTRATION=false', async () => {
@@ -32,6 +36,7 @@ describe('POST /api/auth/[...all] — registration guard', () => {
 
     expect(res.status).toBe(403);
     const body = await res.json();
+    expect(body.error).toBe('Registration is disabled');
     expect(body.message).toBe('Registration is disabled');
   });
 

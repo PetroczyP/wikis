@@ -1,14 +1,24 @@
 import { GET } from '../route';
 
 describe('GET /api/auth/config', () => {
-  const originalEnv = process.env;
+  const WATCHED = [
+    'GITHUB_CLIENT_ID',
+    'GITHUB_CLIENT_SECRET',
+    'GOOGLE_CLIENT_ID',
+    'GOOGLE_CLIENT_SECRET',
+    'ALLOW_REGISTRATION',
+  ] as const;
+  const saved: Partial<Record<string, string>> = {};
 
   beforeEach(() => {
-    process.env = { ...originalEnv };
+    for (const key of WATCHED) saved[key] = process.env[key];
   });
 
-  afterAll(() => {
-    process.env = originalEnv;
+  afterEach(() => {
+    for (const key of WATCHED) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
   });
 
   it('returns github=true when both GitHub secrets are set', async () => {

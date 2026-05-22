@@ -10,7 +10,7 @@ export const GET = handlers.GET;
 export async function POST(request: NextRequest, _context: { params: Promise<{ all: string[] }> }) {
   const url = new URL(request.url);
   if (process.env.ALLOW_REGISTRATION === 'false' && url.pathname === '/api/auth/sign-up/email') {
-    return NextResponse.json({ message: 'Registration is disabled' }, { status: 403 });
+    return NextResponse.json({ error: 'Registration is disabled', message: 'Registration is disabled' }, { status: 403 });
   }
   return handlers.POST(request);
 }

@@ -307,7 +307,7 @@ async def stream_invocation(
                 data=event.model_dump_json(),
             )
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(event_generator(), ping=15)
 
 
 # ---------------------------------------------------------------------------
@@ -1721,7 +1721,7 @@ async def recompute_project_route(
                 data=evt.model_dump_json() if hasattr(evt, "model_dump_json") else _json.dumps(evt),
             )
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(event_generator(), ping=15)
 
 
 @router.get("/projects/{project_id}/search", response_model=ProjectSearchResponse)
