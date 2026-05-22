@@ -187,11 +187,15 @@ export function MermaidDiagram({ chart, mode = 'dark' }: MermaidDiagramProps) {
           borderColor: 'divider',
           overflow: 'auto',
           cursor: 'zoom-in',
-          // Use width (layout-affecting) instead of zoom/transform:scale so
-          // the card expands correctly in all browsers including Firefox.
+          // scale=1 → fit container (100%). scale≠1 → explicit pixel width
+          // so the card scrolls when zoomed in. Always layout-affecting (no
+          // zoom/transform:scale) so it works in Firefox too.
           '& .mermaid-svg-wrap svg': {
             display: 'block',
-            width: naturalWidth ? `${naturalWidth * scale}px` : '100%',
+            width: scale === 1
+              ? '100%'
+              : naturalWidth ? `${naturalWidth * scale}px` : `${scale * 100}%`,
+            maxWidth: scale === 1 ? '100%' : 'none',
             height: 'auto',
           },
         }}
@@ -222,27 +226,31 @@ export function MermaidDiagram({ chart, mode = 'dark' }: MermaidDiagramProps) {
           }}
         >
           <Tooltip title="Zoom out" placement="bottom">
-            <IconButton
-              size="small"
-              aria-label="Zoom out"
-              onClick={handleInlineZoomOut}
-              sx={{ color: pillColor, p: 0.5 }}
-              disabled={scale <= INLINE_MIN_SCALE}
-            >
-              <ZoomOutIcon fontSize="small" />
-            </IconButton>
+            <span>
+              <IconButton
+                size="small"
+                aria-label="Zoom out"
+                onClick={handleInlineZoomOut}
+                sx={{ color: pillColor, p: 0.5 }}
+                disabled={scale <= INLINE_MIN_SCALE}
+              >
+                <ZoomOutIcon fontSize="small" />
+              </IconButton>
+            </span>
           </Tooltip>
 
           <Tooltip title="Zoom in" placement="bottom">
-            <IconButton
-              size="small"
-              aria-label="Zoom in"
-              onClick={handleInlineZoomIn}
-              sx={{ color: pillColor, p: 0.5 }}
-              disabled={scale >= INLINE_MAX_SCALE}
-            >
-              <ZoomInIcon fontSize="small" />
-            </IconButton>
+            <span>
+              <IconButton
+                size="small"
+                aria-label="Zoom in"
+                onClick={handleInlineZoomIn}
+                sx={{ color: pillColor, p: 0.5 }}
+                disabled={scale >= INLINE_MAX_SCALE}
+              >
+                <ZoomInIcon fontSize="small" />
+              </IconButton>
+            </span>
           </Tooltip>
 
           <Tooltip title="Fullscreen" placement="bottom">
@@ -257,15 +265,17 @@ export function MermaidDiagram({ chart, mode = 'dark' }: MermaidDiagramProps) {
           </Tooltip>
 
           <Tooltip title="Reset zoom" placement="bottom">
-            <IconButton
-              size="small"
-              aria-label="Reset zoom"
-              onClick={(e) => { e.stopPropagation(); setScale(1); }}
-              sx={{ color: pillColor, p: 0.5 }}
-              disabled={scale === 1}
-            >
-              <FitScreenIcon fontSize="small" />
-            </IconButton>
+            <span>
+              <IconButton
+                size="small"
+                aria-label="Reset zoom"
+                onClick={(e) => { e.stopPropagation(); setScale(1); }}
+                sx={{ color: pillColor, p: 0.5 }}
+                disabled={scale === 1}
+              >
+                <FitScreenIcon fontSize="small" />
+              </IconButton>
+            </span>
           </Tooltip>
         </Box>
       </Box>
@@ -380,15 +390,17 @@ export function MermaidDiagram({ chart, mode = 'dark' }: MermaidDiagramProps) {
             </IconButton>
           </Tooltip>
           <Tooltip title="Zoom in">
-            <IconButton
-              aria-label="Zoom in"
-              size="small"
-              onClick={handleModalZoomIn}
-              sx={{ color: pillColor, p: 0.5 }}
-              disabled={modalScale >= MAX_SCALE}
-            >
-              <ZoomInIcon fontSize="small" />
-            </IconButton>
+            <span>
+              <IconButton
+                aria-label="Zoom in"
+                size="small"
+                onClick={handleModalZoomIn}
+                sx={{ color: pillColor, p: 0.5 }}
+                disabled={modalScale >= MAX_SCALE}
+              >
+                <ZoomInIcon fontSize="small" />
+              </IconButton>
+            </span>
           </Tooltip>
 
           {/* Row 2: [left] [reset] [right] */}
@@ -416,15 +428,17 @@ export function MermaidDiagram({ chart, mode = 'dark' }: MermaidDiagramProps) {
             </IconButton>
           </Tooltip>
           <Tooltip title="Zoom out">
-            <IconButton
-              aria-label="Zoom out"
-              size="small"
-              onClick={handleModalZoomOut}
-              sx={{ color: pillColor, p: 0.5 }}
-              disabled={modalScale <= MIN_SCALE}
-            >
-              <ZoomOutIcon fontSize="small" />
-            </IconButton>
+            <span>
+              <IconButton
+                aria-label="Zoom out"
+                size="small"
+                onClick={handleModalZoomOut}
+                sx={{ color: pillColor, p: 0.5 }}
+                disabled={modalScale <= MIN_SCALE}
+              >
+                <ZoomOutIcon fontSize="small" />
+              </IconButton>
+            </span>
           </Tooltip>
         </Box>
       </Dialog>
