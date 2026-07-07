@@ -29,8 +29,15 @@ export async function middleware(request: NextRequest) {
     const url = new URL(pathname + request.nextUrl.search, BACKEND_URL);
     return NextResponse.rewrite(url);
   }
-  if (pathname.startsWith('/mcp')) {
-    const url = new URL(pathname + request.nextUrl.search, BACKEND_URL);
+  if (pathname === '/mcp' || pathname.startsWith('/mcp/')) {
+    // FastMCP's streamable app is mounted at /mcp with its route at "/", so the
+    // backend expects the trailing-slash form "/mcp/". Proxy the bare "/mcp" to
+    // "/mcp/" here — otherwise the Starlette Mount 307-redirects to
+    // http://backend:8000/mcp/, leaking the internal upstream host to the client
+    // (which then can't resolve it → ConnectionRefused). rewrite() keeps the
+    // client-facing URL as /mcp, so there's no client-visible redirect or loop.
+    const path = pathname === '/mcp' ? '/mcp/' : pathname;
+    const url = new URL(path + request.nextUrl.search, BACKEND_URL);
     return NextResponse.rewrite(url);
   }
   if (pathname === '/health') {
